@@ -7,7 +7,7 @@ from torchvision import transforms
 from transformers import AutoTokenizer
 
 # Load HuggingFace Bangla tokenizer (Stylenet adaptation)
-tokenizer = AutoTokenizer.from_pretrained("hishab/titulm-mpt-1b-v2.0")
+tokenizer = AutoTokenizer.from_pretrained("hishab/titulm-mpt-1b-v2.0", trust_remote_code=True)
 
 # Rescale utility
 class Rescale:
