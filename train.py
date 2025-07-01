@@ -1,144 +1,153 @@
 import os
-import pickle
 import argparse
 import torch
-from torch.autograd import Variable
-from data_loader import get_data_loader, get_styled_data_loader
-from models import EncoderViT, FactoredLSTM
-from loss import masked_cross_entropy
-from transformers import AutoTokenizer
-import numpy as np
-from tqdm.auto import tqdm
-from config import config
+from data_loader import get_loader, get_styled_loader, load_img_caption_lists, tokenizer
+from models import EncoderCNN, FactoredLSTM
+import torch.nn as nn
+import torch.optim as optim
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def to_var(x, device="cuda", requires_grad=False):
-    return x.to(device).requires_grad_(requires_grad)
+def to_var(x):
+    if torch.cuda.is_available():
+        x = x.cuda()
+    return x
 
 def eval_outputs(outputs, tokenizer):
-    indices = torch.topk(outputs, 1, dim=2)[1]
-    indices = indices.squeeze(2).cpu().numpy()
+    # outputs: [batch, max_len-1, vocab_size]
+    indices = torch.topk(outputs, 1)[1]  # [batch, seq, 1]
+    indices = indices.squeeze(2)         # [batch, seq]
+    indices = indices.data.cpu().numpy()
     for i in range(len(indices)):
-        caption_list = tokenizer.convert_ids_to_tokens(indices[i])
-        caption = " ".join(caption_list)
-        print(caption)
-        print()
+        tokens = tokenizer.convert_ids_to_tokens(indices[i])
+        text = tokenizer.convert_tokens_to_string(tokens)
+        print("Generated:", text)
 
-# Paths
-permanent_save_folder = "stylenet_models/"
-os.makedirs(config.model_path, exist_ok=True)
+def main(args):
+    model_path = args.model_path
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
 
-# Tokenizer
-tokenizer = AutoTokenizer.from_pretrained("hishab/titulm-mpt-1b-v2.0", trust_remote_code=True)
-print("Pad token:", tokenizer.pad_token)
-print("Pad token ID:", tokenizer.pad_token_id)
+    # Bangla factual captions
+    img_paths, factual_captions = load_img_caption_lists(
+        args.factual_caption_path, args.img_path, args.img_ext)
+    # Bangla styled captions (e.g., humor/romantic)
+    _, humorous_captions = load_img_caption_lists(
+        args.humorous_caption_path, args.img_path, args.img_ext) if args.humorous_caption_path else ([], [])
+    _, romantic_captions = load_img_caption_lists(
+        args.romantic_caption_path, args.img_path, args.img_ext) if args.romantic_caption_path else ([], [])
 
-pad_token_id = tokenizer.pad_token_id
-vocab = tokenizer.get_vocab()
+    # DataLoader
+    data_loader = get_loader(
+        img_paths, factual_captions, batch_size=args.caption_batch_size, shuffle=True, num_workers=2)
+    styled_data_loader = get_styled_loader(
+        humorous_captions, batch_size=args.language_batch_size, shuffle=True, num_workers=2) if humorous_captions else None
+    styled_data_loader_romantic = get_styled_loader(
+        romantic_captions, batch_size=args.language_batch_size, shuffle=True, num_workers=2) if romantic_captions else None
 
-# Data Loaders
-data_loader = get_data_loader(config.img_path, config.factual_caption_path, tokenizer, config.caption_batch_size, shuffle=True)
-styled_data_loader = get_styled_data_loader(config.humorous_caption_path, tokenizer, config.language_batch_size, shuffle=True)
-romantic_styled_data_loader = get_styled_data_loader(config.romantic_caption_path, tokenizer, config.language_batch_size, shuffle=True)
+    # Models
+    encoder = EncoderCNN(args.emb_dim)
+    decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, tokenizer.vocab_size)
+    if torch.cuda.is_available():
+        encoder = encoder.cuda()
+        decoder = decoder.cuda()
 
-# Models
-encoder = EncoderViT(config.emb_dim).to(device)
-decoder = FactoredLSTM(config.emb_dim, config.hidden_dim, config.factored_dim, tokenizer.vocab_size).to(device)
+    # Loss and optimizers
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    cap_params = list(decoder.parameters()) + list(encoder.A.parameters())
+    lang_params = list(decoder.parameters())
+    optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
+    optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
-# Optimizers
-criterion = masked_cross_entropy
-cap_params = list(decoder.parameters()) + list(encoder.parameters())
-optimizer_cap = torch.optim.Adam(cap_params, lr=config.lr_caption)
-optimizer_lang = torch.optim.Adam(decoder.parameters(), lr=config.lr_language)
+    # Train
+    total_cap_step = len(data_loader)
+    total_lang_step = len(styled_data_loader) if styled_data_loader else 0
+    total_rom_step = len(styled_data_loader_romantic) if styled_data_loader_romantic else 0
+    for epoch in range(args.epoch_num):
+        # Captioning (factual, with images)
+        for i, (images, input_ids, attn_mask, lengths) in enumerate(data_loader):
+            images = to_var(images)
+            input_ids = to_var(input_ids)
+            decoder.zero_grad()
+            encoder.zero_grad()
+            features = encoder(images)
+            outputs = decoder(input_ids, features, mode="factual")
+            targets = input_ids[:, 1:].contiguous()
+            outputs = outputs[:, :-1, :].contiguous()
+            loss = criterion(outputs.view(-1, tokenizer.vocab_size), targets.view(-1))
+            loss.backward()
+            optimizer_cap.step()
+            if i % args.log_step_caption == 0:
+                print("Epoch [%d/%d], CAP, Step [%d/%d], Loss: %.4f"
+                      % (epoch+1, args.epoch_num, i, total_cap_step, loss.data.item()))
+        eval_outputs(outputs, tokenizer)
 
-# ======= Checkpoint Loading (NEW SECTION) =======
-start_epoch = 0
-checkpoint_path = os.path.join(permanent_save_folder, 'checkpoint-latest.pth')
-encoder_last_path = os.path.join(permanent_save_folder, "encoder-last.pkl")
-decoder_last_path = os.path.join(permanent_save_folder, "decoder-last.pkl")
+        # Language modeling (styled captions: humorous)
+        if styled_data_loader:
+            for i, (input_ids, attn_mask) in enumerate(styled_data_loader):
+                input_ids = to_var(input_ids)
+                decoder.zero_grad()
+                outputs = decoder(input_ids, features=None, mode='humorous')
+                targets = input_ids[:, 1:].contiguous()
+                outputs = outputs[:, :-1, :].contiguous()
+                loss = criterion(outputs.view(-1, tokenizer.vocab_size), targets.view(-1))
+                loss.backward()
+                optimizer_lang.step()
+                if i % args.log_step_language == 0:
+                    print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
+                        % (epoch+1, args.epoch_num, i, total_lang_step, loss.data.item()))
+        # Language modeling (styled: romantic)
+        if styled_data_loader_romantic:
+            for i, (input_ids, attn_mask) in enumerate(styled_data_loader_romantic):
+                input_ids = to_var(input_ids)
+                decoder.zero_grad()
+                outputs = decoder(input_ids, features=None, mode='romantic')
+                targets = input_ids[:, 1:].contiguous()
+                outputs = outputs[:, :-1, :].contiguous()
+                loss = criterion(outputs.view(-1, tokenizer.vocab_size), targets.view(-1))
+                loss.backward()
+                optimizer_lang.step()
+                if i % args.log_step_language == 0:
+                    print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
+                        % (epoch+1, args.epoch_num, i, total_rom_step, loss.data.item()))
 
-if os.path.exists(checkpoint_path):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    encoder.load_state_dict(checkpoint['encoder_state_dict'])
-    decoder.load_state_dict(checkpoint['decoder_state_dict'])
-    optimizer_cap.load_state_dict(checkpoint['optimizer_cap_state_dict'])
-    optimizer_lang.load_state_dict(checkpoint['optimizer_lang_state_dict'])
-    start_epoch = checkpoint['epoch'] + 1
-    print(f"Loaded checkpoint from epoch {checkpoint['epoch']+1}")
-else:
-    loaded_any = False
-    if os.path.exists(decoder_last_path):
-        decoder.load_state_dict(torch.load(decoder_last_path, map_location=device))
-        print("Decoder loaded from saved weight")
-        loaded_any = True
-    if os.path.exists(encoder_last_path):
-        encoder.load_state_dict(torch.load(encoder_last_path, map_location=device))
-        print("Encoder loaded from saved weight")
-        loaded_any = True
-    if not loaded_any:
-        print("No checkpoint or pretrained weights found. Training from scratch (random weights).")
-    else:
-        print("No checkpoint found. Loaded latest pretrained weights only.")
+        # Save models
+        torch.save(decoder.state_dict(),
+                   os.path.join(model_path, 'decoder-%d.pkl' % (epoch + 1,)))
+        torch.save(encoder.state_dict(),
+                   os.path.join(model_path, 'encoder-%d.pkl' % (epoch + 1,)))
+        print("Model saved for epoch %d" % (epoch+1))
 
-# ======= END Checkpoint Loading =======
-
-# ======= Training Loop (start from start_epoch) =======
-for epoch in range(start_epoch, config.epoch_num):
-    # Caption - Factual
-    encoder.train()
-    decoder.train()
-    for i, (images, captions, lengths) in tqdm(enumerate(data_loader)):
-        images = to_var(images.float(), device=device)
-        captions = to_var(captions.long(), device=device)
-
-        # Forward, backward and optimize
-        optimizer_cap.zero_grad()
-        features = encoder(images)
-        outputs = decoder(captions, features, mode="factual")
-        loss = criterion(outputs[:, 1:, :].contiguous(),
-                        captions[:, 1:].contiguous(), lengths - 1)
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
-        optimizer_cap.step()
-
-        if i % config.log_step_caption == 0:
-            print(f"Epoch [{epoch+1}/{config.epoch_num}], CAP, Loss: {loss.item():.4f}")
-
-    # Style training loops (humorous and romantic remain exactly the same)
-    for i, (captions, lengths) in tqdm(enumerate(styled_data_loader)):
-        captions = to_var(captions.long(), device=device)
-        optimizer_lang.zero_grad()
-        outputs = decoder(captions, mode='humorous')
-        loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
-        optimizer_lang.step()
-
-    for i, (captions, lengths) in tqdm(enumerate(romantic_styled_data_loader)):
-        captions = to_var(captions.long(), device=device)
-        optimizer_lang.zero_grad()
-        outputs = decoder(captions, mode='romantic')
-        loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
-        optimizer_lang.step()
-
-    # ======= Only Save the Latest Weights & Checkpoint =======
-    os.makedirs(permanent_save_folder, exist_ok=True)
-    torch.save(decoder.state_dict(), os.path.join(permanent_save_folder, 'decoder-last.pkl'))
-    torch.save(encoder.state_dict(), os.path.join(permanent_save_folder, 'encoder-last.pkl'))
-    torch.save(decoder.state_dict(), os.path.join(config.model_path, 'decoder-last.pkl'))
-    torch.save(encoder.state_dict(), os.path.join(config.model_path, 'encoder-last.pkl'))
-    torch.save({
-        'epoch': epoch,
-        'encoder_state_dict': encoder.state_dict(),
-        'decoder_state_dict': decoder.state_dict(),
-        'optimizer_cap_state_dict': optimizer_cap.state_dict(),
-        'optimizer_lang_state_dict': optimizer_lang.state_dict(),
-        'loss': loss.item(),
-    }, os.path.join(permanent_save_folder, 'checkpoint-latest.pth'))
-    print(f"[Checkpoint] Saved at end of epoch {epoch+1}")
-
-# ======= END Training Loop =======
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='StyleNet Bangla: Generating Attractive Visual Captions with Styles')
+    parser.add_argument('--model_path', type=str, default='pretrained_models',
+                        help='path for saving trained models')
+    parser.add_argument('--img_path', type=str, default='./dataset/images',
+                        help='path for train images directory')
+    parser.add_argument('--factual_caption_path', type=str, default='./dataset/factual_captions.txt',
+                        help='path for factual caption file')
+    parser.add_argument('--humorous_caption_path', type=str, default='',
+                        help='path for humorous caption file (optional)')
+    parser.add_argument('--romantic_caption_path', type=str, default='',
+                        help='path for romantic caption file (optional)')
+    parser.add_argument('--img_ext', type=str, default='jpg',
+                        help='image extension (jpg/png)')
+    parser.add_argument('--caption_batch_size', type=int, default=64,
+                        help='mini batch size for caption model training')
+    parser.add_argument('--language_batch_size', type=int, default=96,
+                        help='mini batch size for language model training')
+    parser.add_argument('--emb_dim', type=int, default=300,
+                        help='embedding size of word, image')
+    parser.add_argument('--hidden_dim', type=int, default=512,
+                        help='hidden state size of factored LSTM')
+    parser.add_argument('--factored_dim', type=int, default=512,
+                        help='size of factored matrix')
+    parser.add_argument('--lr_caption', type=float, default=0.0002,
+                        help='learning rate for caption model training')
+    parser.add_argument('--lr_language', type=float, default=0.0005,
+                        help='learning rate for language model training')
+    parser.add_argument('--epoch_num', type=int, default=30)
+    parser.add_argument('--log_step_caption', type=int, default=50,
+                        help='steps for print log while train caption model')
+    parser.add_argument('--log_step_language', type=int, default=10,
+                        help='steps for print log while train language model')
+    args = parser.parse_args()
+    main(args)
