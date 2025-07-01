@@ -36,7 +36,7 @@ def main():
         Rescale((224, 224)),
         transforms.ToTensor()
     ])
-    img_names, img_list = load_sample_images('sample_images/', transform)
+    img_names, img_list = load_sample_images('/kaggle/input/sample/sample_images', transform)
     idx = 1
     image = img_list[idx]
 
