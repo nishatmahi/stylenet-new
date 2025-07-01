@@ -124,10 +124,10 @@ if __name__ == '__main__':
                         help='path for train images directory')
     parser.add_argument('--factual_caption_path', type=str, default='./kaggle/input/dataset/data/factual_caption.txt',
                         help='path for factual caption file')
-    parser.add_argument('--humorous_caption_path', type=str, default='',
-                        help='/kaggle/input/dataset/data/humorous_train.txt')
-    parser.add_argument('--romantic_caption_path', type=str, default='',
-                        help='/kaggle/input/dataset/data/romantic_train.txt')
+    parser.add_argument('--humorous_caption_path', type=str, default='./kaggle/input/dataset/data/humorous_train.txt',
+                        help='path for humorous caption file')
+    parser.add_argument('--romantic_caption_path', type=str, default='./kaggle/input/dataset/data/romantic_train.txt',
+                        help='path for romantic caption file')
     parser.add_argument('--img_ext', type=str, default='jpg',
                         help='image extension (jpg/png)')
     parser.add_argument('--caption_batch_size', type=int, default=64,
