@@ -4,34 +4,42 @@ import torch.nn as nn
 import torchvision.models as models
 import torch.nn.functional as F
 from torch.autograd import Variable
-from constant import get_symbol_id
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-class EncoderViT(nn.Module):
+# --------- EncoderCNN (ResNet152) ---------
+class EncoderCNN(nn.Module):
     def __init__(self, emb_dim):
-        super(EncoderViT, self).__init__()
-        vit = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT)
-        vit.heads = nn.Identity()    # <-- This is the fix
-        self.vit = vit
-        self.fc = nn.Linear(768, emb_dim)
+        '''
+        Load the pretrained ResNet152 and replace fc
+        '''
+        super(EncoderCNN, self).__init__()
+        resnet = models.resnet152(pretrained=True)
+        modules = list(resnet.children())[:-1]
+        self.resnet = nn.Sequential(*modules)
+        self.A = nn.Linear(resnet.fc.in_features, emb_dim)
+        self.bn = nn.BatchNorm1d(emb_dim, momentum=0.01)
 
     def forward(self, images):
-        features = self.vit(images)   # Shape: [batch_size, 768]
-        features = self.fc(features)  # Shape: [batch_size, emb_dim]
+        '''
+        Extract the image feature vectors
+        '''
+        with torch.no_grad():
+            features = self.resnet(images)
+        features = features.view(features.size(0), -1)
+        features = self.A(features)
+        features = self.bn(features)
         return features
 
+# --------- FactoredLSTM ---------
 class FactoredLSTM(nn.Module):
     def __init__(self, emb_dim, hidden_dim, factored_dim, vocab_size):
         super(FactoredLSTM, self).__init__()
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
 
-        # embedding
-        print(f"vocab_size: {vocab_size}")
+        # Embedding (HuggingFace tokenizer compatible)
         self.B = nn.Embedding(vocab_size, emb_dim)
 
-        # factored lstm weights
+        # Factored LSTM weights (for each gate)
         self.U_i = nn.Linear(factored_dim, hidden_dim)
         self.S_fi = nn.Linear(factored_dim, factored_dim)
         self.V_i = nn.Linear(emb_dim, factored_dim)
@@ -52,18 +60,16 @@ class FactoredLSTM(nn.Module):
         self.V_c = nn.Linear(emb_dim, factored_dim)
         self.W_c = nn.Linear(hidden_dim, hidden_dim)
 
+        # Style-specific (optional, for humor/romantic etc)
         self.S_hi = nn.Linear(factored_dim, factored_dim)
         self.S_hf = nn.Linear(factored_dim, factored_dim)
         self.S_ho = nn.Linear(factored_dim, factored_dim)
         self.S_hc = nn.Linear(factored_dim, factored_dim)
+        # self.S_ri = nn.Linear(factored_dim, factored_dim)
+        # self.S_rf = nn.Linear(factored_dim, factored_dim)
+        # self.S_ro = nn.Linear(factored_dim, factored_dim)
+        # self.S_rc = nn.Linear(factored_dim, factored_dim)
 
-        
-        self.S_ri = nn.Linear(factored_dim, factored_dim)
-        self.S_rf = nn.Linear(factored_dim, factored_dim)
-        self.S_ro = nn.Linear(factored_dim, factored_dim)
-        self.S_rc = nn.Linear(factored_dim, factored_dim)
-
-        # weight for output
         self.C = nn.Linear(hidden_dim, vocab_size)
 
     def forward_step(self, embedded, h_0, c_0, mode):
@@ -71,7 +77,6 @@ class FactoredLSTM(nn.Module):
         f = self.V_f(embedded)
         o = self.V_o(embedded)
         c = self.V_c(embedded)
-
 
         if mode == "factual":
             i = self.S_fi(i)
@@ -83,11 +88,11 @@ class FactoredLSTM(nn.Module):
             f = self.S_hf(f)
             o = self.S_ho(o)
             c = self.S_hc(c)
-        elif mode == "romantic":
-            i = self.S_ri(i)
-            f = self.S_rf(f)
-            o = self.S_ro(o)
-            c = self.S_rc(c)
+        # elif mode == "romantic":
+        #     i = self.S_ri(i)
+        #     f = self.S_rf(f)
+        #     o = self.S_ro(o)
+        #     c = self.S_rc(c)
         else:
             sys.stderr.write("mode name wrong!\n")
 
@@ -97,120 +102,103 @@ class FactoredLSTM(nn.Module):
         c_tilda = torch.tanh(self.U_c(c) + self.W_c(h_0))
 
         c_t = f_t * c_0 + i_t * c_tilda
-        h_t = o_t * c_t
+        h_t = o_t * torch.tanh(c_t)
 
         outputs = self.C(h_t)
+
         return outputs, h_t, c_t
 
     def forward(self, captions, features=None, mode="factual"):
+        '''
+        Args:
+            features: fixed vectors from images, [batch, emb_dim]
+            captions: [batch, max_len]
+            mode: type of caption to generate
+        '''
         batch_size = captions.size(0)
-        embedded = self.B(captions)
-
+        embedded = self.B(captions)  # [batch, max_len, emb_dim]
+        # concat features and captions
         if mode == "factual":
             if features is None:
                 sys.stderr.write("features is None!\n")
             embedded = torch.cat((features.unsqueeze(1), embedded), 1)
 
-        h_t = Variable(torch.Tensor(batch_size, self.hidden_dim)).to(device)
-        c_t = Variable(torch.Tensor(batch_size, self.hidden_dim)).to(device)
+        # initialize hidden state
+        h_t = torch.zeros(batch_size, self.hidden_dim)
+        c_t = torch.zeros(batch_size, self.hidden_dim)
         nn.init.uniform_(h_t)
         nn.init.uniform_(c_t)
 
+        if torch.cuda.is_available():
+            h_t = h_t.cuda()
+            c_t = c_t.cuda()
+
         all_outputs = []
+        # iterate
         for ix in range(embedded.size(1) - 1):
             emb = embedded[:, ix, :]
             outputs, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode)
             all_outputs.append(outputs)
 
-        return torch.stack(all_outputs, 1)
+        all_outputs = torch.stack(all_outputs, 1)
+        return all_outputs
 
-    
-    def sample(self, feature, beam_size=5, max_len=30, mode="factual"): 
-        with torch.no_grad():
-        # Initialize hidden states with zeros
-            h_t = Variable(torch.zeros(1, self.hidden_dim))
-            c_t = Variable(torch.zeros(1, self.hidden_dim))
+    def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual"):
+        '''
+        generate captions from feature vectors with beam search
 
-        # Device handling
-            if torch.cuda.is_available():
-                h_t = h_t.cuda()
-                c_t = c_t.cuda()
-                feature = feature.cuda()
+        Args:
+            feature: fixed vector for an image, [1, emb_dim]
+            tokenizer: HuggingFace tokenizer (for special tokens)
+            beam_size: stock size for beam search
+            max_len: max sampling length
+            mode: type of caption to generate
+        '''
+        h_t = torch.zeros(1, self.hidden_dim)
+        c_t = torch.zeros(1, self.hidden_dim)
+        nn.init.uniform_(h_t)
+        nn.init.uniform_(c_t)
 
-        # Process image feature FIRST for ALL modes
-            _, h_t, c_t = self.forward_step(feature, h_t, c_t, mode=mode)
+        if torch.cuda.is_available():
+            h_t = h_t.cuda()
+            c_t = c_t.cuda()
+            feature = feature.cuda()
 
-        # Initialize beam candidates with <s> token
-            start_token = get_symbol_id('<s>')
-            symbol = torch.LongTensor([[start_token]])
-            if torch.cuda.is_available():
-                symbol = symbol.cuda()
-            symbol = Variable(symbol)
+        # First input: image feature as embedded
+        _, h_t, c_t = self.forward_step(feature, h_t, c_t, mode=mode)
 
-            candidates = [[0.0, symbol, h_t.clone(), c_t.clone(), [start_token]]]
+        # BOS token id from HuggingFace tokenizer
+        start_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
+        symbol_id = torch.LongTensor([start_id]).unsqueeze(0)
+        symbol_id = symbol_id.cuda() if torch.cuda.is_available() else symbol_id
+        candidates = [[0, symbol_id, h_t, c_t, [start_id]]]
 
-        # Beam search loop
-            t = 0
-            while t < max_len:
-                t += 1
-                tmp_candidates = []
-                end_flag = True
-
-                for score, last_id, h_prev, c_prev, id_seq in candidates:
-                    if id_seq[-1] == get_symbol_id('</s>'):
-                        tmp_candidates.append([score, last_id, h_prev, c_prev, id_seq])
-                        continue
-                    
+        t = 0
+        while t < max_len - 1:
+            t += 1
+            tmp_candidates = []
+            end_flag = True
+            for score, last_id, h_t, c_t, id_seq in candidates:
+                if id_seq[-1] == tokenizer.eos_token_id:
+                    tmp_candidates.append([score, last_id, h_t, c_t, id_seq])
+                else:
                     end_flag = False
                     emb = self.B(last_id)
+                    output, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode)
+                    output = output.squeeze(0).squeeze(0)
+                    output = F.log_softmax(output, dim=-1)
+                    output, indices = torch.sort(output, descending=True)
+                    output = output[:beam_size]
+                    indices = indices[:beam_size]
+                    score_list = score + output
+                    for score_, wid in zip(score_list, indices):
+                        tmp_candidates.append(
+                            [score_, wid.unsqueeze(0), h_t, c_t, id_seq + [int(wid.cpu().numpy())]]
+                        )
+            if end_flag:
+                break
+            # sort by normalized log probs, pick beam_size highest candidate
+            candidates = sorted(tmp_candidates,
+                                key=lambda x: -x[0].item() / len(x[-1]))[:beam_size]
 
-                # Forward step with cloned states
-                    output, h_new, c_new = self.forward_step(
-                        emb, 
-                        h_prev.clone(), 
-                        c_prev.clone(), 
-                        mode=mode
-                    )
-
-                # Get probabilities
-                    log_probs = F.log_softmax(output.squeeze(1), dim=1)
-                    top_log_probs, top_indices = torch.topk(log_probs, beam_size, dim=1)
-
-                # Expand candidates
-                    for i in range(beam_size):
-                        wid = top_indices[0, i]
-                        log_prob = top_log_probs[0, i]
-
-                        new_score = score + log_prob.item()
-                        new_seq = id_seq + [wid.item()]
-
-                        wid_tensor = torch.LongTensor([[wid.item()]])
-                        if torch.cuda.is_available():
-                            wid_tensor = wid_tensor.cuda()
-                        wid_var = Variable(wid_tensor)
-
-                        tmp_candidates.append([
-                            new_score,
-                            wid_var,
-                            h_new.clone(),
-                            c_new.clone(),
-                            new_seq
-                        ])
-
-                if end_flag:
-                    break
-                
-            # Normalize scores by sequence length
-                tmp_candidates.sort(key=lambda x: -x[0]/len(x[-1]))
-                candidates = tmp_candidates[:beam_size]
-
-        # Return best sequence
-            best_candidate = max(candidates, key=lambda x: x[0]/len(x[-1]))
-            id_seq = best_candidate[-1]
-
-        # Trim at </s> token if exists
-        eos_token_id = get_symbol_id('</s>')
-        if eos_token_id in id_seq:
-            id_seq = id_seq[:id_seq.index(eos_token_id) + 1]  # include </s>
-
-        return id_seq
+        return candidates[0][-1]
