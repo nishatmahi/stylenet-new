@@ -6,12 +6,11 @@ from PIL import Image
 from torchvision import transforms
 from transformers import AutoTokenizer
 
-# HuggingFace Bangla tokenizer (change here if you want another model)
+# Load HuggingFace Bangla tokenizer (Stylenet adaptation)
 tokenizer = AutoTokenizer.from_pretrained("hishab/titulm-mpt-1b-v2.0")
 
-# Rescale utility (as in original code)
+# Rescale utility
 class Rescale:
-    '''Rescale the image to a given size'''
     def __init__(self, output_size):
         assert isinstance(output_size, (int, tuple))
         self.output_size = output_size
@@ -28,13 +27,14 @@ class Rescale:
         image = image.resize((new_w, new_h))
         return image
 
-# Standard transform
+# Standard image transform
 image_transform = transforms.Compose([
     Rescale((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
-# ------------- MULTI-EXTENSION IMAGE FINDER (ADD THIS BLOCK) ---------------
+
+# Multi-extension image finder (jpg/jpeg/png)
 def find_image_with_any_ext(img_folder, img_id):
     for ext in ['jpg', 'jpeg', 'png']:
         candidate = os.path.join(img_folder, f"{img_id}.{ext}")
@@ -42,7 +42,7 @@ def find_image_with_any_ext(img_folder, img_id):
             return candidate
     return None
 
-# Custom Bangla Dataset (original style, factual or styled captions)
+# Caption dataset (image+caption)
 class BanglaCaptionDataset(Dataset):
     def __init__(self, img_paths, captions, transform=None):
         self.img_paths = img_paths
@@ -55,29 +55,28 @@ class BanglaCaptionDataset(Dataset):
     def __getitem__(self, ix):
         img_path = self.img_paths[ix]
         caption = self.captions[ix]
-        # Image open and preprocess
         image = Image.open(img_path).convert("RGB")
         image = self.transform(image)
-        # Tokenize caption (no <s>, </s> manual)
         encoding = tokenizer(
             caption,
             truncation=True,
             padding='max_length',
-            max_length=32,  # Or your desired
+            max_length=32,
             return_tensors="pt"
         )
-        input_ids = encoding["input_ids"].squeeze(0)    # [seq_len]
+        input_ids = encoding["input_ids"].squeeze(0)
         attn_mask = encoding["attention_mask"].squeeze(0)
         return image, input_ids, attn_mask
 
-# Loader for flexible tab/space separated files (factual or stylized)
+# Robust caption+image loader (handles tab/multi-space/single space, multi-ext image)
 def load_img_caption_lists(data_txt_file, image_folder):
     img_paths = []
     captions = []
     with open(data_txt_file, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
-            if not line: continue
+            if not line:
+                continue
             parts = re.split(r'\s{2,}|\t', line, maxsplit=1)
             if len(parts) < 2:
                 parts = line.split(' ', 1)
@@ -94,8 +93,7 @@ def load_img_caption_lists(data_txt_file, image_folder):
     print(f"Loaded {len(img_paths)} images and {len(captions)} captions.")
     return img_paths, captions
 
-
-# Collate function (original style) — batch padding
+# Collate: batch, pad, sort
 def collate_fn(data):
     data.sort(key=lambda x: (x[1] != tokenizer.pad_token_id).sum(), reverse=True)
     images, input_ids, attn_masks = zip(*data)
@@ -105,12 +103,12 @@ def collate_fn(data):
     lengths = torch.LongTensor([(ids != tokenizer.pad_token_id).sum().item() for ids in input_ids])
     return images, input_ids, attn_masks, lengths
 
-# Loader utility for train/test loop
+# Loader
 def get_loader(img_paths, captions, batch_size=32, shuffle=True, num_workers=2):
     dataset = BanglaCaptionDataset(img_paths, captions)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn)
 
-# Styled captions (only caption, no image needed)
+# Styled caption dataset (no image)
 class BanglaStyledCaptionDataset(Dataset):
     def __init__(self, captions):
         self.captions = captions
@@ -135,13 +133,12 @@ def get_styled_loader(captions, batch_size=64, shuffle=True, num_workers=2):
     dataset = BanglaStyledCaptionDataset(captions)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
-# For manual testing
+# Manual test block (clean, no unnecessary args)
 if __name__ == "__main__":
-    # Example usage (set your file paths here)
+    # Example: test loading works (replace with your file/folder as needed)
     img_paths, captions = load_img_caption_lists(
         data_txt_file="your_factual_captions.txt",
-        image_folder="your_image_folder",
-        img_ext="jpg"
+        image_folder="your_image_folder"
     )
     loader = get_loader(img_paths, captions, batch_size=3)
     for i, (images, input_ids, attn_mask, lengths) in enumerate(loader):
