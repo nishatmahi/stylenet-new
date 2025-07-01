@@ -71,14 +71,13 @@ class BanglaCaptionDataset(Dataset):
         return image, input_ids, attn_mask
 
 # Loader for flexible tab/space separated files (factual or stylized)
-def load_img_caption_lists(data_txt_file, image_folder, img_ext="jpg"):
+def load_img_caption_lists(data_txt_file, image_folder):
     img_paths = []
     captions = []
     with open(data_txt_file, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if not line: continue
-            # Robust: split by tab or 2+ spaces, fallback single space
             parts = re.split(r'\s{2,}|\t', line, maxsplit=1)
             if len(parts) < 2:
                 parts = line.split(' ', 1)
@@ -86,16 +85,15 @@ def load_img_caption_lists(data_txt_file, image_folder, img_ext="jpg"):
                     continue
             id_and_idx, caption = parts
             img_id = id_and_idx.split('#')[0]
-            if not (img_id.endswith('.jpg') or img_id.endswith('.jpeg') or img_id.endswith('.png')):
-                img_id = img_id + '.' + img_ext
-            img_path = os.path.join(image_folder, img_id)
-            if not os.path.exists(img_path):
-                print(f"Warning: {img_path} not found, skipping")
+            img_path = find_image_with_any_ext(image_folder, img_id)
+            if img_path is None:
+                print(f"Warning: {img_id} not found in {image_folder}, skipping")
                 continue
             img_paths.append(img_path)
             captions.append(caption.strip())
     print(f"Loaded {len(img_paths)} images and {len(captions)} captions.")
     return img_paths, captions
+
 
 # Collate function (original style) — batch padding
 def collate_fn(data):
