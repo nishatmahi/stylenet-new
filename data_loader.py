@@ -42,6 +42,13 @@ def find_image_with_any_ext(img_folder, img_id):
             return candidate
     return None
 
+# Extension stripper
+def strip_ext(img_id):
+    for ext in ['.jpg', '.jpeg', '.png']:
+        if img_id.lower().endswith(ext):
+            return img_id[: -len(ext)]
+    return img_id
+
 # Caption dataset (image+caption)
 class BanglaCaptionDataset(Dataset):
     def __init__(self, img_paths, captions, transform=None):
@@ -68,7 +75,7 @@ class BanglaCaptionDataset(Dataset):
         attn_mask = encoding["attention_mask"].squeeze(0)
         return image, input_ids, attn_mask
 
-# Robust caption+image loader (handles tab/multi-space/single space, multi-ext image)
+# Robust caption+image loader (handles tab/multi-space/single space, multi-ext image, ext stripping)
 def load_img_caption_lists(data_txt_file, image_folder):
     img_paths = []
     captions = []
@@ -83,7 +90,8 @@ def load_img_caption_lists(data_txt_file, image_folder):
                 if len(parts) < 2:
                     continue
             id_and_idx, caption = parts
-            img_id = id_and_idx.split('#')[0]
+            img_id = id_and_idx.split('#')[0].strip()
+            img_id = strip_ext(img_id)  # Always strip ext if present
             img_path = find_image_with_any_ext(image_folder, img_id)
             if img_path is None:
                 print(f"Warning: {img_id} not found in {image_folder}, skipping")
@@ -135,7 +143,6 @@ def get_styled_loader(captions, batch_size=64, shuffle=True, num_workers=2):
 
 # Manual test block (clean, no unnecessary args)
 if __name__ == "__main__":
-    # Example: test loading works (replace with your file/folder as needed)
     img_paths, captions = load_img_caption_lists(
         data_txt_file="your_factual_captions.txt",
         image_folder="your_image_folder"
