@@ -37,7 +37,7 @@ def main():
         transforms.ToTensor()
     ])
     img_names, img_list = load_sample_images('sample_images/', transform)
-    idx = 30
+    idx = 1
     image = img_list[idx]
 
     # if torch.cuda.is_available():
