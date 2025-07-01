@@ -2,159 +2,147 @@ import os
 import re
 import torch
 from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 from torchvision import transforms
-from torchvision.io import read_image
+from transformers import AutoTokenizer
 
-class FlickerDataset(Dataset):
-    '''Flickr8K dataset'''
-    def __init__(self, img_dir, caption_file, tokenizer, transform=None):
-        '''
-        Args:
-            img_dir: Directory with all the images
-            caption_file: Path to the factual caption file
-            tokenizer: Tokenizer instance
-            transform: Optional transform to be applied
-        '''
-        self.img_dir = img_dir
-        self.imgname_caption_list = self._get_imgname_and_caption(caption_file)
-        self.transform = transform
-        self.tokenizer = tokenizer
+# HuggingFace Bangla tokenizer (change here if you want another model)
+tokenizer = AutoTokenizer.from_pretrained("hishab/titulm-mpt-1b-v2.0")
 
-    def _get_imgname_and_caption(self, caption_file):
-        '''extract image name and caption from factual caption file'''
-        with open(caption_file, 'r') as f:
-            res = f.readlines()
+# Rescale utility (as in original code)
+class Rescale:
+    '''Rescale the image to a given size'''
+    def __init__(self, output_size):
+        assert isinstance(output_size, (int, tuple))
+        self.output_size = output_size
 
-        imgname_caption_list = []
-        r = re.compile(r'#\d*')
-        for line in res:
-            img_and_cap = r.split(line)
-            img_and_cap = [x.strip() for x in img_and_cap]
-            imgname_caption_list.append(img_and_cap)
+    def __call__(self, image):
+        w, h = image.size
+        if isinstance(self.output_size, int):
+            if h > w:
+                new_h, new_w = int(self.output_size * h / w), self.output_size
+            else:
+                new_h, new_w = self.output_size, int(self.output_size * w / h)
+        else:
+            new_h, new_w = self.output_size
+        image = image.resize((new_w, new_h))
+        return image
 
-        return imgname_caption_list
+# Standard transform
+image_transform = transforms.Compose([
+    Rescale((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
 
-    def __len__(self):
-        return len(self.imgname_caption_list)
-
-    def __getitem__(self, ix):
-        '''return one data pair (image and caption)'''
-        img_name = self.imgname_caption_list[ix][0]
-        img_name = os.path.join(self.img_dir, img_name)
-        caption = self.imgname_caption_list[ix][1]
-
-        # Add valid extension
-        valid_extensions = ['.jpg', '.png', '.jpeg','.JPG']
-        valid_name = ""
-        for ext in valid_extensions:
-            valid_name = img_name + ext
-            if os.path.exists(valid_name):
-                img_name = valid_name
-                break
-
-        # --- ADD THIS PART ---
-        try:
-            image = read_image(img_name)  # Shape: [C, H, W]
-        except Exception as e:
-            print(f"[ERROR] Failed to load image: {img_name}")
-            print(f"[ERROR] Reason: {e}")
-            raise e
-    # --- END ADD ---
-        
-        # Convert to RGB if needed (only modification)
-        if image.shape[0] == 1:  # Grayscale -> RGB
-            image = image.repeat(3, 1, 1)
-        elif image.shape[0] == 4:  # RGBA -> RGB
-            image = image[:3]
-        
-        image = image.float() / 255.0  # Keep original scaling
-
-        if self.transform is not None:
-            image = self.transform(image)
-
-        # Original caption processing
-        caption_list = self.tokenizer.encode(caption, return_tensors="pt").tolist()[0]
-        caption_list = torch.Tensor(caption_list)
-        return image, caption_list
-
-
-class FlickrStyleDataset(Dataset):
-    '''Styled caption dataset'''
-    def __init__(self, caption_file, tokenizer):
-        '''
-        Args:
-            caption_file: Path to styled caption file
-            tokenizer: Tokenizer instance
-        '''
-        self.caption_list = self._get_caption(caption_file)
-        self.tokenizer = tokenizer
-
-    def _get_caption(self, caption_file):
-        '''extract caption list from styled caption file'''
-        with open(caption_file, 'r') as f:
-            caption_list = f.readlines()
-
-        caption_list = [x.strip() for x in caption_list]
-        return caption_list
+# Custom Bangla Dataset (original style, factual or styled captions)
+class BanglaCaptionDataset(Dataset):
+    def __init__(self, img_paths, captions, transform=None):
+        self.img_paths = img_paths
+        self.captions = captions
+        self.transform = transform if transform else image_transform
 
     def __len__(self):
-        return len(self.caption_list)
+        return len(self.captions)
 
     def __getitem__(self, ix):
-        caption_text = self.caption_list[ix]
-        caption_text = caption_text.split("#")[-1][1:]  # Remove image name
-        caption_text = caption_text.strip()
+        img_path = self.img_paths[ix]
+        caption = self.captions[ix]
+        # Image open and preprocess
+        image = Image.open(img_path).convert("RGB")
+        image = self.transform(image)
+        # Tokenize caption (no <s>, </s> manual)
+        encoding = tokenizer(
+            caption,
+            truncation=True,
+            padding='max_length',
+            max_length=32,  # Or your desired
+            return_tensors="pt"
+        )
+        input_ids = encoding["input_ids"].squeeze(0)    # [seq_len]
+        attn_mask = encoding["attention_mask"].squeeze(0)
+        return image, input_ids, attn_mask
 
-        caption_list = self.tokenizer.encode(caption_text, return_tensors="pt").tolist()[0]
-        caption_list = torch.Tensor(caption_list)
-        return caption_list
+# Loader for flexible tab/space separated files (factual or stylized)
+def load_img_caption_lists(data_txt_file, image_folder, img_ext="jpg"):
+    img_paths = []
+    captions = []
+    with open(data_txt_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            # Robust: split by tab or 2+ spaces, fallback single space
+            parts = re.split(r'\s{2,}|\t', line, maxsplit=1)
+            if len(parts) < 2:
+                parts = line.split(' ', 1)
+                if len(parts) < 2:
+                    continue
+            id_and_idx, caption = parts
+            img_id = id_and_idx.split('#')[0]
+            if not (img_id.endswith('.jpg') or img_id.endswith('.jpeg') or img_id.endswith('.png')):
+                img_id = img_id + '.' + img_ext
+            img_path = os.path.join(image_folder, img_id)
+            if not os.path.exists(img_path):
+                print(f"Warning: {img_path} not found, skipping")
+                continue
+            img_paths.append(img_path)
+            captions.append(caption.strip())
+    print(f"Loaded {len(img_paths)} images and {len(captions)} captions.")
+    return img_paths, captions
 
-
-def get_data_loader(img_dir, caption_file, tokenizer, batch_size,
-                   transform=None, shuffle=False, num_workers=0):
-    if transform is None:
-        transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-    flickr7k = FlickerDataset(img_dir, caption_file, tokenizer, transform)
-    data_loader = DataLoader(dataset=flickr7k,
-                           batch_size=batch_size,
-                           shuffle=shuffle,
-                           num_workers=num_workers,
-                           collate_fn=lambda data: collate_fn(data, tokenizer.pad_token_id))
-    return data_loader
-
-
-def get_styled_data_loader(caption_file, tokenizer, batch_size,
-                         shuffle=False, num_workers=1):
-    flickr_styled_7k = FlickrStyleDataset(caption_file, tokenizer)
-    data_loader = DataLoader(dataset=flickr_styled_7k,
-                           batch_size=batch_size,
-                           shuffle=shuffle,
-                           num_workers=num_workers,
-                           collate_fn=lambda data: collate_fn_styled(data, tokenizer.pad_token_id))
-    return data_loader
-
-
-def collate_fn(data, pad_token_id):
-    data.sort(key=lambda x: len(x[1]), reverse=True)
-    images, captions = zip(*data)
+# Collate function (original style) — batch padding
+def collate_fn(data):
+    data.sort(key=lambda x: (x[1] != tokenizer.pad_token_id).sum(), reverse=True)
+    images, input_ids, attn_masks = zip(*data)
     images = torch.stack(images, 0)
-    lengths = torch.LongTensor([len(cap) for cap in captions])
-    captions = [pad_sequence(cap, max(lengths), pad_token_id) for cap in captions]
-    captions = torch.stack(captions, 0)
-    return images, captions, lengths
+    input_ids = torch.stack(input_ids, 0)
+    attn_masks = torch.stack(attn_masks, 0)
+    lengths = torch.LongTensor([(ids != tokenizer.pad_token_id).sum().item() for ids in input_ids])
+    return images, input_ids, attn_masks, lengths
 
+# Loader utility for train/test loop
+def get_loader(img_paths, captions, batch_size=32, shuffle=True, num_workers=2):
+    dataset = BanglaCaptionDataset(img_paths, captions)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn)
 
-def collate_fn_styled(captions, pad_token_id):
-    captions.sort(key=lambda x: len(x), reverse=True)
-    lengths = torch.LongTensor([len(cap) for cap in captions])
-    captions = [pad_sequence(cap, max(lengths), pad_token_id) for cap in captions]
-    captions = torch.stack(captions, 0)
-    return captions, lengths
+# Styled captions (only caption, no image needed)
+class BanglaStyledCaptionDataset(Dataset):
+    def __init__(self, captions):
+        self.captions = captions
 
+    def __len__(self):
+        return len(self.captions)
 
-def pad_sequence(seq, max_len, pad_token_id):
-    return torch.cat((seq, torch.full((max_len - len(seq),), fill_value=pad_token_id, dtype=torch.long)))
+    def __getitem__(self, ix):
+        caption = self.captions[ix]
+        encoding = tokenizer(
+            caption,
+            truncation=True,
+            padding='max_length',
+            max_length=32,
+            return_tensors="pt"
+        )
+        input_ids = encoding["input_ids"].squeeze(0)
+        attn_mask = encoding["attention_mask"].squeeze(0)
+        return input_ids, attn_mask
+
+def get_styled_loader(captions, batch_size=64, shuffle=True, num_workers=2):
+    dataset = BanglaStyledCaptionDataset(captions)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+
+# For manual testing
+if __name__ == "__main__":
+    # Example usage (set your file paths here)
+    img_paths, captions = load_img_caption_lists(
+        data_txt_file="your_factual_captions.txt",
+        image_folder="your_image_folder",
+        img_ext="jpg"
+    )
+    loader = get_loader(img_paths, captions, batch_size=3)
+    for i, (images, input_ids, attn_mask, lengths) in enumerate(loader):
+        print("Batch:", i)
+        print("Image batch:", images.shape)
+        print("Input_ids:", input_ids.shape)
+        print("Attention mask:", attn_mask.shape)
+        print("Lengths:", lengths)
+        if i == 2: break
