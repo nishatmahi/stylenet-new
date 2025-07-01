@@ -1,55 +1,70 @@
 import os
 import torch
-from torchvision.io import read_image
 from torchvision import transforms
-from transformers import AutoTokenizer
-import re
-from config import config
-from models import EncoderViT, FactoredLSTM
+from PIL import Image
+from data_loader import Rescale, tokenizer
+from models import EncoderCNN, FactoredLSTM
 
 def load_sample_images(img_dir, transform):
-    img_names = sorted(os.listdir(img_dir))
+    img_names = os.listdir(img_dir)
     img_list = []
     for img_name in img_names:
         img_path = os.path.join(img_dir, img_name)
-        image = read_image(img_path).float() / 255.0
-        if transform:
-            image = transform(image)
-        img_list.append(image)
+        img = Image.open(img_path).convert("RGB")
+        img = transform(img).unsqueeze(0)
+        img_list.append(img)
     return img_names, img_list
 
-# Load tokenizer
-tokenizer = AutoTokenizer.from_pretrained("hishab/titulm-mpt-1b-v2.0", trust_remote_code=True)
+def main():
+    # build model (use the dimension you used for training!)
+    emb_dim = 300
+    hidden_dim = 512
+    factored_dim = 512
 
-# Initialize models
-encoder = EncoderViT(config.emb_dim).to("cuda")
-decoder = FactoredLSTM(config.emb_dim, config.hidden_dim, config.factored_dim, vocab_size=tokenizer.vocab_size).to("cuda")
+    encoder = EncoderCNN(emb_dim)
+    decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, tokenizer.vocab_size)
 
-encoder.load_state_dict(torch.load(os.path.join(config.model_path, "encoder-last.pkl")))
-decoder.load_state_dict(torch.load(os.path.join(config.model_path, "decoder-last.pkl")))
+    # Load weights (update paths as needed)
+    encoder.load_state_dict(torch.load('pretrained_models/encoder-10.pkl', map_location='cpu'))
+    decoder.load_state_dict(torch.load('pretrained_models/decoder-10.pkl', map_location='cpu'))
 
-# Image transform 
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
+    encoder.eval()
+    decoder.eval()
 
-# Load and preprocess images
-img_names, img_list = load_sample_images(config.simg_path, transform)
+    # prepare images
+    transform = transforms.Compose([
+        Rescale((224, 224)),
+        transforms.ToTensor()
+    ])
+    img_names, img_list = load_sample_images('sample_images/', transform)
+    idx = 30
+    image = img_list[idx]
 
-# Use only the first image
-idx = 0
-selected_image = img_list[idx].unsqueeze(0).to("cuda")
+    # if torch.cuda.is_available():
+    #     encoder = encoder.cuda()
+    #     decoder = decoder.cuda()
+    #     image = image.cuda()
 
-encoder.eval()
-decoder.eval()
-with torch.no_grad():
-    features = encoder(selected_image)
-    style = "factual"  # Choose your style here!
-    caption_ids = decoder.sample(features, beam_size=5, max_len=30, mode=style)
-    caption = tokenizer.decode(caption_ids, skip_special_tokens=True).strip()
-    caption = re.sub(r"(।){2,}", "।", caption)
+    with torch.no_grad():
+        features = encoder(image)
+        output_token_ids = decoder.sample(
+            features,
+            tokenizer=tokenizer,      # Pass HuggingFace tokenizer!
+            beam_size=5,
+            max_len=30,
+            mode="factual"
+        )
 
-print(f"Image: {img_names[idx]}")
-print(f"Caption: {caption}")
+    # BOS token skip, stop at EOS
+    if output_token_ids and output_token_ids[0] == tokenizer.bos_token_id:
+        output_token_ids = output_token_ids[1:]
+    if tokenizer.eos_token_id in output_token_ids:
+        end_idx = output_token_ids.index(tokenizer.eos_token_id)
+        output_token_ids = output_token_ids[:end_idx]
+
+    caption = tokenizer.decode(output_token_ids, skip_special_tokens=True)
+    print(img_names[idx])
+    print(caption)
+
+if __name__ == '__main__':
+    main()
