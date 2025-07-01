@@ -34,6 +34,13 @@ image_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
+# ------------- MULTI-EXTENSION IMAGE FINDER (ADD THIS BLOCK) ---------------
+def find_image_with_any_ext(img_folder, img_id):
+    for ext in ['jpg', 'jpeg', 'png']:
+        candidate = os.path.join(img_folder, f"{img_id}.{ext}")
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 # Custom Bangla Dataset (original style, factual or styled captions)
 class BanglaCaptionDataset(Dataset):
