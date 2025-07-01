@@ -28,12 +28,15 @@ def main(args):
 
     # Bangla factual captions
     img_paths, factual_captions = load_img_caption_lists(
-        args.factual_caption_path, args.img_path, args.img_ext)
+        args.factual_caption_path, args.img_path
+    )
     # Bangla styled captions (e.g., humor/romantic)
     _, humorous_captions = load_img_caption_lists(
-        args.humorous_caption_path, args.img_path, args.img_ext) if args.humorous_caption_path else ([], [])
+        args.humorous_caption_path, args.img_path
+    ) if args.humorous_caption_path else ([], [])
     _, romantic_captions = load_img_caption_lists(
-        args.romantic_caption_path, args.img_path, args.img_ext) if args.romantic_caption_path else ([], [])
+        args.romantic_caption_path, args.img_path
+    ) if args.romantic_caption_path else ([], [])
 
     # DataLoader
     data_loader = get_loader(
