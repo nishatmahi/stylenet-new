@@ -43,6 +43,7 @@ def strip_ext(img_id):
             return img_id[: -len(ext)]
     return img_id
 
+# FACTUAL: image+caption (will check for image)
 class BanglaCaptionDataset(Dataset):
     def __init__(self, img_paths, captions, transform=None):
         self.img_paths = img_paths
@@ -81,11 +82,10 @@ def load_img_caption_lists(data_txt_file, image_folder):
             img_id = strip_ext(img_id)
             img_path = find_image_with_any_ext(image_folder, img_id)
             if img_path is None:
-                print(f"Warning: {img_id} not found in {image_folder}, skipping")
-                continue
+                continue  # warning remove: silently skip if image not found
             img_paths.append(img_path)
             captions.append(caption.strip())
-    print(f"Loaded {len(img_paths)} images and {len(captions)} captions.")
+    print(f"Loaded {len(img_paths)} images and {len(captions)} factual captions.")
     return img_paths, captions
 
 def collate_fn(data):
@@ -101,6 +101,7 @@ def get_loader(img_paths, captions, batch_size=32, shuffle=True, num_workers=2):
     dataset = BanglaCaptionDataset(img_paths, captions)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn)
 
+# STYLED: caption only, NO image check, for humor/romantic style
 class BanglaStyledCaptionDataset(Dataset):
     def __init__(self, captions):
         self.captions = captions
@@ -116,11 +117,31 @@ class BanglaStyledCaptionDataset(Dataset):
         attn_mask = encoding["attention_mask"].squeeze(0)
         return input_ids, attn_mask
 
+def load_styled_caption_list(data_txt_file):
+    captions = []
+    with open(data_txt_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = re.split(r'\s{2,}|\t', line, maxsplit=1)
+            if len(parts) < 2:
+                parts = line.split(' ', 1)
+                if len(parts) < 2:
+                    continue
+            # Always take only caption part
+            _, caption = parts
+            captions.append(caption.strip())
+    print(f"Loaded {len(captions)} styled captions.")
+    return captions
+
 def get_styled_loader(captions, batch_size=64, shuffle=True, num_workers=2):
     dataset = BanglaStyledCaptionDataset(captions)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
+# Manual test (optional)
 if __name__ == "__main__":
+    # Factual test
     img_paths, captions = load_img_caption_lists(
         data_txt_file="your_factual_captions.txt",
         image_folder="your_image_folder"
@@ -128,8 +149,11 @@ if __name__ == "__main__":
     loader = get_loader(img_paths, captions, batch_size=3)
     for i, (images, input_ids, attn_mask, lengths) in enumerate(loader):
         print("Batch:", i)
-        print("Image batch:", images.shape)
-        print("Input_ids:", input_ids.shape)
-        print("Attention mask:", attn_mask.shape)
-        print("Lengths:", lengths)
+        if i == 2: break
+
+    # Styled test
+    styled_captions = load_styled_caption_list("your_humorous_captions.txt")
+    styled_loader = get_styled_loader(styled_captions, batch_size=3)
+    for i, (input_ids, attn_mask) in enumerate(styled_loader):
+        print("Styled batch:", i)
         if i == 2: break
