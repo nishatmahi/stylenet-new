@@ -84,12 +84,11 @@ def main(args):
             outputs = decoder(input_ids, features, mode="factual")
             targets = input_ids[:, 1:].contiguous()
             outputs = outputs[:, :-1, :].contiguous()
-            # ==== SHAPE ALIGNMENT & LOSS ====
             loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
-            # ==== END SHAPE FIX ====
             loss.backward()
             optimizer_cap.step()
-            if i % args.log_step_caption == 0:
+            # === LOGGING FIX: always log last step ===
+            if (i % args.log_step_caption == 0) or (i == len(data_loader)-1):
                 print("Epoch [%d/%d], CAP, Step [%d/%d], Loss: %.4f"
                       % (epoch+1, args.epoch_num, i, len(data_loader), loss.data.item()))
         eval_outputs(outputs, tokenizer)
@@ -102,12 +101,11 @@ def main(args):
                 outputs = decoder(input_ids, features=None, mode='humorous')
                 targets = input_ids[:, 1:].contiguous()
                 outputs = outputs[:, :-1, :].contiguous()
-                # ==== SHAPE ALIGNMENT & LOSS ====
                 loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
-                # ==== END SHAPE FIX ====
                 loss.backward()
                 optimizer_lang.step()
-                if i % args.log_step_language == 0:
+                # === LOGGING FIX: always log last step ===
+                if (i % args.log_step_language == 0) or (i == len(styled_data_loader)-1):
                     print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
                         % (epoch+1, args.epoch_num, i, len(styled_data_loader), loss.data.item()))
         if styled_data_loader_romantic:
@@ -117,12 +115,11 @@ def main(args):
                 outputs = decoder(input_ids, features=None, mode='romantic')
                 targets = input_ids[:, 1:].contiguous()
                 outputs = outputs[:, :-1, :].contiguous()
-                # ==== SHAPE ALIGNMENT & LOSS ====
                 loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
-                # ==== END SHAPE FIX ====
                 loss.backward()
                 optimizer_lang.step()
-                if i % args.log_step_language == 0:
+                # === LOGGING FIX: always log last step ===
+                if (i % args.log_step_language == 0) or (i == len(styled_data_loader_romantic)-1):
                     print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
                         % (epoch+1, args.epoch_num, i, len(styled_data_loader_romantic), loss.data.item()))
 
