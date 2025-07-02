@@ -157,7 +157,7 @@ if __name__ == '__main__':
                         help='hidden state size of factored LSTM')
     parser.add_argument('--factored_dim', type=int, default=512,
                         help='size of factored matrix')
-    parser.add_argument('--lr_caption', type=float, default=0.0002,
+    parser.add_argument('--lr_caption', type=float, default=0.0003,
                         help='learning rate for caption model training')
     parser.add_argument('--lr_language', type=float, default=0.0005,
                         help='learning rate for language model training')
