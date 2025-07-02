@@ -20,20 +20,26 @@ def eval_outputs(outputs, tokenizer):
         text = tokenizer.convert_tokens_to_string(tokens)
         print("Generated:", text)
 
+def align_and_loss(outputs, targets, criterion, vocab_size):
+    # ---- Shape alignment fix block ----
+    if outputs.size(1) != targets.size(1):
+        seq_len = min(outputs.size(1), targets.size(1))
+        print(f"[Trim] outputs seq_len={outputs.size(1)}, targets seq_len={targets.size(1)} → trim to {seq_len}")
+        outputs = outputs[:, :seq_len, :]
+        targets = targets[:, :seq_len]
+    # Now shapes must match!
+    return criterion(outputs.reshape(-1, vocab_size), targets.reshape(-1))
+
 def main(args):
     model_path = args.model_path
     os.makedirs(model_path, exist_ok=True)
 
-    # Bangla factual captions (image+caption loader)
     img_paths, factual_captions = load_img_caption_lists(
         args.factual_caption_path, args.img_path
     )
-
-    # Bangla styled captions (caption only loader, NO image check!)
     humorous_captions = load_styled_caption_list(args.humorous_caption_path) if args.humorous_caption_path else []
     romantic_captions = load_styled_caption_list(args.romantic_caption_path) if args.romantic_caption_path else []
 
-    # DataLoader
     data_loader = get_loader(
         img_paths, factual_captions, batch_size=args.caption_batch_size, shuffle=True, num_workers=2)
     styled_data_loader = get_styled_loader(
@@ -41,21 +47,18 @@ def main(args):
     styled_data_loader_romantic = get_styled_loader(
         romantic_captions, batch_size=args.language_batch_size, shuffle=True, num_workers=2) if romantic_captions else None
 
-    # Models
     encoder = EncoderCNN(args.emb_dim)
     decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, tokenizer.vocab_size)
     if torch.cuda.is_available():
         encoder = encoder.cuda()
         decoder = decoder.cuda()
 
-    # Loss and optimizers
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     cap_params = list(decoder.parameters()) + list(encoder.A.parameters())
     lang_params = list(decoder.parameters())
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
-    # ======= Load checkpoint if exists =======
     checkpoint_path = os.path.join(model_path, 'checkpoint-latest.pth')
     start_epoch = 0
     if os.path.exists(checkpoint_path):
@@ -69,9 +72,7 @@ def main(args):
     else:
         print("[Checkpoint] No previous checkpoint found. Training from scratch.")
 
-    # ======= Training Loop =======
     for epoch in range(start_epoch, args.epoch_num):
-        # Captioning (factual, with images)
         encoder.train()
         decoder.train()
         for i, (images, input_ids, attn_mask, lengths) in enumerate(data_loader):
@@ -83,7 +84,9 @@ def main(args):
             outputs = decoder(input_ids, features, mode="factual")
             targets = input_ids[:, 1:].contiguous()
             outputs = outputs[:, :-1, :].contiguous()
-            loss = criterion(outputs.view(-1, tokenizer.vocab_size), targets.view(-1))
+            # ==== SHAPE ALIGNMENT & LOSS ====
+            loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
+            # ==== END SHAPE FIX ====
             loss.backward()
             optimizer_cap.step()
             if i % args.log_step_caption == 0:
@@ -99,13 +102,14 @@ def main(args):
                 outputs = decoder(input_ids, features=None, mode='humorous')
                 targets = input_ids[:, 1:].contiguous()
                 outputs = outputs[:, :-1, :].contiguous()
-                loss = criterion(outputs.view(-1, tokenizer.vocab_size), targets.view(-1))
+                # ==== SHAPE ALIGNMENT & LOSS ====
+                loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
+                # ==== END SHAPE FIX ====
                 loss.backward()
                 optimizer_lang.step()
                 if i % args.log_step_language == 0:
                     print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
                         % (epoch+1, args.epoch_num, i, len(styled_data_loader), loss.data.item()))
-        # Language modeling (styled: romantic)
         if styled_data_loader_romantic:
             for i, (input_ids, attn_mask) in enumerate(styled_data_loader_romantic):
                 input_ids = to_var(input_ids)
@@ -113,14 +117,15 @@ def main(args):
                 outputs = decoder(input_ids, features=None, mode='romantic')
                 targets = input_ids[:, 1:].contiguous()
                 outputs = outputs[:, :-1, :].contiguous()
-                loss = criterion(outputs.view(-1, tokenizer.vocab_size), targets.view(-1))
+                # ==== SHAPE ALIGNMENT & LOSS ====
+                loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
+                # ==== END SHAPE FIX ====
                 loss.backward()
                 optimizer_lang.step()
                 if i % args.log_step_language == 0:
                     print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
                         % (epoch+1, args.epoch_num, i, len(styled_data_loader_romantic), loss.data.item()))
 
-        # ======= Only Save the Latest Weights & Checkpoint =======
         torch.save(decoder.state_dict(), os.path.join(model_path, 'decoder-last.pkl'))
         torch.save(encoder.state_dict(), os.path.join(model_path, 'encoder-last.pkl'))
         torch.save({
