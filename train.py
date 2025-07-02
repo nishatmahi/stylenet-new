@@ -1,7 +1,7 @@
 import os
 import argparse
 import torch
-from data_loader import get_loader, get_styled_loader, load_img_caption_lists, tokenizer
+from data_loader import get_loader, get_styled_loader, load_img_caption_lists, load_styled_caption_list, tokenizer
 from models import EncoderCNN, FactoredLSTM
 import torch.nn as nn
 import torch.optim as optim
@@ -12,9 +12,8 @@ def to_var(x):
     return x
 
 def eval_outputs(outputs, tokenizer):
-    # outputs: [batch, max_len-1, vocab_size]
-    indices = torch.topk(outputs, 1)[1]  # [batch, seq, 1]
-    indices = indices.squeeze(2)         # [batch, seq]
+    indices = torch.topk(outputs, 1)[1]
+    indices = indices.squeeze(2)
     indices = indices.data.cpu().numpy()
     for i in range(len(indices)):
         tokens = tokenizer.convert_ids_to_tokens(indices[i])
@@ -26,17 +25,14 @@ def main(args):
     if not os.path.exists(model_path):
         os.makedirs(model_path)
 
-    # Bangla factual captions
+    # Bangla factual captions (image+caption loader)
     img_paths, factual_captions = load_img_caption_lists(
         args.factual_caption_path, args.img_path
     )
-    # Bangla styled captions (e.g., humor/romantic)
-    _, humorous_captions = load_img_caption_lists(
-        args.humorous_caption_path, args.img_path
-    ) if args.humorous_caption_path else ([], [])
-    _, romantic_captions = load_img_caption_lists(
-        args.romantic_caption_path, args.img_path
-    ) if args.romantic_caption_path else ([], [])
+
+    # Bangla styled captions (caption only loader, NO image check!)
+    humorous_captions = load_styled_caption_list(args.humorous_caption_path) if args.humorous_caption_path else []
+    romantic_captions = load_styled_caption_list(args.romantic_caption_path) if args.romantic_caption_path else []
 
     # DataLoader
     data_loader = get_loader(
