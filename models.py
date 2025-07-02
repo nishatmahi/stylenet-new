@@ -88,11 +88,11 @@ class FactoredLSTM(nn.Module):
             f = self.S_hf(f)
             o = self.S_ho(o)
             c = self.S_hc(c)
-        # elif mode == "romantic":
-        #     i = self.S_ri(i)
-        #     f = self.S_rf(f)
-        #     o = self.S_ro(o)
-        #     c = self.S_rc(c)
+        elif mode == "romantic":
+           i = self.S_ri(i)
+           f = self.S_rf(f)
+           o = self.S_ro(o)
+           c = self.S_rc(c)
         else:
             sys.stderr.write("mode name wrong!\n")
 
