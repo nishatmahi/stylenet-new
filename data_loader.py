@@ -139,7 +139,7 @@ def load_styled_caption_list(data_txt_file):
     print(f"Loaded {len(captions)} styled captions.")
     return captions
 
-def get_styled_loader(captions, batch_size=64, shuffle=True, num_workers=1):
+def get_styled_loader(captions, batch_size=64, shuffle=True, num_workers=2):
     dataset = BanglaStyledCaptionDataset(captions)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
