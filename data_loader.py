@@ -97,7 +97,7 @@ def collate_fn(data):
     lengths = torch.LongTensor([(ids != tokenizer.pad_token_id).sum().item() for ids in input_ids])
     return images, input_ids, attn_masks, lengths
 
-def get_loader(img_paths, captions, batch_size=32, shuffle=True, num_workers=2):
+def get_loader(img_paths, captions, batch_size=32, shuffle=True, num_workers=1):
     dataset = BanglaCaptionDataset(img_paths, captions)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn)
 
