@@ -137,13 +137,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla: Generating Attractive Visual Captions with Styles')
     parser.add_argument('--model_path', type=str, default='pretrained_models',
                         help='path for saving trained models')
-    parser.add_argument('--img_path', type=str, default='/kaggle/working/dataset/data/Images',
+    parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images',
                     help='path for train images directory')
-    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/working/dataset/data/factual_caption.txt',
+    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_caption.txt',
                         help='path for factual caption file')
-    parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/working/dataset/data/humorous_train.txt',
+    parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset/data/humorous_train.txt',
                         help='path for humorous caption file')
-    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/working/dataset/data/romantic_train.txt',
+    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_train.txt',
                         help='path for romantic caption file')
     parser.add_argument('--caption_batch_size', type=int, default=64,
                         help='mini batch size for caption model training')
