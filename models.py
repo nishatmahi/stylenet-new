@@ -65,10 +65,10 @@ class FactoredLSTM(nn.Module):
         self.S_hf = nn.Linear(factored_dim, factored_dim)
         self.S_ho = nn.Linear(factored_dim, factored_dim)
         self.S_hc = nn.Linear(factored_dim, factored_dim)
-        # self.S_ri = nn.Linear(factored_dim, factored_dim)
-        # self.S_rf = nn.Linear(factored_dim, factored_dim)
-        # self.S_ro = nn.Linear(factored_dim, factored_dim)
-        # self.S_rc = nn.Linear(factored_dim, factored_dim)
+        self.S_ri = nn.Linear(factored_dim, factored_dim)
+        self.S_rf = nn.Linear(factored_dim, factored_dim)
+        self.S_ro = nn.Linear(factored_dim, factored_dim)
+        self.S_rc = nn.Linear(factored_dim, factored_dim)
 
         self.C = nn.Linear(hidden_dim, vocab_size)
 
