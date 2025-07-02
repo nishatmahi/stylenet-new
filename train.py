@@ -22,8 +22,7 @@ def eval_outputs(outputs, tokenizer):
 
 def main(args):
     model_path = args.model_path
-    if not os.path.exists(model_path):
-        os.makedirs(model_path)
+    os.makedirs(model_path, exist_ok=True)
 
     # Bangla factual captions (image+caption loader)
     img_paths, factual_captions = load_img_caption_lists(
@@ -56,12 +55,25 @@ def main(args):
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
-    # Train
-    total_cap_step = len(data_loader)
-    total_lang_step = len(styled_data_loader) if styled_data_loader else 0
-    total_rom_step = len(styled_data_loader_romantic) if styled_data_loader_romantic else 0
-    for epoch in range(args.epoch_num):
+    # ======= Load checkpoint if exists =======
+    checkpoint_path = os.path.join(model_path, 'checkpoint-latest.pth')
+    start_epoch = 0
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location="cuda" if torch.cuda.is_available() else "cpu")
+        encoder.load_state_dict(checkpoint['encoder_state_dict'])
+        decoder.load_state_dict(checkpoint['decoder_state_dict'])
+        optimizer_cap.load_state_dict(checkpoint['optimizer_cap_state_dict'])
+        optimizer_lang.load_state_dict(checkpoint['optimizer_lang_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"[Checkpoint] Loaded checkpoint from epoch {checkpoint['epoch']+1}")
+    else:
+        print("[Checkpoint] No previous checkpoint found. Training from scratch.")
+
+    # ======= Training Loop =======
+    for epoch in range(start_epoch, args.epoch_num):
         # Captioning (factual, with images)
+        encoder.train()
+        decoder.train()
         for i, (images, input_ids, attn_mask, lengths) in enumerate(data_loader):
             images = to_var(images)
             input_ids = to_var(input_ids)
@@ -76,7 +88,7 @@ def main(args):
             optimizer_cap.step()
             if i % args.log_step_caption == 0:
                 print("Epoch [%d/%d], CAP, Step [%d/%d], Loss: %.4f"
-                      % (epoch+1, args.epoch_num, i, total_cap_step, loss.data.item()))
+                      % (epoch+1, args.epoch_num, i, len(data_loader), loss.data.item()))
         eval_outputs(outputs, tokenizer)
 
         # Language modeling (styled captions: humorous)
@@ -92,7 +104,7 @@ def main(args):
                 optimizer_lang.step()
                 if i % args.log_step_language == 0:
                     print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
-                        % (epoch+1, args.epoch_num, i, total_lang_step, loss.data.item()))
+                        % (epoch+1, args.epoch_num, i, len(styled_data_loader), loss.data.item()))
         # Language modeling (styled: romantic)
         if styled_data_loader_romantic:
             for i, (input_ids, attn_mask) in enumerate(styled_data_loader_romantic):
@@ -106,26 +118,32 @@ def main(args):
                 optimizer_lang.step()
                 if i % args.log_step_language == 0:
                     print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
-                        % (epoch+1, args.epoch_num, i, total_rom_step, loss.data.item()))
+                        % (epoch+1, args.epoch_num, i, len(styled_data_loader_romantic), loss.data.item()))
 
-        # Save models
-        torch.save(decoder.state_dict(),
-                   os.path.join(model_path, 'decoder-%d.pkl' % (epoch + 1,)))
-        torch.save(encoder.state_dict(),
-                   os.path.join(model_path, 'encoder-%d.pkl' % (epoch + 1,)))
-        print("Model saved for epoch %d" % (epoch+1))
+        # ======= Only Save the Latest Weights & Checkpoint =======
+        torch.save(decoder.state_dict(), os.path.join(model_path, 'decoder-last.pkl'))
+        torch.save(encoder.state_dict(), os.path.join(model_path, 'encoder-last.pkl'))
+        torch.save({
+            'epoch': epoch,
+            'encoder_state_dict': encoder.state_dict(),
+            'decoder_state_dict': decoder.state_dict(),
+            'optimizer_cap_state_dict': optimizer_cap.state_dict(),
+            'optimizer_lang_state_dict': optimizer_lang.state_dict(),
+            'loss': loss.item(),
+        }, os.path.join(model_path, 'checkpoint-latest.pth'))
+        print(f"[Checkpoint] Saved at end of epoch {epoch+1}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla: Generating Attractive Visual Captions with Styles')
     parser.add_argument('--model_path', type=str, default='pretrained_models',
                         help='path for saving trained models')
-    parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images',
+    parser.add_argument('--img_path', type=str, default='/kaggle/working/dataset/data/Images',
                     help='path for train images directory')
-    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_caption.txt',
+    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/working/dataset/data/factual_caption.txt',
                         help='path for factual caption file')
-    parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset/data/humorous_train.txt',
+    parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/working/dataset/data/humorous_train.txt',
                         help='path for humorous caption file')
-    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_train.txt',
+    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/working/dataset/data/romantic_train.txt',
                         help='path for romantic caption file')
     parser.add_argument('--caption_batch_size', type=int, default=64,
                         help='mini batch size for caption model training')
