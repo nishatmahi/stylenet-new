@@ -4,7 +4,6 @@ import torch
 from data_loader import get_loader, get_styled_loader, load_img_caption_lists, load_styled_caption_list, tokenizer
 from models import EncoderCNN, FactoredLSTM
 import torch.nn as nn
-import torch.optim as optim
 
 def to_var(x):
     if torch.cuda.is_available():
@@ -21,13 +20,11 @@ def eval_outputs(outputs, tokenizer):
         print("Generated:", text)
 
 def align_and_loss(outputs, targets, criterion, vocab_size):
-    # ---- Shape alignment fix block ----
     if outputs.size(1) != targets.size(1):
         seq_len = min(outputs.size(1), targets.size(1))
         print(f"[Trim] outputs seq_len={outputs.size(1)}, targets seq_len={targets.size(1)} → trim to {seq_len}")
         outputs = outputs[:, :seq_len, :]
         targets = targets[:, :seq_len]
-    # Now shapes must match!
     return criterion(outputs.reshape(-1, vocab_size), targets.reshape(-1))
 
 def main(args):
@@ -86,25 +83,25 @@ def main(args):
             outputs = outputs[:, :-1, :].contiguous()
             loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
             optimizer_cap.step()
-            # === LOGGING FIX: always log last step ===
             if (i % args.log_step_caption == 0) or (i == len(data_loader)-1):
                 print("Epoch [%d/%d], CAP, Step [%d/%d], Loss: %.4f"
                       % (epoch+1, args.epoch_num, i, len(data_loader), loss.data.item()))
         eval_outputs(outputs, tokenizer)
 
-        # Language modeling (styled captions: humorous)
         if styled_data_loader:
             for i, (input_ids, attn_mask) in enumerate(styled_data_loader):
                 input_ids = to_var(input_ids)
                 decoder.zero_grad()
-                outputs = decoder(input_ids, features=None, mode='humorous')
+                dummy_features = torch.zeros(input_ids.size(0), args.emb_dim).to(input_ids.device)
+                outputs = decoder(input_ids, features=dummy_features, mode='humorous')
                 targets = input_ids[:, 1:].contiguous()
                 outputs = outputs[:, :-1, :].contiguous()
                 loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
                 optimizer_lang.step()
-                # === LOGGING FIX: always log last step ===
                 if (i % args.log_step_language == 0) or (i == len(styled_data_loader)-1):
                     print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
                         % (epoch+1, args.epoch_num, i, len(styled_data_loader), loss.data.item()))
@@ -112,13 +109,14 @@ def main(args):
             for i, (input_ids, attn_mask) in enumerate(styled_data_loader_romantic):
                 input_ids = to_var(input_ids)
                 decoder.zero_grad()
-                outputs = decoder(input_ids, features=None, mode='romantic')
+                dummy_features = torch.zeros(input_ids.size(0), args.emb_dim).to(input_ids.device)
+                outputs = decoder(input_ids, features=dummy_features, mode='romantic')
                 targets = input_ids[:, 1:].contiguous()
                 outputs = outputs[:, :-1, :].contiguous()
                 loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
                 optimizer_lang.step()
-                # === LOGGING FIX: always log last step ===
                 if (i % args.log_step_language == 0) or (i == len(styled_data_loader_romantic)-1):
                     print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
                         % (epoch+1, args.epoch_num, i, len(styled_data_loader_romantic), loss.data.item()))
@@ -157,9 +155,9 @@ if __name__ == '__main__':
                         help='hidden state size of factored LSTM')
     parser.add_argument('--factored_dim', type=int, default=512,
                         help='size of factored matrix')
-    parser.add_argument('--lr_caption', type=float, default=0.0001,
+    parser.add_argument('--lr_caption', type=float, default=0.00001,
                         help='learning rate for caption model training')
-    parser.add_argument('--lr_language', type=float, default=0.0002,
+    parser.add_argument('--lr_language', type=float, default=0.00002,
                         help='learning rate for language model training')
     parser.add_argument('--epoch_num', type=int, default=30)
     parser.add_argument('--log_step_caption', type=int, default=100,
