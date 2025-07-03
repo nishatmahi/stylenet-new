@@ -45,7 +45,14 @@ def main(args):
         romantic_captions, batch_size=args.language_batch_size, shuffle=True, num_workers=2) if romantic_captions else None
 
     encoder = EncoderCNN(args.emb_dim)
-    decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, tokenizer.vocab_size, dropout_p=0.3)
+    # --------- Encoder freeze here ---------
+    for param in encoder.resnet.parameters():
+        param.requires_grad = False
+    # Optionally, only encoder.A trainable (stylenet logic)
+    for param in encoder.A.parameters():
+        param.requires_grad = True
+
+    decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, tokenizer.vocab_size)
     if torch.cuda.is_available():
         encoder = encoder.cuda()
         decoder = decoder.cuda()
@@ -94,8 +101,8 @@ def main(args):
             for i, (input_ids, attn_mask) in enumerate(styled_data_loader):
                 input_ids = to_var(input_ids)
                 decoder.zero_grad()
-                dummy_features = torch.zeros(input_ids.size(0), args.emb_dim).to(input_ids.device)
-                outputs = decoder(input_ids, features=dummy_features, mode='humorous')
+                # --------- No dummy features! ---------
+                outputs = decoder(input_ids, features=None, mode='humorous')
                 targets = input_ids[:, 1:].contiguous()
                 outputs = outputs[:, :-1, :].contiguous()
                 loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
@@ -109,8 +116,7 @@ def main(args):
             for i, (input_ids, attn_mask) in enumerate(styled_data_loader_romantic):
                 input_ids = to_var(input_ids)
                 decoder.zero_grad()
-                dummy_features = torch.zeros(input_ids.size(0), args.emb_dim).to(input_ids.device)
-                outputs = decoder(input_ids, features=dummy_features, mode='romantic')
+                outputs = decoder(input_ids, features=None, mode='romantic')
                 targets = input_ids[:, 1:].contiguous()
                 outputs = outputs[:, :-1, :].contiguous()
                 loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
@@ -155,11 +161,11 @@ if __name__ == '__main__':
                         help='hidden state size of factored LSTM')
     parser.add_argument('--factored_dim', type=int, default=512,
                         help='size of factored matrix')
-    parser.add_argument('--lr_caption', type=float, default=0.00001,
+    parser.add_argument('--lr_caption', type=float, default=0.0001,
                         help='learning rate for caption model training')
-    parser.add_argument('--lr_language', type=float, default=0.00002,
+    parser.add_argument('--lr_language', type=float, default=0.0002,
                         help='learning rate for language model training')
-    parser.add_argument('--epoch_num', type=int, default=10)
+    parser.add_argument('--epoch_num', type=int, default=30)
     parser.add_argument('--log_step_caption', type=int, default=100,
                         help='steps for print log while train caption model')
     parser.add_argument('--log_step_language', type=int, default=10,
