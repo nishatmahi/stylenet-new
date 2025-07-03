@@ -4,7 +4,6 @@ import torch.nn as nn
 import torchvision.models as models
 import torch.nn.functional as F
 
-# --------- EncoderCNN (ResNet152) ---------
 class EncoderCNN(nn.Module):
     def __init__(self, emb_dim):
         super(EncoderCNN, self).__init__()
@@ -21,14 +20,14 @@ class EncoderCNN(nn.Module):
         features = self.bn(features)
         return features
 
-# --------- FactoredLSTM ---------
 class FactoredLSTM(nn.Module):
-    def __init__(self, emb_dim, hidden_dim, factored_dim, vocab_size):
+    def __init__(self, emb_dim, hidden_dim, factored_dim, vocab_size, dropout_p=0.3):
         super(FactoredLSTM, self).__init__()
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
 
         self.B = nn.Embedding(vocab_size, emb_dim)
+        self.dropout = nn.Dropout(dropout_p)  # Dropout add korlam
 
         self.U_i = nn.Linear(factored_dim, hidden_dim)
         self.S_fi = nn.Linear(factored_dim, factored_dim)
@@ -50,7 +49,6 @@ class FactoredLSTM(nn.Module):
         self.V_c = nn.Linear(emb_dim, factored_dim)
         self.W_c = nn.Linear(hidden_dim, hidden_dim)
 
-        # Style-specific
         self.S_hi = nn.Linear(factored_dim, factored_dim)
         self.S_hf = nn.Linear(factored_dim, factored_dim)
         self.S_ho = nn.Linear(factored_dim, factored_dim)
@@ -97,12 +95,13 @@ class FactoredLSTM(nn.Module):
         c_t = f_t * c_0 + i_t * c_tilda
         h_t = o_t * torch.tanh(c_t)
 
-        outputs = self.C(h_t)
+        outputs = self.dropout(self.C(h_t))  # Dropout add here
         return outputs, h_t, c_t
 
     def forward(self, captions, features=None, mode="factual"):
         batch_size = captions.size(0)
         embedded = self.B(captions)
+        embedded = self.dropout(embedded)  # Dropout on embedding
         if mode == "factual":
             if features is None:
                 sys.stderr.write("features is None!\n")
@@ -118,7 +117,6 @@ class FactoredLSTM(nn.Module):
             emb = embedded[:, ix, :]
             outputs, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode)
             all_outputs.append(outputs)
-
         all_outputs = torch.stack(all_outputs, 1)
         return all_outputs
 
@@ -129,7 +127,6 @@ class FactoredLSTM(nn.Module):
             h_t = h_t.cuda()
             c_t = c_t.cuda()
             feature = feature.cuda()
-        # BOS token id from HuggingFace tokenizer
         start_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
         symbol_id = torch.LongTensor([start_id]).unsqueeze(0)
         symbol_id = symbol_id.cuda() if torch.cuda.is_available() else symbol_id
