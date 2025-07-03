@@ -3,27 +3,19 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torch.nn.functional as F
-from torch.autograd import Variable
 
 # --------- EncoderCNN (ResNet152) ---------
 class EncoderCNN(nn.Module):
     def __init__(self, emb_dim):
-        '''
-        Load the pretrained ResNet152 and replace fc
-        '''
         super(EncoderCNN, self).__init__()
-        resnet = models.resnet152(pretrained=True)
+        resnet = models.resnet152(weights=models.ResNet152_Weights.IMAGENET1K_V1)
         modules = list(resnet.children())[:-1]
         self.resnet = nn.Sequential(*modules)
         self.A = nn.Linear(resnet.fc.in_features, emb_dim)
         self.bn = nn.BatchNorm1d(emb_dim, momentum=0.01)
 
     def forward(self, images):
-        '''
-        Extract the image feature vectors
-        '''
-        with torch.no_grad():
-            features = self.resnet(images)
+        features = self.resnet(images)
         features = features.view(features.size(0), -1)
         features = self.A(features)
         features = self.bn(features)
@@ -36,10 +28,8 @@ class FactoredLSTM(nn.Module):
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
 
-        # Embedding (HuggingFace tokenizer compatible)
         self.B = nn.Embedding(vocab_size, emb_dim)
 
-        # Factored LSTM weights (for each gate)
         self.U_i = nn.Linear(factored_dim, hidden_dim)
         self.S_fi = nn.Linear(factored_dim, factored_dim)
         self.V_i = nn.Linear(emb_dim, factored_dim)
@@ -60,7 +50,7 @@ class FactoredLSTM(nn.Module):
         self.V_c = nn.Linear(emb_dim, factored_dim)
         self.W_c = nn.Linear(hidden_dim, hidden_dim)
 
-        # Style-specific (optional, for humor/romantic etc)
+        # Style-specific
         self.S_hi = nn.Linear(factored_dim, factored_dim)
         self.S_hf = nn.Linear(factored_dim, factored_dim)
         self.S_ho = nn.Linear(factored_dim, factored_dim)
@@ -69,6 +59,9 @@ class FactoredLSTM(nn.Module):
         self.S_rf = nn.Linear(factored_dim, factored_dim)
         self.S_ro = nn.Linear(factored_dim, factored_dim)
         self.S_rc = nn.Linear(factored_dim, factored_dim)
+
+        self.init_h = nn.Linear(emb_dim, hidden_dim)
+        self.init_c = nn.Linear(emb_dim, hidden_dim)
 
         self.C = nn.Linear(hidden_dim, vocab_size)
 
@@ -89,10 +82,10 @@ class FactoredLSTM(nn.Module):
             o = self.S_ho(o)
             c = self.S_hc(c)
         elif mode == "romantic":
-           i = self.S_ri(i)
-           f = self.S_rf(f)
-           o = self.S_ro(o)
-           c = self.S_rc(c)
+            i = self.S_ri(i)
+            f = self.S_rf(f)
+            o = self.S_ro(o)
+            c = self.S_rc(c)
         else:
             sys.stderr.write("mode name wrong!\n")
 
@@ -105,36 +98,22 @@ class FactoredLSTM(nn.Module):
         h_t = o_t * torch.tanh(c_t)
 
         outputs = self.C(h_t)
-
         return outputs, h_t, c_t
 
     def forward(self, captions, features=None, mode="factual"):
-        '''
-        Args:
-            features: fixed vectors from images, [batch, emb_dim]
-            captions: [batch, max_len]
-            mode: type of caption to generate
-        '''
         batch_size = captions.size(0)
-        embedded = self.B(captions)  # [batch, max_len, emb_dim]
-        # concat features and captions
+        embedded = self.B(captions)
         if mode == "factual":
             if features is None:
                 sys.stderr.write("features is None!\n")
             embedded = torch.cat((features.unsqueeze(1), embedded), 1)
-
-        # initialize hidden state
-        h_t = torch.zeros(batch_size, self.hidden_dim)
-        c_t = torch.zeros(batch_size, self.hidden_dim)
-        nn.init.uniform_(h_t)
-        nn.init.uniform_(c_t)
-
-        if torch.cuda.is_available():
-            h_t = h_t.cuda()
-            c_t = c_t.cuda()
+            h_t = self.init_h(features)
+            c_t = self.init_c(features)
+        else:
+            h_t = torch.zeros(batch_size, self.hidden_dim, device=embedded.device)
+            c_t = torch.zeros(batch_size, self.hidden_dim, device=embedded.device)
 
         all_outputs = []
-        # iterate
         for ix in range(embedded.size(1) - 1):
             emb = embedded[:, ix, :]
             outputs, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode)
@@ -144,29 +123,12 @@ class FactoredLSTM(nn.Module):
         return all_outputs
 
     def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual"):
-        '''
-        generate captions from feature vectors with beam search
-
-        Args:
-            feature: fixed vector for an image, [1, emb_dim]
-            tokenizer: HuggingFace tokenizer (for special tokens)
-            beam_size: stock size for beam search
-            max_len: max sampling length
-            mode: type of caption to generate
-        '''
-        h_t = torch.zeros(1, self.hidden_dim)
-        c_t = torch.zeros(1, self.hidden_dim)
-        nn.init.uniform_(h_t)
-        nn.init.uniform_(c_t)
-
+        h_t = self.init_h(feature)
+        c_t = self.init_c(feature)
         if torch.cuda.is_available():
             h_t = h_t.cuda()
             c_t = c_t.cuda()
             feature = feature.cuda()
-
-        # First input: image feature as embedded
-        _, h_t, c_t = self.forward_step(feature, h_t, c_t, mode=mode)
-
         # BOS token id from HuggingFace tokenizer
         start_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
         symbol_id = torch.LongTensor([start_id]).unsqueeze(0)
@@ -197,8 +159,6 @@ class FactoredLSTM(nn.Module):
                         )
             if end_flag:
                 break
-            # sort by normalized log probs, pick beam_size highest candidate
-            candidates = sorted(tmp_candidates,
-                                key=lambda x: -x[0].item() / len(x[-1]))[:beam_size]
+            candidates = sorted(tmp_candidates, key=lambda x: -x[0].item()/len(x[-1]))[:beam_size]
 
         return candidates[0][-1]
