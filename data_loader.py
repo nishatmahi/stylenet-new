@@ -6,10 +6,8 @@ from PIL import Image
 from torchvision import transforms
 from transformers import AutoTokenizer
 
-# ---- HuggingFace Bangla Tokenizer ----
 tokenizer = AutoTokenizer.from_pretrained("hishab/titulm-mpt-1b-v2.0", trust_remote_code=True)
 
-# ---- Image transforms ----
 class Rescale:
     def __init__(self, output_size):
         assert isinstance(output_size, (int, tuple))
@@ -34,7 +32,6 @@ image_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-# ---- Helper functions ----
 def find_image_with_any_ext(img_folder, img_id):
     for ext in ['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG']:
         candidate = os.path.join(img_folder, f"{img_id}.{ext}")
@@ -48,7 +45,6 @@ def strip_ext(img_id):
             return img_id[: -len(ext)]
     return img_id
 
-# ---- Factual (image+caption) ----
 class BanglaCaptionDataset(Dataset):
     def __init__(self, img_paths, captions, transform=None):
         self.img_paths = img_paths
@@ -101,7 +97,6 @@ def load_img_caption_lists(data_txt_file, image_folder):
     return img_paths, captions
 
 def collate_fn(data):
-    # Sort by caption length (descending, for pack_padded, if needed)
     data.sort(key=lambda x: (x[1] != tokenizer.pad_token_id).sum(), reverse=True)
     images, input_ids, attn_masks = zip(*data)
     images = torch.stack(images, 0)
@@ -114,7 +109,6 @@ def get_loader(img_paths, captions, batch_size=32, shuffle=True, num_workers=1):
     dataset = BanglaCaptionDataset(img_paths, captions)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn)
 
-# ---- Styled: caption only ----
 class BanglaStyledCaptionDataset(Dataset):
     def __init__(self, captions):
         self.captions = captions
