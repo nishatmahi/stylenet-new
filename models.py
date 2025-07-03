@@ -3,32 +3,38 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torch.nn.functional as F
+from torch.autograd import Variable
 
+# --------- EncoderCNN (ResNet152) ---------
 class EncoderCNN(nn.Module):
     def __init__(self, emb_dim):
+        '''
+        Load the pretrained ResNet152 and replace fc
+        '''
         super(EncoderCNN, self).__init__()
-        resnet = models.resnet152(weights=models.ResNet152_Weights.IMAGENET1K_V1)
+        resnet = models.resnet152(pretrained=True)
         modules = list(resnet.children())[:-1]
         self.resnet = nn.Sequential(*modules)
         self.A = nn.Linear(resnet.fc.in_features, emb_dim)
-        self.bn = nn.BatchNorm1d(emb_dim, momentum=0.01)
 
     def forward(self, images):
+        '''Extract the image feature vectors'''
         features = self.resnet(images)
+        features = Variable(features.data)
         features = features.view(features.size(0), -1)
         features = self.A(features)
-        features = self.bn(features)
         return features
 
+# --------- FactoredLSTM ---------
 class FactoredLSTM(nn.Module):
-    def __init__(self, emb_dim, hidden_dim, factored_dim, vocab_size, dropout_p=0.3):
+    def __init__(self, emb_dim, hidden_dim, factored_dim, vocab_size):
         super(FactoredLSTM, self).__init__()
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
 
         self.B = nn.Embedding(vocab_size, emb_dim)
-        self.dropout = nn.Dropout(dropout_p)  # Dropout add korlam
 
+        # Factored LSTM weights for each gate
         self.U_i = nn.Linear(factored_dim, hidden_dim)
         self.S_fi = nn.Linear(factored_dim, factored_dim)
         self.V_i = nn.Linear(emb_dim, factored_dim)
@@ -49,19 +55,21 @@ class FactoredLSTM(nn.Module):
         self.V_c = nn.Linear(emb_dim, factored_dim)
         self.W_c = nn.Linear(hidden_dim, hidden_dim)
 
+        # Style-specific
         self.S_hi = nn.Linear(factored_dim, factored_dim)
         self.S_hf = nn.Linear(factored_dim, factored_dim)
         self.S_ho = nn.Linear(factored_dim, factored_dim)
         self.S_hc = nn.Linear(factored_dim, factored_dim)
+        # If you want romantic style, uncomment these:
         self.S_ri = nn.Linear(factored_dim, factored_dim)
         self.S_rf = nn.Linear(factored_dim, factored_dim)
         self.S_ro = nn.Linear(factored_dim, factored_dim)
         self.S_rc = nn.Linear(factored_dim, factored_dim)
 
-        self.init_h = nn.Linear(emb_dim, hidden_dim)
-        self.init_c = nn.Linear(emb_dim, hidden_dim)
-
         self.C = nn.Linear(hidden_dim, vocab_size)
+
+        # Optional dropout for regularization (add if you want)
+        self.dropout = nn.Dropout(p=0.3)
 
     def forward_step(self, embedded, h_0, c_0, mode):
         i = self.V_i(embedded)
@@ -95,22 +103,34 @@ class FactoredLSTM(nn.Module):
         c_t = f_t * c_0 + i_t * c_tilda
         h_t = o_t * torch.tanh(c_t)
 
-        outputs = self.dropout(self.C(h_t))  # Dropout add here
+        # dropout regularization
+        h_t = self.dropout(h_t)
+
+        outputs = self.C(h_t)
         return outputs, h_t, c_t
 
     def forward(self, captions, features=None, mode="factual"):
+        '''
+        Args:
+            features: fixed vectors from images, [batch, emb_dim]
+            captions: [batch, max_len]
+            mode: type of caption to generate
+        '''
         batch_size = captions.size(0)
-        embedded = self.B(captions)
-        embedded = self.dropout(embedded)  # Dropout on embedding
+        embedded = self.B(captions)  # [batch, max_len, emb_dim]
         if mode == "factual":
             if features is None:
                 sys.stderr.write("features is None!\n")
             embedded = torch.cat((features.unsqueeze(1), embedded), 1)
-            h_t = self.init_h(features)
-            c_t = self.init_c(features)
-        else:
-            h_t = torch.zeros(batch_size, self.hidden_dim, device=embedded.device)
-            c_t = torch.zeros(batch_size, self.hidden_dim, device=embedded.device)
+
+        # Stylenet: hidden/cell state — random uniform
+        h_t = Variable(torch.Tensor(batch_size, self.hidden_dim))
+        c_t = Variable(torch.Tensor(batch_size, self.hidden_dim))
+        nn.init.uniform_(h_t)
+        nn.init.uniform_(c_t)
+        if torch.cuda.is_available():
+            h_t = h_t.cuda()
+            c_t = c_t.cuda()
 
         all_outputs = []
         for ix in range(embedded.size(1) - 1):
@@ -121,15 +141,29 @@ class FactoredLSTM(nn.Module):
         return all_outputs
 
     def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual"):
-        h_t = self.init_h(feature)
-        c_t = self.init_c(feature)
+        with torch.no_grad():
+        '''
+        Generate captions from feature vectors with beam search
+        '''
+        # Stylenet-style: initialize hidden/cell state with random
+        h_t = Variable(torch.Tensor(1, self.hidden_dim))
+        c_t = Variable(torch.Tensor(1, self.hidden_dim))
+        nn.init.uniform_(h_t)
+        nn.init.uniform_(c_t)
         if torch.cuda.is_available():
             h_t = h_t.cuda()
             c_t = c_t.cuda()
             feature = feature.cuda()
+
+        # Pass the feature at t=0 (Stylenet logic)
+        _, h_t, c_t = self.forward_step(feature, h_t, c_t, mode=mode)
+
+        # Use tokenizer BOS/EOS for Bangla
         start_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
+        end_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 2
         symbol_id = torch.LongTensor([start_id]).unsqueeze(0)
-        symbol_id = symbol_id.cuda() if torch.cuda.is_available() else symbol_id
+        if torch.cuda.is_available():
+            symbol_id = symbol_id.cuda()
         candidates = [[0, symbol_id, h_t, c_t, [start_id]]]
 
         t = 0
@@ -138,7 +172,7 @@ class FactoredLSTM(nn.Module):
             tmp_candidates = []
             end_flag = True
             for score, last_id, h_t, c_t, id_seq in candidates:
-                if id_seq[-1] == tokenizer.eos_token_id:
+                if id_seq[-1] == end_id:
                     tmp_candidates.append([score, last_id, h_t, c_t, id_seq])
                 else:
                     end_flag = False
@@ -156,6 +190,7 @@ class FactoredLSTM(nn.Module):
                         )
             if end_flag:
                 break
+            # Sort by normalized log prob
             candidates = sorted(tmp_candidates, key=lambda x: -x[0].item()/len(x[-1]))[:beam_size]
 
         return candidates[0][-1]
