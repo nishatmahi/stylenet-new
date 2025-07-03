@@ -45,7 +45,7 @@ def main(args):
         romantic_captions, batch_size=args.language_batch_size, shuffle=True, num_workers=2) if romantic_captions else None
 
     encoder = EncoderCNN(args.emb_dim)
-    decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, tokenizer.vocab_size)
+    decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, tokenizer.vocab_size, dropout_p=0.3)
     if torch.cuda.is_available():
         encoder = encoder.cuda()
         decoder = decoder.cuda()
