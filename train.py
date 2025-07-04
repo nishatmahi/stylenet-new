@@ -116,9 +116,8 @@ def main(args):
                     print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
                           % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
 
-        # Save model/checkpoint (like stylenet)
-        torch.save(decoder.state_dict(), os.path.join(model_path, f'decoder-{epoch + 1}.pkl'))
-        torch.save(encoder.state_dict(), os.path.join(model_path, f'encoder-{epoch + 1}.pkl'))
+        torch.save(decoder.state_dict(), os.path.join(model_path, 'decoder-last.pkl'))
+        torch.save(encoder.state_dict(), os.path.join(model_path, 'encoder-last.pkl'))
         torch.save({
             'epoch': epoch,
             'encoder_state_dict': encoder.state_dict(),
