@@ -143,7 +143,7 @@ def collate_fn_styled(captions):
     captions = torch.stack(captions, 0)
     return captions, lengths
 
-def get_data_loader(img_dir, caption_file, batch_size, shuffle=False, num_workers=0):
+def get_data_loader(img_dir, caption_file, batch_size, shuffle=False, num_workers=2):
     dataset = Flickr7kBanglaDataset(img_dir, caption_file, tokenizer, transform=image_transform)
     data_loader = DataLoader(dataset=dataset,
                              batch_size=batch_size,
@@ -152,7 +152,7 @@ def get_data_loader(img_dir, caption_file, batch_size, shuffle=False, num_worker
                              collate_fn=collate_fn)
     return data_loader
 
-def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=0):
+def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=2):
     dataset = FlickrStyle7kBanglaDataset(caption_file, tokenizer)
     data_loader = DataLoader(dataset=dataset,
                              batch_size=batch_size,
