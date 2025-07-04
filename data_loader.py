@@ -163,10 +163,10 @@ def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=
 
 # ==== Test/debug block ====
 if __name__ == "__main__":
-    img_dir = "./your_image_folder"
-    factual_file = "./your_factual_captions.txt"
-    humorous_file = "./your_humorous_captions.txt"
-    romantic_file = "./your_romantic_captions.txt"
+    img_dir = "/kaggle/input/dataset/data/Images"
+    factual_file = "/kaggle/input/dataset/data/factual_caption.txt"
+    humorous_file = "/kaggle/input/dataset/data/humorous_train.txt"
+    romantic_file = "/kaggle/input/dataset/data/romantic_train.txt"
 
     data_loader = get_data_loader(img_dir, factual_file, batch_size=3)
     for i, (images, input_ids, lengths) in enumerate(data_loader):
