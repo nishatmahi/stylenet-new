@@ -1,14 +1,9 @@
 import os
 import argparse
 import torch
-from data_loader import get_loader, get_styled_loader, load_img_caption_lists, load_styled_caption_list, tokenizer
+from data_loader import get_data_loader, get_styled_data_loader, tokenizer
 from models import EncoderCNN, FactoredLSTM
-import torch.nn as nn
-
-def to_var(x):
-    if torch.cuda.is_available():
-        x = x.cuda()
-    return x
+from loss import masked_cross_entropy
 
 def eval_outputs(outputs, tokenizer):
     indices = torch.topk(outputs, 1)[1]
@@ -19,54 +14,42 @@ def eval_outputs(outputs, tokenizer):
         text = tokenizer.convert_tokens_to_string(tokens)
         print("Generated:", text)
 
-def align_and_loss(outputs, targets, criterion, vocab_size):
-    if outputs.size(1) != targets.size(1):
-        seq_len = min(outputs.size(1), targets.size(1))
-        print(f"[Trim] outputs seq_len={outputs.size(1)}, targets seq_len={targets.size(1)} → trim to {seq_len}")
-        outputs = outputs[:, :seq_len, :]
-        targets = targets[:, :seq_len]
-    return criterion(outputs.reshape(-1, vocab_size), targets.reshape(-1))
-
 def main(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model_path = args.model_path
-    os.makedirs(model_path, exist_ok=True)
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
 
-    img_paths, factual_captions = load_img_caption_lists(
-        args.factual_caption_path, args.img_path
-    )
-    humorous_captions = load_styled_caption_list(args.humorous_caption_path) if args.humorous_caption_path else []
-    romantic_captions = load_styled_caption_list(args.romantic_caption_path) if args.romantic_caption_path else []
+    # Data loaders
+    data_loader = get_data_loader(
+        args.img_path, args.factual_caption_path, batch_size=args.caption_batch_size, shuffle=True)
+    styled_data_loader = get_styled_data_loader(
+        args.humorous_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.humorous_caption_path else None
+    styled_data_loader_romantic = get_styled_data_loader(
+        args.romantic_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.romantic_caption_path else None
 
-    data_loader = get_loader(
-        img_paths, factual_captions, batch_size=args.caption_batch_size, shuffle=True, num_workers=2)
-    styled_data_loader = get_styled_loader(
-        humorous_captions, batch_size=args.language_batch_size, shuffle=True, num_workers=2) if humorous_captions else None
-    styled_data_loader_romantic = get_styled_loader(
-        romantic_captions, batch_size=args.language_batch_size, shuffle=True, num_workers=2) if romantic_captions else None
+    # Models
+    encoder = EncoderCNN(args.emb_dim).to(device)
+    decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, tokenizer.vocab_size).to(device)
 
-    encoder = EncoderCNN(args.emb_dim)
-    # --------- Encoder freeze here ---------
+    # --- Stylenet logic: freeze encoder except last FC ---
     for param in encoder.resnet.parameters():
         param.requires_grad = False
-    # Optionally, only encoder.A trainable (stylenet logic)
     for param in encoder.A.parameters():
         param.requires_grad = True
 
-    decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, tokenizer.vocab_size)
-    if torch.cuda.is_available():
-        encoder = encoder.cuda()
-        decoder = decoder.cuda()
-
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    # Optimizer, loss
+    criterion = masked_cross_entropy
     cap_params = list(decoder.parameters()) + list(encoder.A.parameters())
     lang_params = list(decoder.parameters())
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
+    # Resume checkpoint (optional)
     checkpoint_path = os.path.join(model_path, 'checkpoint-latest.pth')
     start_epoch = 0
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location="cuda" if torch.cuda.is_available() else "cpu")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
         encoder.load_state_dict(checkpoint['encoder_state_dict'])
         decoder.load_state_dict(checkpoint['decoder_state_dict'])
         optimizer_cap.load_state_dict(checkpoint['optimizer_cap_state_dict'])
@@ -76,59 +59,66 @@ def main(args):
     else:
         print("[Checkpoint] No previous checkpoint found. Training from scratch.")
 
-    for epoch in range(start_epoch, args.epoch_num):
-        encoder.train()
-        decoder.train()
-        for i, (images, input_ids, attn_mask, lengths) in enumerate(data_loader):
-            images = to_var(images)
-            input_ids = to_var(input_ids)
+    # --- Train loop ---
+    total_cap_step = len(data_loader)
+    total_lang_step = len(styled_data_loader) if styled_data_loader else 0
+    total_romantic_step = len(styled_data_loader_romantic) if styled_data_loader_romantic else 0
+    epoch_num = args.epoch_num
+    for epoch in range(start_epoch, epoch_num):
+        # factual (image+caption)
+        for i, (images, captions, lengths) in enumerate(data_loader):
+            images = images.to(device)
+            captions = captions.long().to(device)
+            lengths = lengths.to(device)
+
             decoder.zero_grad()
             encoder.zero_grad()
             features = encoder(images)
-            outputs = decoder(input_ids, features, mode="factual")
-            targets = input_ids[:, 1:].contiguous()
-            outputs = outputs[:, :-1, :].contiguous()
-            loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
+            outputs = decoder(captions, features, mode="factual")
+            loss = criterion(outputs[:, 1:, :].contiguous(),
+                             captions[:, 1:].contiguous(), lengths - 1)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
             optimizer_cap.step()
-            if (i % args.log_step_caption == 0) or (i == len(data_loader)-1):
+
+            if i % args.log_step_caption == 0 or i == total_cap_step-1:
                 print("Epoch [%d/%d], CAP, Step [%d/%d], Loss: %.4f"
-                      % (epoch+1, args.epoch_num, i, len(data_loader), loss.data.item()))
+                      % (epoch+1, epoch_num, i, total_cap_step, loss.item()))
         eval_outputs(outputs, tokenizer)
 
+        # styled (humorous)
         if styled_data_loader:
-            for i, (input_ids, attn_mask) in enumerate(styled_data_loader):
-                input_ids = to_var(input_ids)
+            for i, (captions, lengths) in enumerate(styled_data_loader):
+                captions = captions.long().to(device)
+                lengths = lengths.to(device)
                 decoder.zero_grad()
-                # --------- No dummy features! ---------
-                outputs = decoder(input_ids, features=None, mode='humorous')
-                targets = input_ids[:, 1:].contiguous()
-                outputs = outputs[:, :-1, :].contiguous()
-                loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
+                outputs = decoder(captions, features=None, mode='humorous')
+                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
                 optimizer_lang.step()
-                if (i % args.log_step_language == 0) or (i == len(styled_data_loader)-1):
+                if i % args.log_step_language == 0 or i == total_lang_step-1:
                     print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
-                        % (epoch+1, args.epoch_num, i, len(styled_data_loader), loss.data.item()))
+                          % (epoch+1, epoch_num, i, total_lang_step, loss.item()))
+
+        # styled (romantic)
         if styled_data_loader_romantic:
-            for i, (input_ids, attn_mask) in enumerate(styled_data_loader_romantic):
-                input_ids = to_var(input_ids)
+            for i, (captions, lengths) in enumerate(styled_data_loader_romantic):
+                captions = captions.long().to(device)
+                lengths = lengths.to(device)
                 decoder.zero_grad()
-                outputs = decoder(input_ids, features=None, mode='romantic')
-                targets = input_ids[:, 1:].contiguous()
-                outputs = outputs[:, :-1, :].contiguous()
-                loss = align_and_loss(outputs, targets, criterion, tokenizer.vocab_size)
+                outputs = decoder(captions, features=None, mode='romantic')
+                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
                 optimizer_lang.step()
-                if (i % args.log_step_language == 0) or (i == len(styled_data_loader_romantic)-1):
+                if i % args.log_step_language == 0 or i == total_romantic_step-1:
                     print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
-                        % (epoch+1, args.epoch_num, i, len(styled_data_loader_romantic), loss.data.item()))
+                          % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
 
-        torch.save(decoder.state_dict(), os.path.join(model_path, 'decoder-last.pkl'))
-        torch.save(encoder.state_dict(), os.path.join(model_path, 'encoder-last.pkl'))
+        # Save model/checkpoint (like stylenet)
+        torch.save(decoder.state_dict(), os.path.join(model_path, f'decoder-{epoch + 1}.pkl'))
+        torch.save(encoder.state_dict(), os.path.join(model_path, f'encoder-{epoch + 1}.pkl'))
         torch.save({
             'epoch': epoch,
             'encoder_state_dict': encoder.state_dict(),
@@ -136,7 +126,7 @@ def main(args):
             'optimizer_cap_state_dict': optimizer_cap.state_dict(),
             'optimizer_lang_state_dict': optimizer_lang.state_dict(),
             'loss': loss.item(),
-        }, os.path.join(model_path, 'checkpoint-latest.pth'))
+        }, checkpoint_path)
         print(f"[Checkpoint] Saved at end of epoch {epoch+1}")
 
 if __name__ == '__main__':
@@ -165,7 +155,7 @@ if __name__ == '__main__':
                         help='learning rate for caption model training')
     parser.add_argument('--lr_language', type=float, default=0.0002,
                         help='learning rate for language model training')
-    parser.add_argument('--epoch_num', type=int, default=30)
+    parser.add_argument('--epoch_num', type=int, default=5)
     parser.add_argument('--log_step_caption', type=int, default=100,
                         help='steps for print log while train caption model')
     parser.add_argument('--log_step_language', type=int, default=10,
