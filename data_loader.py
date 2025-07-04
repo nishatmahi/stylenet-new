@@ -6,7 +6,7 @@ from PIL import Image
 from torchvision import transforms
 from transformers import AutoTokenizer
 
-# ---- Bangla HuggingFace Tokenizer ----
+# ---- HuggingFace Bangla Tokenizer ----
 tokenizer = AutoTokenizer.from_pretrained("hishab/titulm-mpt-1b-v2.0", trust_remote_code=True)
 
 class Rescale:
@@ -49,10 +49,9 @@ def strip_ext(img_id):
 
 class Flickr7kBanglaDataset(Dataset):
     '''Flickr7k-style dataset for Bangla image-caption'''
-    def __init__(self, img_dir, caption_file, tokenizer, transform=None):
+    def __init__(self, img_dir, caption_file, transform=None):
         self.img_dir = img_dir
         self.imgname_caption_list = self._get_imgname_and_caption(caption_file)
-        self.tokenizer = tokenizer
         self.transform = transform if transform else image_transform
 
     def _get_imgname_and_caption(self, caption_file):
@@ -74,7 +73,6 @@ class Flickr7kBanglaDataset(Dataset):
         img_id = strip_ext(img_name)
         img_path = find_image_with_any_ext(self.img_dir, img_id)
         caption = self.imgname_caption_list[ix][1]
-
         # Robust image loading (RGB, RGBA, Grayscale)
         try:
             image = Image.open(img_path)
@@ -85,26 +83,14 @@ class Flickr7kBanglaDataset(Dataset):
             image = image.convert("RGB")
         elif image.mode == "L":
             image = image.convert("RGB")
-
         if self.transform is not None:
             image = self.transform(image)
-        # HuggingFace tokenizer, pad/truncate, BOS/EOS auto (add_special_tokens=True)
-        tokens = self.tokenizer(
-            caption,
-            truncation=True,
-            padding='max_length',
-            max_length=32,
-            return_tensors="pt",
-            add_special_tokens=True
-        )
-        input_ids = tokens["input_ids"].squeeze(0)
-        return image, input_ids
+        return image, caption  # <-- NOTE: raw string caption, NOT tokenized!
 
 class FlickrStyle7kBanglaDataset(Dataset):
     '''Styled caption dataset'''
-    def __init__(self, caption_file, tokenizer):
+    def __init__(self, caption_file):
         self.caption_list = self._get_caption(caption_file)
-        self.tokenizer = tokenizer
 
     def _get_caption(self, caption_file):
         with open(caption_file, 'r', encoding='utf-8') as f:
@@ -116,35 +102,39 @@ class FlickrStyle7kBanglaDataset(Dataset):
         return len(self.caption_list)
 
     def __getitem__(self, ix):
-        caption = self.caption_list[ix]
-        tokens = self.tokenizer(
-            caption,
-            truncation=True,
-            padding='max_length',
-            max_length=32,
-            return_tensors="pt",
-            add_special_tokens=True
-        )
-        input_ids = tokens["input_ids"].squeeze(0)
-        return input_ids
+        return self.caption_list[ix]  # <--- Return string
 
-def collate_fn(data):
-    data.sort(key=lambda x: (x[1] != tokenizer.pad_token_id).sum(), reverse=True)
-    images, input_ids = zip(*data)
+# --------- Collate functions ---------
+def collate_fn(batch):
+    images, captions = zip(*batch)
     images = torch.stack(images, 0)
-    input_ids = torch.stack(input_ids, 0)
-    lengths = torch.LongTensor([(ids != tokenizer.pad_token_id).sum().item() for ids in input_ids])
+    encodings = tokenizer(
+        list(captions),
+        padding=True,         # Dynamic pad
+        truncation=True,      # Optional: cut long captions
+        return_tensors="pt",
+        add_special_tokens=True
+    )
+    input_ids = encodings["input_ids"]
+    lengths = (input_ids != tokenizer.pad_token_id).sum(dim=1)
     return images, input_ids, lengths
 
 def collate_fn_styled(captions):
     captions = list(captions)
-    captions.sort(key=lambda x: (x != tokenizer.pad_token_id).sum(), reverse=True)
-    lengths = torch.LongTensor([(cap != tokenizer.pad_token_id).sum().item() for cap in captions])
-    captions = torch.stack(captions, 0)
-    return captions, lengths
+    encodings = tokenizer(
+        list(captions),
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+        add_special_tokens=True
+    )
+    input_ids = encodings["input_ids"]
+    lengths = (input_ids != tokenizer.pad_token_id).sum(dim=1)
+    return input_ids, lengths
 
+# --------- Loader functions ---------
 def get_data_loader(img_dir, caption_file, batch_size, shuffle=False, num_workers=2):
-    dataset = Flickr7kBanglaDataset(img_dir, caption_file, tokenizer, transform=image_transform)
+    dataset = Flickr7kBanglaDataset(img_dir, caption_file, transform=image_transform)
     data_loader = DataLoader(dataset=dataset,
                              batch_size=batch_size,
                              shuffle=shuffle,
@@ -153,7 +143,7 @@ def get_data_loader(img_dir, caption_file, batch_size, shuffle=False, num_worker
     return data_loader
 
 def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=2):
-    dataset = FlickrStyle7kBanglaDataset(caption_file, tokenizer)
+    dataset = FlickrStyle7kBanglaDataset(caption_file)
     data_loader = DataLoader(dataset=dataset,
                              batch_size=batch_size,
                              shuffle=shuffle,
