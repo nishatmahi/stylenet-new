@@ -2,8 +2,16 @@ import os
 import torch
 from torchvision import transforms
 from PIL import Image
-from data_loader import Rescale, tokenizer
+from data_loader import tokenizer  # Ensure tokenizer is properly imported
 from models import EncoderCNN, FactoredLSTM
+
+# Add the missing Rescale transform if not in data_loader
+class Rescale:
+    def __init__(self, output_size):
+        self.output_size = output_size
+
+    def __call__(self, image):
+        return image.resize(self.output_size, Image.BILINEAR)
 
 def load_sample_images(img_dir, transform, device):
     img_names = os.listdir(img_dir)
@@ -27,39 +35,51 @@ def main():
     encoder = EncoderCNN(emb_dim).to(device)
     decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, tokenizer.vocab_size).to(device)
 
-    # Load weights (update paths as needed)
-    encoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/encoder-last.pkl'))
-    decoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/decoder-last.pkl'))
+    # Load weights - use map_location for cross-device compatibility
+    encoder.load_state_dict(torch.load(
+        '/kaggle/working/pretrained_models/encoder-last.pkl',
+        map_location=device
+    ))
+    decoder.load_state_dict(torch.load(
+        '/kaggle/working/pretrained_models/decoder-last.pkl',
+        map_location=device
+    ))
     encoder.eval()
     decoder.eval()
 
-    # Prepare image(s)
+    # Prepare image transform with normalization
     transform = transforms.Compose([
         Rescale((224, 224)),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                             std=[0.229, 0.224, 0.225])  # Essential for ResNet
     ])
-    img_dir = '/kaggle/input/sample/sample_images'  # Change as needed
+    
+    img_dir = '/kaggle/input/sample/sample_images'
     img_names, img_list = load_sample_images(img_dir, transform, device)
-    image = to_var(img_list[1], volatile=True)
+    
+    # Process all images
+    for i, image in enumerate(img_list):
+        with torch.no_grad():
+            features = encoder(image)
+            output_token_ids = decoder.sample(
+                features,
+                tokenizer=tokenizer,
+                mode="factual"
+            )
 
-    with torch.no_grad():
-        features = encoder(image)
-        output_token_ids = decoder.sample(
-            features,
-            tokenizer=tokenizer,
-            mode="factual"
-        )
-
-    # Remove BOS, stop at EOS, like StyleNet
-    if output_token_ids and output_token_ids[0] == tokenizer.bos_token_id:
-        output_token_ids = output_token_ids[1:]
-    if tokenizer.eos_token_id in output_token_ids:
-        output_token_ids = output_token_ids[:output_token_ids.index(tokenizer.eos_token_id)]
-
-    # StyleNet-style: map index to token (like vocab.i2w[x])
-    caption_tokens = [tokenizer.convert_ids_to_tokens([x])[0] for x in output_token_ids]
-    print(img_names[1])
-    print(caption)
+        # Convert token IDs to text
+        if isinstance(output_token_ids, list):
+            # Remove special tokens
+            tokens = [tokenizer.convert_ids_to_tokens([tid])[0] 
+                      for tid in output_token_ids 
+                      if tid not in [tokenizer.bos_token_id, tokenizer.eos_token_id]]
+            
+            caption = tokenizer.convert_tokens_to_string(tokens)
+            print(f"Image: {img_names[i]}")
+            print(f"Caption: {caption}\n")
+        else:
+            print(f"No caption generated for {img_names[i]}")
 
 if __name__ == '__main__':
     main()
