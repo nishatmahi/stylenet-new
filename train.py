@@ -116,17 +116,37 @@ def main(args):
                     print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
                           % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
 
-        torch.save(decoder.state_dict(), os.path.join(model_path, 'decoder-last.pkl'))
-        torch.save(encoder.state_dict(), os.path.join(model_path, 'encoder-last.pkl'))
-        torch.save({
-            'epoch': epoch,
-            'encoder_state_dict': encoder.state_dict(),
-            'decoder_state_dict': decoder.state_dict(),
-            'optimizer_cap_state_dict': optimizer_cap.state_dict(),
-            'optimizer_lang_state_dict': optimizer_lang.state_dict(),
-            'loss': loss.item(),
-        }, checkpoint_path)
-        print(f"[Checkpoint] Saved at end of epoch {epoch+1}")
+    torch.save(
+        decoder.state_dict(),
+        os.path.join(model_path, f'decoder-{epoch+1}.pkl')
+    )
+    torch.save(
+        encoder.state_dict(),
+        os.path.join(model_path, f'encoder-{epoch+1}.pkl')
+    )
+    
+    # 2. Save "latest" versions
+    torch.save(
+        decoder.state_dict(),
+        os.path.join(model_path, 'decoder-last.pkl')
+    )
+    torch.save(
+        encoder.state_dict(),
+        os.path.join(model_path, 'encoder-last.pkl')
+    )
+    
+    # 3. Save full checkpoint (optional)
+    checkpoint_path = os.path.join(model_path, f'checkpoint-{epoch+1}.pth')
+    torch.save({
+        'epoch': epoch,
+        'encoder_state_dict': encoder.state_dict(),
+        'decoder_state_dict': decoder.state_dict(),
+        'optimizer_cap_state_dict': optimizer_cap.state_dict(),
+        'optimizer_lang_state_dict': optimizer_lang.state_dict(),
+        'loss': loss.item(),
+    }, checkpoint_path)
+    
+    print(f"[Checkpoint] Saved all models for epoch {epoch+1}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla: Generating Attractive Visual Captions with Styles')
