@@ -28,8 +28,8 @@ def main():
     decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, tokenizer.vocab_size).to(device)
 
     # Load weights (update paths as needed)
-    encoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/encoder-last.pkl', map_location=device))
-    decoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/decoder-last.pkl', map_location=device))
+    encoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/encoder-last.pkl'))
+    decoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/decoder-last.pkl'))
     encoder.eval()
     decoder.eval()
 
@@ -40,16 +40,13 @@ def main():
     ])
     img_dir = '/kaggle/input/sample/sample_images'  # Change as needed
     img_names, img_list = load_sample_images(img_dir, transform, device)
-    idx = 1  # or whichever image index you want
-    image = img_list[idx]  # already on device
+    image = to_var(img_list[1], volatile=True)
 
     with torch.no_grad():
         features = encoder(image)
         output_token_ids = decoder.sample(
             features,
             tokenizer=tokenizer,
-            beam_size=5,
-            max_len=30,
             mode="factual"
         )
 
@@ -61,8 +58,8 @@ def main():
 
     # StyleNet-style: map index to token (like vocab.i2w[x])
     caption_tokens = [tokenizer.convert_ids_to_tokens([x])[0] for x in output_token_ids]
-    print(img_names[idx])
-    print(" ".join(caption_tokens))
+    print(img_names[1])
+    print(caption)
 
 if __name__ == '__main__':
     main()
