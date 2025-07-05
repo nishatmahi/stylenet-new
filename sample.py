@@ -30,11 +30,11 @@ def main():
 
     # Load weights (update paths as needed)
     encoder.load_state_dict(torch.load(
-        '/kaggle/working/pretrained_models/encoder-5.pkl',
+        '/kaggle/working/pretrained_models/encoder-last.pkl',
         map_location=device
     ))
     decoder.load_state_dict(torch.load(
-        '/kaggle/working/pretrained_models/decoder-5.pkl',
+        '/kaggle/working/pretrained_models/decoder-last.pkl',
         map_location=device
     ))
 
