@@ -28,8 +28,8 @@ def main():
     decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, tokenizer.vocab_size).to(device)
 
     # Load weights (update paths as needed)
-    encoder.load_state_dict(torch.load('pretrained_models/encoder-last.pkl', map_location=device))
-    decoder.load_state_dict(torch.load('pretrained_models/decoder-last.pkl', map_location=device))
+    encoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/encoder-last.pkl', map_location=device))
+    decoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/decoder-last.pkl', map_location=device))
     encoder.eval()
     decoder.eval()
 
