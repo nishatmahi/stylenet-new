@@ -28,8 +28,8 @@ def main():
     decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, tokenizer.vocab_size).to(device)
 
     # Load weights
-    encoder.load_state_dict(torch.load('pretrained_models/encoder-last.pkl', map_location=device))
-    decoder.load_state_dict(torch.load('pretrained_models/decoder-last.pkl', map_location=device))
+    encoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/encoder-last.pkl', map_location=device))
+    decoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/decoder-last.pkl', map_location=device))
     encoder.eval()
     decoder.eval()
 
@@ -38,7 +38,7 @@ def main():
         Rescale((224, 224)),
         transforms.ToTensor()
     ])
-    img_dir = 'sample_images'  # Change as needed
+    img_dir = '/kaggle/input/sample/sample_images'  # Change as needed
     img_names, img_list = load_sample_images(img_dir, transform, device)
     idx = 1  # whichever image you want
     image = img_list[idx]
