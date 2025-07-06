@@ -2,6 +2,7 @@ import os
 import torch
 from torchvision import transforms
 from PIL import Image
+import matplotlib.pyplot as plt
 from data_loader import Rescale, tokenizer
 from models import EncoderCNN, FactoredLSTM
 
@@ -46,6 +47,26 @@ def main():
 
     with torch.no_grad():
         features = encoder(image)
+        print("Image features shape:", features.shape)
+        print("First 10 feature values:", features[0][:10])
+
+        # ---- Feature visualization (1D plot, emb_dim=300) ----
+        plt.figure(figsize=(10,3))
+        plt.plot(features[0].cpu().numpy())
+        plt.title("Extracted Image Features (1D plot)")
+        plt.xlabel("Feature index")
+        plt.ylabel("Feature value")
+        plt.show()
+
+        # ---- First token analysis ----
+        h0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
+        c0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
+        first_output, _, _ = decoder.forward_step(features, h0, c0, mode="factual")
+        first_output = first_output.squeeze(0)  # [vocab_size]
+        top_tokens = torch.topk(first_output, 5).indices.tolist()
+        print("Top 5 first tokens:", tokenizer.convert_ids_to_tokens(top_tokens))
+
+        # ---- Caption generation ----
         output = decoder.sample(
             features,
             tokenizer=tokenizer,
@@ -60,14 +81,12 @@ def main():
     if tokenizer.eos_token_id in output:
         output = output[:output.index(tokenizer.eos_token_id)]
 
-    # Map index to word tokens (same as before)
+    # Convert tokens to string and print
     caption_tokens = [tokenizer.convert_ids_to_tokens([x])[0] for x in output]
-
-    # NEW: Convert tokens to string and print full sentence
     caption_text = tokenizer.convert_tokens_to_string(caption_tokens)
 
     print(img_names[idx])
-    print(caption_text)
+    print("Predicted Caption:", caption_text)
 
 if __name__ == '__main__':
     main()
