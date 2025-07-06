@@ -16,9 +16,10 @@ def eval_outputs(outputs, tokenizer):
 
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model_path = args.model_path
-    if not os.path.exists(model_path):
-        os.makedirs(model_path)
+    # Paths
+    permanent_save_folder = "stylenet_models/"
+    os.makedirs(permanent_save_folder, exist_ok=True)
+    os.makedirs(args.model_path, exist_ok=True)
 
     # Data loaders
     data_loader = get_data_loader(
@@ -45,9 +46,13 @@ def main(args):
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
-    # Resume checkpoint (optional)
-    checkpoint_path = os.path.join(model_path, 'checkpoint-latest.pth')
+    # ======= Checkpoint Loading (NEW SECTION) =======
+    # Checkpoint loading
     start_epoch = 0
+    checkpoint_path = os.path.join(permanent_save_folder, 'checkpoint-latest.pth')
+    encoder_last_path = os.path.join(permanent_save_folder, "encoder-last.pkl")
+    decoder_last_path = os.path.join(permanent_save_folder, "decoder-last.pkl")
+
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
         encoder.load_state_dict(checkpoint['encoder_state_dict'])
@@ -55,9 +60,19 @@ def main(args):
         optimizer_cap.load_state_dict(checkpoint['optimizer_cap_state_dict'])
         optimizer_lang.load_state_dict(checkpoint['optimizer_lang_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
-        print(f"[Checkpoint] Loaded checkpoint from epoch {checkpoint['epoch']+1}")
+        print(f"Loaded checkpoint from epoch {checkpoint['epoch']+1}")
     else:
-        print("[Checkpoint] No previous checkpoint found. Training from scratch.")
+        loaded_any = False
+        if os.path.exists(decoder_last_path):
+            decoder.load_state_dict(torch.load(decoder_last_path, map_location=device))
+            print("Decoder loaded from saved weight")
+            loaded_any = True
+        if os.path.exists(encoder_last_path):
+            encoder.load_state_dict(torch.load(encoder_last_path, map_location=device))
+            print("Encoder loaded from saved weight")
+            loaded_any = True
+        if not loaded_any:
+            print("No checkpoint or pretrained weights found. Training from scratch (random weights).")
 
     # --- Train loop ---
     total_cap_step = len(data_loader)
@@ -116,27 +131,13 @@ def main(args):
                     print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
                           % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
 
-    torch.save(
-        decoder.state_dict(),
-        os.path.join(model_path, f'decoder-{epoch+1}.pkl')
-    )
-    torch.save(
-        encoder.state_dict(),
-        os.path.join(model_path, f'encoder-{epoch+1}.pkl')
-    )
+    # Save final models
+    torch.save(decoder.state_dict(), os.path.join(permanent_save_folder, 'decoder-last.pkl'))
+    torch.save(encoder.state_dict(), os.path.join(permanent_save_folder, 'encoder-last.pkl'))
+    torch.save(decoder.state_dict(), os.path.join(args.model_path, 'decoder-last.pkl'))
+    torch.save(encoder.state_dict(), os.path.join(args.model_path, 'encoder-last.pkl'))
     
-    # 2. Save "latest" versions
-    torch.save(
-        decoder.state_dict(),
-        os.path.join(model_path, 'decoder-last.pkl')
-    )
-    torch.save(
-        encoder.state_dict(),
-        os.path.join(model_path, 'encoder-last.pkl')
-    )
-    
-    # 3. Save full checkpoint (optional)
-    checkpoint_path = os.path.join(model_path, f'checkpoint-{epoch+1}.pth')
+    # Save final checkpoint
     torch.save({
         'epoch': epoch,
         'encoder_state_dict': encoder.state_dict(),
@@ -144,9 +145,10 @@ def main(args):
         'optimizer_cap_state_dict': optimizer_cap.state_dict(),
         'optimizer_lang_state_dict': optimizer_lang.state_dict(),
         'loss': loss.item(),
-    }, checkpoint_path)
-    
-    print(f"[Checkpoint] Saved all models for epoch {epoch+1}")
+    }, os.path.join(permanent_save_folder, 'checkpoint-latest.pth'))
+    print(f"Saved final checkpoint and models at epoch {epoch+1}")
+
+# ======= END Training Loop =======
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla: Generating Attractive Visual Captions with Styles')
