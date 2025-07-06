@@ -190,4 +190,34 @@ class FactoredLSTM(nn.Module):
                     output, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode)
                     output = output.squeeze(0).squeeze(0)
 
-                    # Log
+                    # Log softmax + sort (EXACT original)
+                    output = torch.log_softmax(output, dim=-1)
+                    output, indices = torch.sort(output, descending=True)
+                    output = output[:beam_size]
+                    indices = indices[:beam_size]
+
+                    # Create new candidates (EXACT original)
+                    for score_val, wid in zip(output, indices):
+                        new_score = score + score_val.item()
+                        new_id_seq = id_seq + [int(wid.item())]
+                        tmp_candidates.append([
+                            new_score,
+                            wid.unsqueeze(0),  # Keep as tensor [1,1]
+                            h_t,
+                            c_t,
+                            new_id_seq
+                        ])
+
+                # Break if all candidates finished (EXACT original)
+                if end_flag:
+                    break
+
+                # Sort by normalized log probability (EXACT original)
+                candidates = sorted(
+                    tmp_candidates,
+                    key=lambda x: x[0] / len(x[4]),  # Normalized score
+                    reverse=True
+                )[:beam_size]
+
+            # Return best sequence (EXACT original)
+            return candidates[0][4]
