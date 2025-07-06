@@ -66,9 +66,7 @@ def main():
     # Print results StyleNet way
     print(img_names[idx])
     print(caption_tokens)
-    # Or print as single words
-    for w in caption_tokens:
-        print(w)
+
 
 if __name__ == '__main__':
     main()
