@@ -160,9 +160,9 @@ if __name__ == '__main__':
                         help='path for humorous caption file')
     parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_train.txt',
                         help='path for romantic caption file')
-    parser.add_argument('--caption_batch_size', type=int, default=64,
+    parser.add_argument('--caption_batch_size', type=int, default=32,
                         help='mini batch size for caption model training')
-    parser.add_argument('--language_batch_size', type=int, default=96,
+    parser.add_argument('--language_batch_size', type=int, default=64,
                         help='mini batch size for language model training')
     parser.add_argument('--emb_dim', type=int, default=300,
                         help='embedding size of word, image')
@@ -170,9 +170,9 @@ if __name__ == '__main__':
                         help='hidden state size of factored LSTM')
     parser.add_argument('--factored_dim', type=int, default=512,
                         help='size of factored matrix')
-    parser.add_argument('--lr_caption', type=float, default=0.001,
+    parser.add_argument('--lr_caption', type=float, default=0.0005,
                         help='learning rate for caption model training')
-    parser.add_argument('--lr_language', type=float, default=0.002,
+    parser.add_argument('--lr_language', type=float, default=0.0003,
                         help='learning rate for language model training')
     parser.add_argument('--epoch_num', type=int, default=35)
     parser.add_argument('--log_step_caption', type=int, default=100,
