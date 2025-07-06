@@ -35,10 +35,10 @@ def main():
 
     # Prepare image(s)
     transform = transforms.Compose([
-    Rescale((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
+        Rescale((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
     img_dir = '/kaggle/input/sample/sample_images'  # Change as needed
     img_names, img_list = load_sample_images(img_dir, transform, device)
     idx = 1  # whichever image you want
@@ -60,13 +60,14 @@ def main():
     if tokenizer.eos_token_id in output:
         output = output[:output.index(tokenizer.eos_token_id)]
 
-    # StyleNet-style: map index to word (original did vocab.i2w[x])
+    # Map index to word tokens (same as before)
     caption_tokens = [tokenizer.convert_ids_to_tokens([x])[0] for x in output]
 
-    # Print results StyleNet way
-    print(img_names[idx])
-    print(caption_tokens)
+    # NEW: Convert tokens to string and print full sentence
+    caption_text = tokenizer.convert_tokens_to_string(caption_tokens)
 
+    print(img_names[idx])
+    print(caption_text)
 
 if __name__ == '__main__':
     main()
