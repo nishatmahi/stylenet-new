@@ -141,58 +141,83 @@ class FactoredLSTM(nn.Module):
         return all_outputs
 
     def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual"):
-        with torch.no_grad():
-            # Initialize hidden/cell state
-            h_t = torch.empty(1, self.hidden_dim)
-            c_t = torch.empty(1, self.hidden_dim)
-            nn.init.uniform_(h_t)
-            nn.init.uniform_(c_t)
-            if torch.cuda.is_available():
-                h_t = h_t.cuda()
-                c_t = c_t.cuda()
-                feature = feature.cuda()
-            # Forward 1 step with image feature (Stylenet logic)
-            _, h_t, c_t = self.forward_step(feature, h_t, c_t, mode=mode)
+    '''
+    generate captions from feature vectors with beam search
+    Args:
+        feature: fixed vector for an image, [1, emb_dim]
+        beam_size: stock size for beam search
+        max_len: max sampling length
+        mode: type of caption to generate
+    '''
+    with torch.no_grad():
+        device = feature.device
+        
+        # Initialize hidden state (EXACT original)
+        h_t = torch.Tensor(1, self.hidden_dim)
+        c_t = torch.Tensor(1, self.hidden_dim)
+        # EXACTLY match original initialization
+        torch.nn.init.uniform_(h_t)
+        torch.nn.init.uniform_(c_t)
+        h_t = h_t.to(device)
+        c_t = c_t.to(device)
 
-            # Setup start/end token
-            start_id = tokenizer.bos_token_id
-            end_id = tokenizer.eos_token_id
-            symbol_id = torch.LongTensor([start_id]).unsqueeze(0)
-            if torch.cuda.is_available():
-                symbol_id = symbol_id.cuda()
-            candidates = [[0.0, symbol_id, h_t, c_t, [start_id]]]
+        # Forward 1 step with image feature
+        _, h_t, c_t = self.forward_step(feature, h_t, c_t, mode=mode)
 
-            t = 0
-            while t < max_len - 1:
-                t += 1
-                tmp_candidates = []
-                end_flag = True
-                for score, last_id, h_t, c_t, id_seq in candidates:
-                    if id_seq[-1] == end_id:
-                        tmp_candidates.append([score, last_id, h_t, c_t, id_seq])
-                    else:
-                        end_flag = False
-                        emb = self.B(last_id)
-                        output, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode)
-                        output = output.squeeze(0).squeeze(0)
-                        output = torch.log_softmax(output, dim=-1)
-                        output_topk, indices_topk = torch.topk(output, beam_size)
-                        for score_, wid in zip(output_topk, indices_topk):
-                            new_score = score + score_.item()
-                            new_id_seq = id_seq + [int(wid.item())]
-                            tmp_candidates.append([
-                                new_score,
-                                wid.unsqueeze(0).unsqueeze(0),  # shape [1,1]
-                                h_t,
-                                c_t,
-                                new_id_seq
-                            ])
-                # -------- KEY LINE: update candidates here, before break! --------
-                candidates = sorted(
-                    tmp_candidates, key=lambda x: x[0]/len(x[-1]), reverse=True
-                )[:beam_size]
-                if end_flag:
-                    break
-            # Best sequence
-            best_seq = candidates[0][-1]
-        return best_seq
+        # Use tokenizer's special tokens
+        start_id = tokenizer.bos_token_id
+        end_id = tokenizer.eos_token_id
+        
+        # Initialize beam (EXACT original structure)
+        symbol_id = torch.tensor([start_id], device=device).unsqueeze(0)
+        candidates = [[0.0, symbol_id, h_t, c_t, [start_id]]]
+
+        # Beam search (EXACT original logic)
+        t = 0
+        while t < max_len - 1:
+            t += 1
+            tmp_candidates = []
+            end_flag = True
+            
+            for score, last_id, h_t, c_t, id_seq in candidates:
+                # Skip finished sequences
+                if id_seq[-1] == end_id:
+                    tmp_candidates.append([score, last_id, h_t, c_t, id_seq])
+                    continue
+                
+                end_flag = False
+                emb = self.B(last_id)
+                output, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode)
+                output = output.squeeze(0).squeeze(0)
+                
+                # Log softmax + sort (EXACT original)
+                output = torch.log_softmax(output, dim=-1)
+                output, indices = torch.sort(output, descending=True)
+                output = output[:beam_size]
+                indices = indices[:beam_size]
+                
+                # Create new candidates (EXACT original)
+                for score_val, wid in zip(output, indices):
+                    new_score = score + score_val.item()
+                    new_id_seq = id_seq + [int(wid.item())]
+                    tmp_candidates.append([
+                        new_score,
+                        wid.unsqueeze(0),  # Keep as tensor [1,1]
+                        h_t, 
+                        c_t, 
+                        new_id_seq
+                    ])
+            
+            # Break if all candidates finished (EXACT original)
+            if end_flag:
+                break
+                
+            # Sort by normalized log probability (EXACT original)
+            candidates = sorted(
+                tmp_candidates, 
+                key=lambda x: x[0] / len(x[4]),  # Normalized score
+                reverse=True
+            )[:beam_size]
+        
+        # Return best sequence (EXACT original)
+        return candidates[0][4]
