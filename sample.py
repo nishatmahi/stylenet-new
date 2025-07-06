@@ -35,9 +35,10 @@ def main():
 
     # Prepare image(s)
     transform = transforms.Compose([
-        Rescale((224, 224)),
-        transforms.ToTensor()
-    ])
+    Rescale((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
     img_dir = '/kaggle/input/sample/sample_images'  # Change as needed
     img_names, img_list = load_sample_images(img_dir, transform, device)
     idx = 1  # whichever image you want
