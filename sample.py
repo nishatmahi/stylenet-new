@@ -29,8 +29,8 @@ def main():
     decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, tokenizer.vocab_size).to(device)
 
     # Load weights
-    encoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/encoder-last.pkl', map_location=device))
-    decoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/decoder-last.pkl', map_location=device))
+    encoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/encoder-35.pkl', map_location=device))
+    decoder.load_state_dict(torch.load('/kaggle/working/pretrained_models/decoder-35.pkl', map_location=device))
     encoder.eval()
     decoder.eval()
 
@@ -42,7 +42,7 @@ def main():
     ])
     img_dir = '/kaggle/input/sample/sample_images'  # Change as needed
     img_names, img_list = load_sample_images(img_dir, transform, device)
-    idx = 15  # whichever image you want
+    idx = 12  # whichever image you want
     image = img_list[idx]
 
     with torch.no_grad():
