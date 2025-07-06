@@ -42,7 +42,7 @@ def main():
     ])
     img_dir = '/kaggle/input/sample/sample_images'  # Change as needed
     img_names, img_list = load_sample_images(img_dir, transform, device)
-    idx = 4  # whichever image you want
+    idx = 7  # whichever image you want
     image = img_list[idx]
 
     with torch.no_grad():
