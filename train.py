@@ -16,7 +16,7 @@ def eval_outputs(outputs, tokenizer):
 
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # Paths
+
     permanent_save_folder = "stylenet_models/"
     os.makedirs(permanent_save_folder, exist_ok=True)
     os.makedirs(args.model_path, exist_ok=True)
@@ -47,7 +47,6 @@ def main(args):
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
     # ======= Checkpoint Loading (NEW SECTION) =======
-    # Checkpoint loading
     start_epoch = 0
     checkpoint_path = os.path.join(permanent_save_folder, 'checkpoint-latest.pth')
     encoder_last_path = os.path.join(permanent_save_folder, "encoder-last.pkl")
@@ -74,11 +73,12 @@ def main(args):
         if not loaded_any:
             print("No checkpoint or pretrained weights found. Training from scratch (random weights).")
 
-    # --- Train loop ---
     total_cap_step = len(data_loader)
     total_lang_step = len(styled_data_loader) if styled_data_loader else 0
     total_romantic_step = len(styled_data_loader_romantic) if styled_data_loader_romantic else 0
     epoch_num = args.epoch_num
+
+    # ========================= Training Loop =========================
     for epoch in range(start_epoch, epoch_num):
         # factual (image+caption)
         for i, (images, captions, lengths) in enumerate(data_loader):
@@ -131,24 +131,21 @@ def main(args):
                     print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
                           % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
 
-    # Save final models
-    torch.save(decoder.state_dict(), os.path.join(permanent_save_folder, 'decoder-last.pkl'))
-    torch.save(encoder.state_dict(), os.path.join(permanent_save_folder, 'encoder-last.pkl'))
-    torch.save(decoder.state_dict(), os.path.join(args.model_path, 'decoder-last.pkl'))
-    torch.save(encoder.state_dict(), os.path.join(args.model_path, 'encoder-last.pkl'))
-    
-    # Save final checkpoint
-    torch.save({
-        'epoch': epoch,
-        'encoder_state_dict': encoder.state_dict(),
-        'decoder_state_dict': decoder.state_dict(),
-        'optimizer_cap_state_dict': optimizer_cap.state_dict(),
-        'optimizer_lang_state_dict': optimizer_lang.state_dict(),
-        'loss': loss.item(),
-    }, os.path.join(permanent_save_folder, 'checkpoint-latest.pth'))
-    print(f"Saved final checkpoint and models at epoch {epoch+1}")
+        # ======== SAVE: After every epoch =========
+        torch.save({
+            'epoch': epoch,
+            'encoder_state_dict': encoder.state_dict(),
+            'decoder_state_dict': decoder.state_dict(),
+            'optimizer_cap_state_dict': optimizer_cap.state_dict(),
+            'optimizer_lang_state_dict': optimizer_lang.state_dict(),
+            'loss': loss.item(),
+        }, os.path.join(permanent_save_folder, 'checkpoint-latest.pth'))
 
-# ======= END Training Loop =======
+        torch.save(decoder.state_dict(), os.path.join(permanent_save_folder, 'decoder-last.pkl'))
+        torch.save(encoder.state_dict(), os.path.join(permanent_save_folder, 'encoder-last.pkl'))
+        print(f"Saved checkpoint and models at epoch {epoch+1}")
+
+    
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla: Generating Attractive Visual Captions with Styles')
