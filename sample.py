@@ -29,9 +29,8 @@ def main():
     decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, tokenizer.vocab_size).to(device)
 
     # Load weights
-    model_dir = "stylenet_models"
-    encoder.load_state_dict(torch.load(f'{model_dir}/encoder-last.pkl', map_location=device))
-    decoder.load_state_dict(torch.load(f'{model_dir}/decoder-last.pkl', map_location=device))
+    encoder.load_state_dict(torch.load('stylenet_models/encoder-last.pkl', map_location=device))
+    decoder.load_state_dict(torch.load('stylenet_models/decoder-last.pkl', map_location=device))
 
     encoder.eval()
     decoder.eval()
