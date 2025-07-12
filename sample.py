@@ -26,7 +26,7 @@ def main():
     factored_dim = 512
 
     encoder = EncoderCNN(emb_dim).to(device)
-    decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, tokenizer.vocab_size).to(device)
+    decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, len(tokenizer)).to(device)
 
     # Load weights
     encoder.load_state_dict(torch.load('stylenet_models/encoder-last.pkl', map_location=device))
