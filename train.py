@@ -132,6 +132,12 @@ def main(args):
                           % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
 
         # ======== SAVE: After every epoch =========
+        os.makedirs(permanent_save_folder, exist_ok=True)
+        os.makedirs(args.model_path, exist_ok=True)
+        torch.save(decoder.state_dict(), os.path.join(permanent_save_folder, 'decoder-last.pkl'))
+        torch.save(encoder.state_dict(), os.path.join(permanent_save_folder, 'encoder-last.pkl'))
+        torch.save(decoder.state_dict(), os.path.join(args.model_path, 'decoder-last.pkl'))
+        torch.save(encoder.state_dict(), os.path.join(args.model_path, 'encoder-last.pkl'))
         torch.save({
             'epoch': epoch,
             'encoder_state_dict': encoder.state_dict(),
@@ -140,12 +146,7 @@ def main(args):
             'optimizer_lang_state_dict': optimizer_lang.state_dict(),
             'loss': loss.item(),
         }, os.path.join(permanent_save_folder, 'checkpoint-latest.pth'))
-
-        torch.save(decoder.state_dict(), os.path.join(permanent_save_folder, 'decoder-last.pkl'))
-        torch.save(encoder.state_dict(), os.path.join(permanent_save_folder, 'encoder-last.pkl'))
         print(f"Saved checkpoint and models at epoch {epoch+1}")
-
-    
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla: Generating Attractive Visual Captions with Styles')
