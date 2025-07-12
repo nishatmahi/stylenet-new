@@ -31,7 +31,7 @@ def main(args):
 
     # Models
     encoder = EncoderCNN(args.emb_dim).to(device)
-    decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, tokenizer.vocab_size).to(device)
+    decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, len(tokenizer)).to(device)
 
     # --- Stylenet logic: freeze encoder except last FC ---
     for param in encoder.resnet.parameters():
