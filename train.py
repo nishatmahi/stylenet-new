@@ -52,6 +52,13 @@ def main(args):
     encoder_last_path = os.path.join(permanent_save_folder, "encoder-last.pkl")
     decoder_last_path = os.path.join(permanent_save_folder, "decoder-last.pkl")
 
+    # === DEBUG: List files before loading checkpoint ===
+    print("========== [DEBUG] ==========")
+    print(f"permanent_save_folder: {permanent_save_folder}")
+    print(f"checkpoint_path: {checkpoint_path}")
+    print("Files in checkpoint folder BEFORE loading:", os.listdir(permanent_save_folder))
+    print("=============================")
+
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
         encoder.load_state_dict(checkpoint['encoder_state_dict'])
@@ -59,19 +66,25 @@ def main(args):
         optimizer_cap.load_state_dict(checkpoint['optimizer_cap_state_dict'])
         optimizer_lang.load_state_dict(checkpoint['optimizer_lang_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
-        print(f"Loaded checkpoint from epoch {checkpoint['epoch']+1}")
+        print(f"[DEBUG] Loaded checkpoint from epoch {checkpoint['epoch']+1}")
+        print(f"[DEBUG] start_epoch = {start_epoch}")
     else:
         loaded_any = False
         if os.path.exists(decoder_last_path):
             decoder.load_state_dict(torch.load(decoder_last_path, map_location=device))
-            print("Decoder loaded from saved weight")
+            print("[DEBUG] Decoder loaded from saved weight")
             loaded_any = True
         if os.path.exists(encoder_last_path):
             encoder.load_state_dict(torch.load(encoder_last_path, map_location=device))
-            print("Encoder loaded from saved weight")
+            print("[DEBUG] Encoder loaded from saved weight")
             loaded_any = True
         if not loaded_any:
-            print("No checkpoint or pretrained weights found. Training from scratch (random weights).")
+            print("[DEBUG] No checkpoint or pretrained weights found. Training from scratch (random weights).")
+        else:
+            print("[DEBUG] No checkpoint found. Loaded latest pretrained weights only.")
+
+    print(f"[DEBUG] Final start_epoch = {start_epoch}")
+    print("=============================")
 
     total_cap_step = len(data_loader)
     total_lang_step = len(styled_data_loader) if styled_data_loader else 0
@@ -80,6 +93,8 @@ def main(args):
 
     # ========================= Training Loop =========================
     for epoch in range(start_epoch, epoch_num):
+        print(f"[DEBUG] Training epoch {epoch+1} of {epoch_num} (starting from {start_epoch+1})")
+
         # factual (image+caption)
         for i, (images, captions, lengths) in enumerate(data_loader):
             images = images.to(device)
@@ -146,7 +161,9 @@ def main(args):
             'optimizer_lang_state_dict': optimizer_lang.state_dict(),
             'loss': loss.item(),
         }, os.path.join(permanent_save_folder, 'checkpoint-latest.pth'))
-        print(f"Saved checkpoint and models at epoch {epoch+1}")
+        # === DEBUG: List files after saving checkpoint ===
+        print(f"[DEBUG] Saved checkpoint and models at epoch {epoch+1}")
+        print(f"[DEBUG] Files in checkpoint folder AFTER saving:", os.listdir(permanent_save_folder))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla: Generating Attractive Visual Captions with Styles')
