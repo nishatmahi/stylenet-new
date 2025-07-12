@@ -7,7 +7,7 @@ from torchvision import transforms
 from transformers import AutoTokenizer
 
 # ---- HuggingFace Bangla Tokenizer ----
-tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/stylenet/tokenizer-extended", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/tokenizer-extended", trust_remote_code=True)
 
 class Rescale:
     '''Rescale the image to a given size'''
