@@ -17,7 +17,7 @@ def eval_outputs(outputs, tokenizer):
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    permanent_save_folder = "stylenet_models/"
+    permanent_save_folder = "stylenet_new_models/"
     os.makedirs(permanent_save_folder, exist_ok=True)
     os.makedirs(args.model_path, exist_ok=True)
 
