@@ -71,7 +71,7 @@ def main():
         output = decoder.sample(
             features,
             tokenizer=tokenizer,
-            beam_size=5,
+            beam_size=3,
             max_len=30,
             mode="factual"
         )
