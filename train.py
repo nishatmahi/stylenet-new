@@ -191,7 +191,7 @@ if __name__ == '__main__':
                         help='learning rate for caption model training')
     parser.add_argument('--lr_language', type=float, default=0.00005,
                         help='learning rate for language model training')
-    parser.add_argument('--epoch_num', type=int, default=1)
+    parser.add_argument('--epoch_num', type=int, default=2)
     parser.add_argument('--log_step_caption', type=int, default=300,
                         help='steps for print log while train caption model')
     parser.add_argument('--log_step_language', type=int, default=10,
