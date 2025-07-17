@@ -43,7 +43,7 @@ def main():
     ])
     img_dir = '/kaggle/input/sample/sample_images'  # Change as needed
     img_names, img_list = load_sample_images(img_dir, transform, device)
-    idx = 25  # whichever image you want
+    idx = 24  # whichever image you want
     image = img_list[idx]
 
     with torch.no_grad():
@@ -71,7 +71,7 @@ def main():
         output = decoder.sample(
             features,
             tokenizer=tokenizer,
-            beam_size=3,
+            beam_size=5,
             max_len=30,
             mode="factual"
         )
