@@ -181,7 +181,7 @@ if __name__ == '__main__':
                         help='mini batch size for caption model training')
     parser.add_argument('--language_batch_size', type=int, default=64,
                         help='mini batch size for language model training')
-    parser.add_argument('--emb_dim', type=int, default=100,
+    parser.add_argument('--emb_dim', type=int, default=300,
                         help='embedding size of word, image')
     parser.add_argument('--hidden_dim', type=int, default=512,
                         help='hidden state size of factored LSTM')
@@ -192,7 +192,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr_language', type=float, default=0.00005,
                         help='learning rate for language model training')
     parser.add_argument('--epoch_num', type=int, default=48)
-    parser.add_argument('--log_step_caption', type=int, default=300,
+    parser.add_argument('--log_step_caption', type=int, default=100,
                         help='steps for print log while train caption model')
     parser.add_argument('--log_step_language', type=int, default=10,
                         help='steps for print log while train language model')
