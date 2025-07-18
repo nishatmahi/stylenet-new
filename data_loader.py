@@ -79,9 +79,7 @@ class Flickr7kBanglaDataset(Dataset):
         except Exception as e:
             print(f"[ERROR] Could not open image: {img_path}, {e}")
             image = Image.new("RGB", (224, 224))
-        if image.mode == "RGBA" or image.mode == "LA":
-            image = image.convert("RGB")
-        elif image.mode == "L":
+        if image.mode != "RGB":
             image = image.convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
