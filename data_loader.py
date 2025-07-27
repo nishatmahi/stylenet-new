@@ -106,28 +106,29 @@ class FlickrStyle7kBanglaDataset(Dataset):
 def collate_fn(batch):
     images, captions = zip(*batch)
     images = torch.stack(images, 0)
-    encodings = tokenizer(
-        list(captions),
-        padding=True,         # Dynamic pad
-        truncation=True,      # Optional: cut long captions
-        return_tensors="pt",
-        add_special_tokens=True
-    )
-    input_ids = encodings["input_ids"]
-    lengths = (input_ids != tokenizer.pad_token_id).sum(dim=1)
+    # --- BOS/EOS manually add for each caption ---
+    ids_list = []
+    for cap in captions:
+        ids = tokenizer.encode(cap, add_special_tokens=False)
+        ids = [tokenizer.bos_token_id] + ids + [tokenizer.eos_token_id]
+        ids_list.append(torch.tensor(ids, dtype=torch.long))
+    # --- Pad manually
+    max_len = max(len(ids) for ids in ids_list)
+    padded = [torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=torch.long)]) for ids in ids_list]
+    input_ids = torch.stack(padded, 0)
+    lengths = torch.tensor([len(ids) for ids in ids_list], dtype=torch.long)
     return images, input_ids, lengths
 
 def collate_fn_styled(captions):
-    captions = list(captions)
-    encodings = tokenizer(
-        list(captions),
-        padding=True,
-        truncation=True,
-        return_tensors="pt",
-        add_special_tokens=True
-    )
-    input_ids = encodings["input_ids"]
-    lengths = (input_ids != tokenizer.pad_token_id).sum(dim=1)
+    ids_list = []
+    for cap in captions:
+        ids = tokenizer.encode(cap, add_special_tokens=False)
+        ids = [tokenizer.bos_token_id] + ids + [tokenizer.eos_token_id]
+        ids_list.append(torch.tensor(ids, dtype=torch.long))
+    max_len = max(len(ids) for ids in ids_list)
+    padded = [torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=torch.long)]) for ids in ids_list]
+    input_ids = torch.stack(padded, 0)
+    lengths = torch.tensor([len(ids) for ids in ids_list], dtype=torch.long)
     return input_ids, lengths
 
 # --------- Loader functions ---------
