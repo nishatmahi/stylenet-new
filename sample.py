@@ -75,19 +75,8 @@ def main():
             max_len=30,
             mode="factual"
         )
-
-    # Remove BOS if present, stop at EOS
-    if output and output[0] == tokenizer.bos_token_id:
-        output = output[1:]
-    if tokenizer.eos_token_id in output:
-        output = output[:output.index(tokenizer.eos_token_id)]
-
-    # Convert tokens to string and print
-    caption_tokens = [tokenizer.convert_ids_to_tokens([x])[0] for x in output]
-    caption_text = tokenizer.convert_tokens_to_string(caption_tokens)
-
-    print(img_names[idx])
-    print("Predicted Caption:", caption_text)
+        caption = tokenizer.decode(output, skip_special_tokens=True)
+        print(img_names[idx], "| Predicted Caption:", caption)
 
 if __name__ == '__main__':
     main()
