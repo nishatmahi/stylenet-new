@@ -4,7 +4,7 @@ from torchvision import transforms
 from PIL import Image
 import matplotlib.pyplot as plt
 from data_loader import Rescale, tokenizer
-from models import EncoderCNN, FactoredLSTM
+from models import EncoderViT, FactoredLSTM
 
 # ---- BLEU and ROUGE functions (add at the top) ----
 def simple_bleu(reference, hypothesis, n=4):
