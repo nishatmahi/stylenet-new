@@ -2,7 +2,7 @@ import os
 import argparse
 import torch
 from data_loader import get_data_loader, get_styled_data_loader, tokenizer
-from models import EncoderCNN, FactoredLSTM
+from models import EncoderViT, FactoredLSTM
 from loss import masked_cross_entropy
 
 def eval_outputs(outputs, tokenizer):
@@ -30,14 +30,10 @@ def main(args):
         args.romantic_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.romantic_caption_path else None
 
     # Models
-    encoder = EncoderCNN(args.emb_dim).to(device)
+    encoder = EncoderViT(args.emb_dim).to(device)
     decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, len(tokenizer)).to(device)
 
-    # --- Stylenet logic: freeze encoder except last FC ---
-    for param in encoder.resnet.parameters():
-        param.requires_grad = False
-    for param in encoder.A.parameters():
-        param.requires_grad = True
+    
 
     # Optimizer, loss
     criterion = masked_cross_entropy
