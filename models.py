@@ -140,7 +140,7 @@ class FactoredLSTM(nn.Module):
         all_outputs = torch.stack(all_outputs, 1)
         return all_outputs
 
-    def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual"):
+    def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="romantic"):
         '''
         generate captions from feature vectors with beam search
         Args:
