@@ -1,27 +1,25 @@
 import sys
 import torch
 import torch.nn as nn
+from transformers import ViTModel
 import torchvision.models as models
 import torch.nn.functional as F
 from torch.autograd import Variable
 
 # --------- EncoderCNN (ResNet152) ---------
-class EncoderCNN(nn.Module):
+class EncoderViT(nn.Module):
     def __init__(self, emb_dim):
-        '''
-        Load the pretrained ResNet152 and replace fc
-        '''
-        super(EncoderCNN, self).__init__()
-        resnet = models.resnet152(pretrained=True)
-        modules = list(resnet.children())[:-1]
-        self.resnet = nn.Sequential(*modules)
-        self.A = nn.Linear(resnet.fc.in_features, emb_dim)
+        super(EncoderViT, self).__init__()
+        self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        self.A = nn.Linear(self.vit.config.hidden_size, emb_dim)
+        for param in self.A.parameters():
+            param.requires_grad = True
 
     def forward(self, images):
-        '''Extract the image feature vectors'''
-        features = self.resnet(images)
-        features = Variable(features.data)
-        features = features.view(features.size(0), -1)
+        outputs = self.vit(images)
+        features = outputs.last_hidden_state[:, 0, :]  # CLS token
         features = self.A(features)
         return features
 
