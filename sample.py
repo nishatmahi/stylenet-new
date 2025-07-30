@@ -91,7 +91,7 @@ def main():
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
-    img_dir = '/kaggle/input/sample-data/sample/sample_images'  # Change as needed
+    img_dir = '/kaggle/input/sample/sample_images'  # Change as needed
     reference_file = '/kaggle/input/sample-data/sample/sample_images_factual.txt'  # Add this path
     img_names, img_list = load_sample_images(img_dir, transform, device)
     reference_captions = load_reference_captions(reference_file)  # New
