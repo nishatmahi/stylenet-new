@@ -75,7 +75,7 @@ def main():
     hidden_dim = 512
     factored_dim = 512
 
-    encoder = EncoderCNN(emb_dim).to(device)
+    encoder = EncoderViT(emb_dim).to(device)
     decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, len(tokenizer)).to(device)
 
     # Load weights
