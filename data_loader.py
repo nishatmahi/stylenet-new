@@ -152,8 +152,8 @@ def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=
 
 # ==== Test/debug block ====
 if __name__ == "__main__":
-    img_dir = "/kaggle/input/dataset/data/Images"
-    factual_file = "/kaggle/input/dataset/data/factual_caption.txt"
+    img_dir = "/kaggle/input/dataset/data/Flicker8k_Dataset"
+    factual_file = "/kaggle/input/dataset/data/factual_train.txt"
     humorous_file = "/kaggle/input/dataset/data/humorous_train.txt"
     romantic_file = "/kaggle/input/dataset/data/romantic_train.txt"
 
