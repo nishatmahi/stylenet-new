@@ -92,55 +92,55 @@ def main(args):
         print(f"[DEBUG] Training epoch {epoch+1} of {epoch_num} (starting from {start_epoch+1})")
 
         # factual (image+caption)
-        for i, (images, captions, lengths) in enumerate(data_loader):
-            images = images.to(device)
-            captions = captions.long().to(device)
-            lengths = lengths.to(device)
+        # for i, (images, captions, lengths) in enumerate(data_loader):
+        #     images = images.to(device)
+        #     captions = captions.long().to(device)
+        #     lengths = lengths.to(device)
 
-            decoder.zero_grad()
-            encoder.zero_grad()
-            features = encoder(images)
-            outputs = decoder(captions, features, mode="factual")
-            loss = criterion(outputs[:, 1:, :].contiguous(),
-                             captions[:, 1:].contiguous(), lengths - 1)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
-            optimizer_cap.step()
+        #     decoder.zero_grad()
+        #     encoder.zero_grad()
+        #     features = encoder(images)
+        #     outputs = decoder(captions, features, mode="factual")
+        #     loss = criterion(outputs[:, 1:, :].contiguous(),
+        #                      captions[:, 1:].contiguous(), lengths - 1)
+        #     loss.backward()
+        #     torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
+        #     optimizer_cap.step()
 
-            if i % args.log_step_caption == 0 or i == total_cap_step-1:
-                print("Epoch [%d/%d], CAP, Step [%d/%d], Loss: %.4f"
-                      % (epoch+1, epoch_num, i, total_cap_step, loss.item()))
-        eval_outputs(outputs, tokenizer)
+        #     if i % args.log_step_caption == 0 or i == total_cap_step-1:
+        #         print("Epoch [%d/%d], CAP, Step [%d/%d], Loss: %.4f"
+        #               % (epoch+1, epoch_num, i, total_cap_step, loss.item()))
+        # eval_outputs(outputs, tokenizer)
 
-        # styled (humorous)
-        # if styled_data_loader:
-        #     for i, (captions, lengths) in enumerate(styled_data_loader):
-        #         captions = captions.long().to(device)
-        #         lengths = lengths.to(device)
-        #         decoder.zero_grad()
-        #         outputs = decoder(captions, features=None, mode='humorous')
-        #         loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
-        #         loss.backward()
-        #         torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-        #         optimizer_lang.step()
-        #         if i % args.log_step_language == 0 or i == total_lang_step-1:
-        #             print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
-        #                   % (epoch+1, epoch_num, i, total_lang_step, loss.item()))
+        styled (humorous)
+        if styled_data_loader:
+            for i, (captions, lengths) in enumerate(styled_data_loader):
+                captions = captions.long().to(device)
+                lengths = lengths.to(device)
+                decoder.zero_grad()
+                outputs = decoder(captions, features=None, mode='humorous')
+                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
+                optimizer_lang.step()
+                if i % args.log_step_language == 0 or i == total_lang_step-1:
+                    print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
+                          % (epoch+1, epoch_num, i, total_lang_step, loss.item()))
 
-        # # styled (romantic)
-        # if styled_data_loader_romantic:
-        #     for i, (captions, lengths) in enumerate(styled_data_loader_romantic):
-        #         captions = captions.long().to(device)
-        #         lengths = lengths.to(device)
-        #         decoder.zero_grad()
-        #         outputs = decoder(captions, features=None, mode='romantic')
-        #         loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
-        #         loss.backward()
-        #         torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-        #         optimizer_lang.step()
-        #         if i % args.log_step_language == 0 or i == total_romantic_step-1:
-        #             print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
-        #                   % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
+        # styled (romantic)
+        if styled_data_loader_romantic:
+            for i, (captions, lengths) in enumerate(styled_data_loader_romantic):
+                captions = captions.long().to(device)
+                lengths = lengths.to(device)
+                decoder.zero_grad()
+                outputs = decoder(captions, features=None, mode='romantic')
+                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
+                optimizer_lang.step()
+                if i % args.log_step_language == 0 or i == total_romantic_step-1:
+                    print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
+                          % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
 
         # ======== SAVE: After every epoch =========
         os.makedirs(permanent_save_folder, exist_ok=True)
