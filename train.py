@@ -112,7 +112,7 @@ def main(args):
         #               % (epoch+1, epoch_num, i, total_cap_step, loss.item()))
         # eval_outputs(outputs, tokenizer)
 
-        styled (humorous)
+        # styled (humorous)
         if styled_data_loader:
             for i, (captions, lengths) in enumerate(styled_data_loader):
                 captions = captions.long().to(device)
