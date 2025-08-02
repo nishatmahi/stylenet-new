@@ -91,7 +91,7 @@ def main(args):
     for epoch in range(start_epoch, epoch_num):
         print(f"[DEBUG] Training epoch {epoch+1} of {epoch_num} (starting from {start_epoch+1})")
 
-        factual (image+caption)
+        #factual (image+caption)
         for i, (images, captions, lengths) in enumerate(data_loader):
             images = images.to(device)
             captions = captions.long().to(device)
@@ -194,5 +194,6 @@ if __name__ == '__main__':
                         help='steps for print log while train language model')
     args = parser.parse_args()
     main(args)
+
 
 
