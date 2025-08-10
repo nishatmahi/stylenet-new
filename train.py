@@ -113,19 +113,19 @@ def main(args):
         eval_outputs(outputs, tokenizer)
 
         # styled (humorous)
-        if styled_data_loader:
-            for i, (captions, lengths) in enumerate(styled_data_loader):
-                captions = captions.long().to(device)
-                lengths = lengths.to(device)
-                decoder.zero_grad()
-                outputs = decoder(captions, mode='humorous')
-                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-                optimizer_lang.step()
-                if i % args.log_step_language == 0 or i == total_lang_step-1:
-                    print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
-                          % (epoch+1, epoch_num, i, total_lang_step, loss.item()))
+        # if styled_data_loader:
+        #     for i, (captions, lengths) in enumerate(styled_data_loader):
+        #         captions = captions.long().to(device)
+        #         lengths = lengths.to(device)
+        #         decoder.zero_grad()
+        #         outputs = decoder(captions, mode='humorous')
+        #         loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+        #         loss.backward()
+        #         torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
+        #         optimizer_lang.step()
+        #         if i % args.log_step_language == 0 or i == total_lang_step-1:
+        #             print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
+        #                   % (epoch+1, epoch_num, i, total_lang_step, loss.item()))
 
          # styled (romantic)
         if styled_data_loader_romantic:
@@ -165,13 +165,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla: Generating Attractive Visual Captions with Styles')
     parser.add_argument('--model_path', type=str, default='pretrained_models',
                         help='path for saving trained models')
-    parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Flicker8k_Dataset',
+    parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images',
                     help='path for train images directory')
-    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_train.txt',
+    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_caption.txt',
                         help='path for factual caption file')
     parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset/data/humorous_text.txt',
                         help='path for humorous caption file')
-    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_text.txt',
+    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_data.txt',
                         help='path for romantic caption file')
     parser.add_argument('--caption_batch_size', type=int, default=32,
                         help='mini batch size for caption model training')
@@ -187,13 +187,14 @@ if __name__ == '__main__':
                         help='learning rate for caption model training')
     parser.add_argument('--lr_language', type=float, default=0.00002,
                         help='learning rate for language model training')
-    parser.add_argument('--epoch_num', type=int, default=74)
+    parser.add_argument('--epoch_num', type=int, default=14)
     parser.add_argument('--log_step_caption', type=int, default=200,
                         help='steps for print log while train caption model')
     parser.add_argument('--log_step_language', type=int, default=10,
                         help='steps for print log while train language model')
     args = parser.parse_args()
     main(args)
+
 
 
 
