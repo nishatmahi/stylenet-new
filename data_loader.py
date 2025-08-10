@@ -154,7 +154,7 @@ def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=
 if __name__ == "__main__":
     img_dir = "/kaggle/input/dataset/data/Flicker8k_Dataset"
     factual_file = "/kaggle/input/dataset/data/factual_train.txt"
-    humorous_file = "/kaggle/input/dataset/data/humorous_train.txt"
+    # humorous_file = "/kaggle/input/dataset/data/humorous_train.txt"
     romantic_file = "/kaggle/input/dataset/data/romantic_train.txt"
 
     data_loader = get_data_loader(img_dir, factual_file, batch_size=3)
@@ -162,12 +162,13 @@ if __name__ == "__main__":
         print(f"Batch: {i}", images.shape, input_ids.shape, lengths)
         if i == 2: break
 
-    styled_loader_humorous = get_styled_data_loader(humorous_file, batch_size=3)
-    for i, (captions, lengths) in enumerate(styled_loader_humorous):
-        print(f"Humorous batch: {i}", captions.shape, lengths)
-        if i == 2: break
+    # styled_loader_humorous = get_styled_data_loader(humorous_file, batch_size=3)
+    # for i, (captions, lengths) in enumerate(styled_loader_humorous):
+    #     print(f"Humorous batch: {i}", captions.shape, lengths)
+    #     if i == 2: break
 
     styled_loader_romantic = get_styled_data_loader(romantic_file, batch_size=3)
     for i, (captions, lengths) in enumerate(styled_loader_romantic):
         print(f"Romantic batch: {i}", captions.shape, lengths)
         if i == 2: break
+
