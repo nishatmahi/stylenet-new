@@ -173,9 +173,9 @@ if __name__ == '__main__':
                         help='path for humorous caption file')
     parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_data.txt',
                         help='path for romantic caption file')
-    parser.add_argument('--caption_batch_size', type=int, default=64,
+    parser.add_argument('--caption_batch_size', type=int, default=32,
                         help='mini batch size for caption model training')
-    parser.add_argument('--language_batch_size', type=int, default=96,
+    parser.add_argument('--language_batch_size', type=int, default=64,
                         help='mini batch size for language model training')
     parser.add_argument('--emb_dim', type=int, default=300,
                         help='embedding size of word, image')
@@ -194,5 +194,6 @@ if __name__ == '__main__':
                         help='steps for print log while train language model')
     args = parser.parse_args()
     main(args)
+
 
 
