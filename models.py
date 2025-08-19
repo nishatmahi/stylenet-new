@@ -54,10 +54,10 @@ class FactoredLSTM(nn.Module):
         self.W_c = nn.Linear(hidden_dim, hidden_dim)
 
         # Style-specific
-        self.S_hi = nn.Linear(factored_dim, factored_dim)
-        self.S_hf = nn.Linear(factored_dim, factored_dim)
-        self.S_ho = nn.Linear(factored_dim, factored_dim)
-        self.S_hc = nn.Linear(factored_dim, factored_dim)
+        # self.S_hi = nn.Linear(factored_dim, factored_dim)
+        # self.S_hf = nn.Linear(factored_dim, factored_dim)
+        # self.S_ho = nn.Linear(factored_dim, factored_dim)
+        # self.S_hc = nn.Linear(factored_dim, factored_dim)
         # If you want romantic style, uncomment these:
         self.S_ri = nn.Linear(factored_dim, factored_dim)
         self.S_rf = nn.Linear(factored_dim, factored_dim)
@@ -219,6 +219,7 @@ class FactoredLSTM(nn.Module):
 
             # Return best sequence (EXACT original)
             return candidates[0][4]
+
 
 
 
