@@ -80,11 +80,11 @@ class FactoredLSTM(nn.Module):
             f = self.S_ff(f)
             o = self.S_fo(o)
             c = self.S_fc(c)
-        elif mode == "humorous":
-            i = self.S_hi(i)
-            f = self.S_hf(f)
-            o = self.S_ho(o)
-            c = self.S_hc(c)
+        # elif mode == "humorous":
+        #     i = self.S_hi(i)
+        #     f = self.S_hf(f)
+        #     o = self.S_ho(o)
+        #     c = self.S_hc(c)
         elif mode == "romantic":
             i = self.S_ri(i)
             f = self.S_rf(f)
@@ -219,6 +219,7 @@ class FactoredLSTM(nn.Module):
 
             # Return best sequence (EXACT original)
             return candidates[0][4]
+
 
 
 
