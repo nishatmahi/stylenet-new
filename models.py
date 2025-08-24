@@ -29,6 +29,7 @@ class FactoredLSTM(nn.Module):
         super(FactoredLSTM, self).__init__()
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
+        self.emb_dim = emb_dim
 
         self.B = nn.Embedding(vocab_size, emb_dim)
 
@@ -53,75 +54,121 @@ class FactoredLSTM(nn.Module):
         self.V_c = nn.Linear(emb_dim, factored_dim)
         self.W_c = nn.Linear(hidden_dim, hidden_dim)
 
-        # Style-specific
-        # self.S_hi = nn.Linear(factored_dim, factored_dim)
-        # self.S_hf = nn.Linear(factored_dim, factored_dim)
-        # self.S_ho = nn.Linear(factored_dim, factored_dim)
-        # self.S_hc = nn.Linear(factored_dim, factored_dim)
-        # If you want romantic style, uncomment these:
+        # NEW: Feature-to-gate transformations for visual conditioning
+        self.F_i = nn.Linear(emb_dim, factored_dim)  # Feature influence on input gate
+        self.F_f = nn.Linear(emb_dim, factored_dim)  # Feature influence on forget gate
+        self.F_o = nn.Linear(emb_dim, factored_dim)  # Feature influence on output gate
+        self.F_c = nn.Linear(emb_dim, factored_dim)  # Feature influence on cell gate
+
+        # Style-specific transformations for romantic
         self.S_ri = nn.Linear(factored_dim, factored_dim)
         self.S_rf = nn.Linear(factored_dim, factored_dim)
         self.S_ro = nn.Linear(factored_dim, factored_dim)
         self.S_rc = nn.Linear(factored_dim, factored_dim)
 
+        # Style-specific transformations for humorous/funny (COMMENTED OUT)
+        # self.S_hi = nn.Linear(factored_dim, factored_dim)
+        # self.S_hf = nn.Linear(factored_dim, factored_dim)
+        # self.S_ho = nn.Linear(factored_dim, factored_dim)
+        # self.S_hc = nn.Linear(factored_dim, factored_dim)
+
         self.C = nn.Linear(hidden_dim, vocab_size)
 
-        # Optional dropout for regularization (add if you want)
+        # Optional dropout for regularization
         self.dropout = nn.Dropout(p=0.5)
 
-    def forward_step(self, embedded, h_0, c_0, mode):
+    def forward_step(self, embedded, h_0, c_0, mode, features=None):
+        """
+        Args:
+            embedded: [batch_size, emb_dim] - current input embedding
+            h_0: [batch_size, hidden_dim] - previous hidden state
+            c_0: [batch_size, hidden_dim] - previous cell state
+            mode: str - "factual" or "romantic"
+            features: [batch_size, emb_dim] - visual features (required for factual mode)
+        """
+        # Transform input through V matrices
         i = self.V_i(embedded)
         f = self.V_f(embedded)
         o = self.V_o(embedded)
         c = self.V_c(embedded)
 
+        # ALL MODES get visual feature conditioning for image-aware generation
+        if features is not None:
+            # Base visual conditioning (applied to all modes)
+            visual_i = self.F_i(features)
+            visual_f = self.F_f(features)
+            visual_o = self.F_o(features)
+            visual_c = self.F_c(features)
+        else:
+            # If no features provided, use zeros (for text-only training)
+            batch_size = embedded.size(0)
+            visual_i = torch.zeros(batch_size, i.size(1), device=embedded.device)
+            visual_f = torch.zeros(batch_size, f.size(1), device=embedded.device)
+            visual_o = torch.zeros(batch_size, o.size(1), device=embedded.device)
+            visual_c = torch.zeros(batch_size, c.size(1), device=embedded.device)
+
+        # Apply style-specific transformations + visual conditioning
         if mode == "factual":
-            i = self.S_fi(i)
-            f = self.S_ff(f)
-            o = self.S_fo(o)
-            c = self.S_fc(c)
-        # elif mode == "humorous":
-        #     i = self.S_hi(i)
-        #     f = self.S_hf(f)
-        #     o = self.S_ho(o)
-        #     c = self.S_hc(c)
+            i = self.S_fi(i) + visual_i  # Factual style + visual info
+            f = self.S_ff(f) + visual_f
+            o = self.S_fo(o) + visual_o
+            c = self.S_fc(c) + visual_c
+            
         elif mode == "romantic":
-            i = self.S_ri(i)
-            f = self.S_rf(f)
-            o = self.S_ro(o)
-            c = self.S_rc(c)
+            i = self.S_ri(i) + visual_i  # Romantic style + visual info
+            f = self.S_rf(f) + visual_f
+            o = self.S_ro(o) + visual_o
+            c = self.S_rc(c) + visual_c
+            
+        # elif mode == "humorous":
+        #     i = self.S_hi(i) + visual_i  # Humorous style + visual info
+        #     f = self.S_hf(f) + visual_f
+        #     o = self.S_ho(o) + visual_o
+        #     c = self.S_hc(c) + visual_c
         else:
             sys.stderr.write("mode name wrong!\n")
+            raise ValueError(f"Unknown mode: {mode}. Only 'factual' and 'romantic' supported.")
 
+        # Compute LSTM gates
         i_t = torch.sigmoid(self.U_i(i) + self.W_i(h_0))
         f_t = torch.sigmoid(self.U_f(f) + self.W_f(h_0))
         o_t = torch.sigmoid(self.U_o(o) + self.W_o(h_0))
         c_tilda = torch.tanh(self.U_c(c) + self.W_c(h_0))
 
+        # Update cell and hidden states
         c_t = f_t * c_0 + i_t * c_tilda
         h_t = o_t * torch.tanh(c_t)
 
-        # dropout regularization
+        # Apply dropout regularization
         h_t = self.dropout(h_t)
 
+        # Generate output logits
         outputs = self.C(h_t)
         return outputs, h_t, c_t
 
     def forward(self, captions, features=None, mode="factual"):
-        '''
+        """
         Args:
-            features: fixed vectors from images, [batch, emb_dim]
-            captions: [batch, max_len]
-            mode: type of caption to generate
-        '''
+            features: [batch, emb_dim] - visual features from images
+            captions: [batch, max_len] - caption token sequences  
+            mode: str - caption style ("factual", "romantic")
+        
+        Training Strategy:
+        - Factual mode: Use image+caption pairs (features provided)
+        - Romantic: Use style text only (features=None for language modeling)
+        
+        Inference Strategy:
+        - ALL modes: Use image features (features provided) for visual conditioning
+        """
         batch_size = captions.size(0)
         embedded = self.B(captions)  # [batch, max_len, emb_dim]
-        if mode == "factual":
-            if features is None:
-                sys.stderr.write("features is None!\n")
+        
+        # For factual training: use features as first timestep (image+caption pairs)
+        # For style training: no features concatenation (text-only language modeling)
+        if mode == "factual" and features is not None:
             embedded = torch.cat((features.unsqueeze(1), embedded), 1)
 
-        # Stylenet: hidden/cell state — random uniform
+        # Initialize hidden/cell state with uniform distribution (matching original)
         h_t = Variable(torch.Tensor(batch_size, self.hidden_dim))
         c_t = Variable(torch.Tensor(batch_size, self.hidden_dim))
         nn.init.uniform_(h_t)
@@ -133,20 +180,24 @@ class FactoredLSTM(nn.Module):
         all_outputs = []
         for ix in range(embedded.size(1) - 1):
             emb = embedded[:, ix, :]
-            outputs, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode)
+            # Pass features for visual conditioning in ALL modes during inference
+            # During training: factual gets features, romantic/humorous get None
+            outputs, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode, features=features)
             all_outputs.append(outputs)
         all_outputs = torch.stack(all_outputs, 1)
         return all_outputs
-    # for caption generation
+
     def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual"):
-        '''
-        generate captions from feature vectors with beam search
+        """
+        Generate captions from feature vectors with beam search
         Args:
-            feature: fixed vector for an image, [1, emb_dim]
-            beam_size: stock size for beam search
-            max_len: max sampling length
-            mode: type of caption to generate
-        '''
+            feature: [1, emb_dim] - visual features for an image
+            beam_size: int - beam size for beam search
+            max_len: int - max sampling length
+            mode: str - caption style ("factual", "romantic", "humorous")
+        
+        NOTE: ALL modes use visual features during inference for image-conditioned generation
+        """
         with torch.no_grad():
             device = feature.device
 
@@ -159,8 +210,8 @@ class FactoredLSTM(nn.Module):
             h_t = h_t.to(device)
             c_t = c_t.to(device)
 
-            # Forward 1 step with image feature
-            _, h_t, c_t = self.forward_step(feature, h_t, c_t, mode=mode)
+            # Forward 1 step with image feature (ALL modes get visual conditioning during inference)
+            _, h_t, c_t = self.forward_step(feature, h_t, c_t, mode=mode, features=feature)
 
             # Use tokenizer's special tokens
             start_id = tokenizer.bos_token_id
@@ -185,7 +236,10 @@ class FactoredLSTM(nn.Module):
 
                     end_flag = False
                     emb = self.B(last_id)
-                    output, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode)
+                    # ALL modes get visual conditioning during inference
+                    output, h_t, c_t = self.forward_step(
+                        emb, h_t, c_t, mode=mode, features=feature
+                    )
                     output = output.squeeze(0).squeeze(0)
 
                     # Log softmax + sort (EXACT original)
@@ -219,13 +273,3 @@ class FactoredLSTM(nn.Module):
 
             # Return best sequence (EXACT original)
             return candidates[0][4]
-
-
-
-
-
-
-
-
-
-
