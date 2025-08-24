@@ -52,32 +52,24 @@ def load_reference_captions(reference_file):
     with open(reference_file, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
-                img_name, caption = line.strip().split('\t', 1)
-                reference_captions[img_name] = caption
+                parts = line.strip().split(None, 1)  # split by any whitespace (tab or space)
+                if len(parts) == 2:
+                    img_name, caption = parts
+                    img_name = img_name.strip()
+                    caption = caption.strip()
+                    if img_name not in reference_captions:
+                        reference_captions[img_name] = []
+                    reference_captions[img_name].append(caption)
     return reference_captions
 
 def load_sample_images(img_dir, transform, device):
-    # FIXED: Filter for image files only
-    img_extensions = {'.jpg', '.jpeg', '.png'}
-    all_files = os.listdir(img_dir)
-    img_names = sorted([f for f in all_files if os.path.splitext(f.lower())[1] in img_extensions])
-    
-    print(f"Found {len(img_names)} image files (filtered from {len(all_files)} total files)")
-    if len(img_names) != len(all_files):
-        skipped = [f for f in all_files if f not in img_names]
-        print(f"Skipped non-image files: {skipped}")
-    
+    img_names = sorted(os.listdir(img_dir))
     img_list = []
     for img_name in img_names:
         img_path = os.path.join(img_dir, img_name)
-        try:
-            img = Image.open(img_path).convert("RGB")
-            img = transform(img).unsqueeze(0).to(device)
-            img_list.append(img)
-        except Exception as e:
-            print(f"Error loading {img_name}: {e}")
-            continue
-    
+        img = Image.open(img_path).convert("RGB")
+        img = transform(img).unsqueeze(0).to(device)
+        img_list.append(img)
     return img_names, img_list
 
 def main():
@@ -143,23 +135,31 @@ def main():
                 tokenizer=tokenizer,
                 beam_size=5,
                 max_len=30,
-                mode="factual"  # Change to "romantic" when needed
+                mode="romantic"
             )
             caption = tokenizer.decode(output, skip_special_tokens=True)
             print(img_names[idx], "| Predicted Caption:", caption)
 
         # ------- BLEU/ROUGE calculation ---------
         img_name = img_names[idx]
-        ref_caption = reference_captions.get(img_name, None)
-        if ref_caption is not None:
-            ref_tokens = tokenizer.tokenize(ref_caption)
-            hyp_tokens = tokenizer.tokenize(caption)
-            bleu_score = simple_bleu(ref_tokens, hyp_tokens)
-            rouge_score = simple_rouge_l(ref_tokens, hyp_tokens)
-            all_bleu.append(bleu_score)
-            all_rouge.append(rouge_score)
-            print(f"Reference: {ref_caption}")
-            print(f"BLEU-4: {bleu_score:.4f} | ROUGE-L: {rouge_score:.4f}\n")
+        ref_list = reference_captions.get(img_name, None)
+
+        if ref_list is not None:
+            best_bleu, best_rouge = 0, 0
+            for ref_caption in ref_list:
+                ref_tokens = tokenizer.tokenize(ref_caption)
+                hyp_tokens = tokenizer.tokenize(caption)
+
+                bleu_score = simple_bleu(ref_tokens, hyp_tokens)
+                rouge_score = simple_rouge_l(ref_tokens, hyp_tokens)
+
+                best_bleu = max(best_bleu, bleu_score)
+                best_rouge = max(best_rouge, rouge_score)
+
+            all_bleu.append(best_bleu)
+            all_rouge.append(best_rouge)
+            print(f"Reference Captions: {ref_list}")
+            print(f"BLEU-4 (best): {best_bleu:.4f} | ROUGE-L (best): {best_rouge:.4f}\n")
         else:
             print(f"Reference: NOT FOUND\n")
 
