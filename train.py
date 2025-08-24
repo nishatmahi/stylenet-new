@@ -185,7 +185,7 @@ if __name__ == '__main__':
                         help='size of factored matrix')
     parser.add_argument('--lr_caption', type=float, default=0.00002,
                         help='learning rate for caption model training')
-    parser.add_argument('--lr_language', type=float, default=0.00003,
+    parser.add_argument('--lr_language', type=float, default=0.00005,
                         help='learning rate for language model training')
     parser.add_argument('--epoch_num', type=int, default=10)
     parser.add_argument('--log_step_caption', type=int, default=200,
@@ -194,6 +194,7 @@ if __name__ == '__main__':
                         help='steps for print log while train language model')
     args = parser.parse_args()
     main(args)
+
 
 
 
