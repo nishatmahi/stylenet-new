@@ -57,13 +57,27 @@ def load_reference_captions(reference_file):
     return reference_captions
 
 def load_sample_images(img_dir, transform, device):
-    img_names = sorted(os.listdir(img_dir))
+    # FIXED: Filter for image files only
+    img_extensions = {'.jpg', '.jpeg', '.png'}
+    all_files = os.listdir(img_dir)
+    img_names = sorted([f for f in all_files if os.path.splitext(f.lower())[1] in img_extensions])
+    
+    print(f"Found {len(img_names)} image files (filtered from {len(all_files)} total files)")
+    if len(img_names) != len(all_files):
+        skipped = [f for f in all_files if f not in img_names]
+        print(f"Skipped non-image files: {skipped}")
+    
     img_list = []
     for img_name in img_names:
         img_path = os.path.join(img_dir, img_name)
-        img = Image.open(img_path).convert("RGB")
-        img = transform(img).unsqueeze(0).to(device)
-        img_list.append(img)
+        try:
+            img = Image.open(img_path).convert("RGB")
+            img = transform(img).unsqueeze(0).to(device)
+            img_list.append(img)
+        except Exception as e:
+            print(f"Error loading {img_name}: {e}")
+            continue
+    
     return img_names, img_list
 
 def main():
@@ -129,7 +143,7 @@ def main():
                 tokenizer=tokenizer,
                 beam_size=5,
                 max_len=30,
-                mode="factual"
+                mode="factual"  # Change to "romantic" when needed
             )
             caption = tokenizer.decode(output, skip_special_tokens=True)
             print(img_names[idx], "| Predicted Caption:", caption)
