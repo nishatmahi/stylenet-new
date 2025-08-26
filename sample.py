@@ -456,7 +456,7 @@ def main():
                     tokenizer=tokenizer,
                     beam_size=5,
                     max_len=30,
-                    mode="romantic"  # You can change this to "factual" if needed
+                    mode="factual"  # You can change this to "factual" if needed
                 )
                 caption = tokenizer.decode(output, skip_special_tokens=True)
                 print(f"Generated Caption (Bengali): {caption}")
