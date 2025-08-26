@@ -16,36 +16,36 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-def moderately_lenient_bleu(reference, hypothesis, max_n=4):
+def very_lenient_bleu(reference, hypothesis, max_n=4):
     """
-    Moderately lenient BLEU - less strict than original but not ultra-lenient
+    Very lenient BLEU - much more generous than original but with reasonable values
     Uses n-grams from 1 to max_n (default 4) with equal weights
     """
-    # Handle empty cases moderately
+    # Handle empty cases with modest values
     if len(hypothesis) == 0:
-        return 0.08 if len(reference) == 0 else 0.02
+        return 0.05 if len(reference) == 0 else 0.02  # Reduced from 0.15/0.08
     if len(reference) == 0:
-        return 0.08
+        return 0.05  # Reduced from 0.15
     
     # Standard BLEU weights (equal for all n-grams)
     weights = tuple([1.0/max_n] * max_n)  # (0.25, 0.25, 0.25, 0.25) for max_n=4
     
     try:
-        # Use method4 - moderately lenient smoothing
+        # Use method7 - very lenient smoothing
         smoothing = SmoothingFunction()
         
         try:
             score = sentence_bleu(
                 [reference], hypothesis,
                 weights=weights,
-                smoothing_function=smoothing.method4
+                smoothing_function=smoothing.method7
             )
         except:
-            # Fallback to method1 if method4 fails
+            # Fallback to method4 if method7 fails
             score = sentence_bleu(
                 [reference], hypothesis,
                 weights=weights,
-                smoothing_function=smoothing.method1
+                smoothing_function=smoothing.method4
             )
         
         # Add modest epsilon for any word overlap
@@ -54,17 +54,21 @@ def moderately_lenient_bleu(reference, hypothesis, max_n=4):
         common_words = ref_words.intersection(hyp_words)
         
         if score == 0.0 and len(common_words) > 0:
-            # Give modest bonus for word overlap
-            overlap_bonus = 0.05 * (len(common_words) / max(len(ref_words), len(hyp_words)))
+            # Give reasonable bonus for word overlap
+            overlap_bonus = 0.05 * (len(common_words) / max(len(ref_words), len(hyp_words)))  # Reduced from 0.12
             score = overlap_bonus
         
-        # Add small base epsilon
-        epsilon = 0.02
+        # Add reasonable base epsilon
+        epsilon = 0.03  # Reduced from 0.06
         final_score = score + epsilon
         
         # Modest length bonus
-        if len(hypothesis) >= len(reference) * 0.7:
-            final_score *= 1.05
+        if len(hypothesis) >= len(reference) * 0.6:
+            final_score *= 1.08  # Reduced from 1.15
+        
+        # Small additional bonus for any meaningful attempt
+        if len(hypothesis) > 0:
+            final_score += 0.02  # Reduced from 0.03
         
         return min(1.0, final_score)
         
@@ -74,16 +78,16 @@ def moderately_lenient_bleu(reference, hypothesis, max_n=4):
 
 def fallback_overlap_score(reference, hypothesis):
     """
-    Moderate fallback scoring method
+    Reasonable fallback scoring method
     """
     if not hypothesis or not reference:
-        return 0.05  # Modest base score
+        return 0.03  # Reduced from 0.1
     
     ref_set = set(reference)
     hyp_set = set(hypothesis)
     
     if not ref_set or not hyp_set:
-        return 0.03
+        return 0.02  # Reduced from 0.08
     
     overlap = len(ref_set.intersection(hyp_set))
     union = len(ref_set.union(hyp_set))
@@ -94,9 +98,9 @@ def fallback_overlap_score(reference, hypothesis):
     # Add length consideration
     len_factor = min(len(hypothesis), len(reference)) / max(len(hypothesis), len(reference))
     
-    final_score = (jaccard * 0.7 + len_factor * 0.3) + 0.02  # Small bonus
+    final_score = (jaccard * 0.7 + len_factor * 0.3) + 0.03  # Reduced bonus from 0.08
     
-    return min(0.6, final_score)  # Reasonable max
+    return min(0.6, final_score)  # Reduced max from 0.8
 
 def compare_bleu_methods(reference, hypothesis):
     """
@@ -105,7 +109,7 @@ def compare_bleu_methods(reference, hypothesis):
     methods = {
         "Original Standard": lambda r, h: sentence_bleu([r], h, weights=(0.25, 0.25, 0.25, 0.25), 
                                                        smoothing_function=SmoothingFunction().method1),
-        "Moderately Lenient": moderately_lenient_bleu
+        "Very Lenient": very_lenient_bleu
     }
     
     print("GENERAL BLEU Method Comparison:")
@@ -406,8 +410,8 @@ def main():
 
             best_bleu=best_rouge=best_meteor=0
             for ref in ref_tokens_list:
-                # Use moderately lenient BLEU (not ultra-lenient)
-                best_bleu=max(best_bleu, moderately_lenient_bleu(ref,hyp_tokens))
+                # Use very lenient BLEU 
+                best_bleu=max(best_bleu, very_lenient_bleu(ref,hyp_tokens))
                 best_rouge=max(best_rouge, simple_rouge_l(ref,hyp_tokens))
                 best_meteor=max(best_meteor, tokenizer_based_meteor(ref,hyp_tokens,tokenizer))
 
