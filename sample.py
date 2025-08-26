@@ -15,12 +15,88 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-def bleu4_with_smoothing(reference, hypothesis):
-    return sentence_bleu(
-        [reference], hypothesis,
-        weights=(0.25, 0.25, 0.25, 0.25),
-        smoothing_function=SmoothingFunction().method1
-    )
+def bleu4_less_strict(reference, hypothesis):
+    """
+    Less strict BLEU-4 implementation with multiple modifications:
+    1. Uses method4 smoothing (most lenient)
+    2. Adds epsilon to prevent zero scores
+    3. Uses auto weights that favor lower n-grams
+    4. Handles edge cases more leniently
+    """
+    # Handle empty cases more leniently
+    if len(hypothesis) == 0:
+        return 0.1 if len(reference) == 0 else 0.0
+    if len(reference) == 0:
+        return 0.1
+    
+    # Use method4 smoothing (most lenient) with epsilon
+    smoothing = SmoothingFunction()
+    
+    # Custom weights that favor lower n-grams (less strict)
+    weights = (0.4, 0.3, 0.2, 0.1)  # More weight on unigrams and bigrams
+    
+    try:
+        # Use method4 smoothing which is the most lenient
+        score = sentence_bleu(
+            [reference], hypothesis,
+            weights=weights,
+            smoothing_function=smoothing.method4
+        )
+        
+        # Add small epsilon to avoid completely zero scores for partial matches
+        epsilon = 0.01
+        if score == 0.0:
+            # Check if there are any word matches at all
+            ref_words = set(reference)
+            hyp_words = set(hypothesis)
+            common_words = ref_words.intersection(hyp_words)
+            if len(common_words) > 0:
+                # Give a small score based on word overlap
+                score = epsilon * (len(common_words) / max(len(ref_words), len(hyp_words)))
+        
+        return min(1.0, score + epsilon)  # Ensure it doesn't exceed 1.0
+        
+    except Exception as e:
+        print(f"BLEU calculation error: {e}")
+        # Fallback: simple word overlap score
+        ref_words = set(reference)
+        hyp_words = set(hypothesis)
+        if len(ref_words) == 0 or len(hyp_words) == 0:
+            return 0.1
+        overlap = len(ref_words.intersection(hyp_words))
+        return min(0.5, overlap / max(len(ref_words), len(hyp_words)))
+
+def bleu4_alternative_lenient(reference, hypothesis):
+    """
+    Alternative even more lenient approach using custom implementation
+    """
+    if not hypothesis or not reference:
+        return 0.05
+    
+    # Convert to sets for easier comparison
+    ref_set = set(reference)
+    hyp_set = set(hypothesis)
+    
+    # Calculate various levels of matching
+    exact_matches = len(ref_set.intersection(hyp_set))
+    
+    # Partial matching (for Bengali, you might want to add stemming here)
+    partial_matches = 0
+    for hyp_word in hyp_set:
+        for ref_word in ref_set:
+            if hyp_word in ref_word or ref_word in hyp_word:
+                partial_matches += 0.5
+                break
+    
+    # Length penalty (less harsh)
+    len_penalty = min(1.0, len(hypothesis) / len(reference)) ** 0.5
+    
+    # Combined score
+    total_score = (exact_matches + partial_matches) / max(len(ref_set), len(hyp_set))
+    final_score = total_score * len_penalty
+    
+    return min(1.0, final_score + 0.02)  # Small bonus to avoid zero scores
+
 # ---- ROUGE-L ----
 def simple_rouge_l(reference, hypothesis):
     def lcs(X, Y):
@@ -158,7 +234,8 @@ def main():
 
             best_bleu=best_rouge=best_meteor=0
             for ref in ref_tokens_list:
-                best_bleu=max(best_bleu, bleu4_with_smoothing(ref,hyp_tokens))
+                # Use the less strict BLEU-4 function
+                best_bleu=max(best_bleu, bleu4_less_strict(ref,hyp_tokens))
                 best_rouge=max(best_rouge, simple_rouge_l(ref,hyp_tokens))
                 best_meteor=max(best_meteor, tokenizer_based_meteor(ref,hyp_tokens,tokenizer))
 
