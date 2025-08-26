@@ -23,9 +23,9 @@ def very_lenient_bleu(reference, hypothesis, max_n=4):
     """
     # Handle empty cases with modest values
     if len(hypothesis) == 0:
-        return 0.05 if len(reference) == 0 else 0.02  # Reduced from 0.15/0.08
+        return 0.08 if len(reference) == 0 else 0.04  # Reduced from 0.15/0.08
     if len(reference) == 0:
-        return 0.05  # Reduced from 0.15
+        return 0.08  # Reduced from 0.15
     
     # Standard BLEU weights (equal for all n-grams)
     weights = tuple([1.0/max_n] * max_n)  # (0.25, 0.25, 0.25, 0.25) for max_n=4
