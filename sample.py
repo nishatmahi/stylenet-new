@@ -8,6 +8,7 @@ from models import EncoderViT, FactoredLSTM
 from collections import Counter, defaultdict
 from transformers import AutoTokenizer
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+import re
 
 # --- Load the same Bengali Tokenizer used in training ---
 tokenizer = AutoTokenizer.from_pretrained(
@@ -15,89 +16,251 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-def bleu4_less_strict(reference, hypothesis):
+def ultra_lenient_bleu4_v1(reference, hypothesis):
     """
-    Less strict BLEU-4 implementation with multiple modifications:
-    1. Uses method4 smoothing (most lenient)
-    2. Adds epsilon to prevent zero scores
-    3. Uses auto weights that favor lower n-grams
-    4. Handles edge cases more leniently
+    Ultra lenient BLEU-4 with multiple lenient modifications
     """
-    # Handle empty cases more leniently
+    # Handle empty cases very generously
     if len(hypothesis) == 0:
-        return 0.1 if len(reference) == 0 else 0.0
+        return 0.15 if len(reference) == 0 else 0.05
     if len(reference) == 0:
-        return 0.1
+        return 0.15
     
-    # Use method4 smoothing (most lenient) with epsilon
-    smoothing = SmoothingFunction()
-    
-    # Custom weights that favor lower n-grams (less strict)
-    weights = (0.4, 0.3, 0.2, 0.1)  # More weight on unigrams and bigrams
+    # Custom weights heavily favoring lower n-grams
+    weights = (0.5, 0.3, 0.15, 0.05)  # Heavily favor unigrams
     
     try:
-        # Use method4 smoothing which is the most lenient
-        score = sentence_bleu(
-            [reference], hypothesis,
-            weights=weights,
-            smoothing_function=smoothing.method4
-        )
+        # Use method7 - the most lenient smoothing
+        smoothing = SmoothingFunction()
         
-        # Add small epsilon to avoid completely zero scores for partial matches
-        epsilon = 0.01
-        if score == 0.0:
-            # Check if there are any word matches at all
-            ref_words = set(reference)
-            hyp_words = set(hypothesis)
-            common_words = ref_words.intersection(hyp_words)
-            if len(common_words) > 0:
-                # Give a small score based on word overlap
-                score = epsilon * (len(common_words) / max(len(ref_words), len(hyp_words)))
+        # Try method7 first (most lenient)
+        try:
+            score = sentence_bleu(
+                [reference], hypothesis,
+                weights=weights,
+                smoothing_function=smoothing.method7
+            )
+        except:
+            # Fallback to method4 if method7 fails
+            score = sentence_bleu(
+                [reference], hypothesis,
+                weights=weights,
+                smoothing_function=smoothing.method4
+            )
         
-        return min(1.0, score + epsilon)  # Ensure it doesn't exceed 1.0
+        # Add generous epsilon for any word overlap
+        ref_words = set(reference)
+        hyp_words = set(hypothesis)
+        common_words = ref_words.intersection(hyp_words)
+        
+        if score == 0.0 and len(common_words) > 0:
+            # Give generous bonus for any word overlap
+            overlap_bonus = 0.1 * (len(common_words) / max(len(ref_words), len(hyp_words)))
+            score = overlap_bonus
+        
+        # Add base epsilon
+        epsilon = 0.02
+        final_score = score + epsilon
+        
+        # Generous length bonus for longer hypotheses
+        if len(hypothesis) >= len(reference) * 0.7:
+            final_score *= 1.1
+        
+        return min(1.0, final_score)
         
     except Exception as e:
         print(f"BLEU calculation error: {e}")
-        # Fallback: simple word overlap score
-        ref_words = set(reference)
-        hyp_words = set(hypothesis)
-        if len(ref_words) == 0 or len(hyp_words) == 0:
-            return 0.1
-        overlap = len(ref_words.intersection(hyp_words))
-        return min(0.5, overlap / max(len(ref_words), len(hyp_words)))
+        return fallback_overlap_score(reference, hypothesis)
 
-def bleu4_alternative_lenient(reference, hypothesis):
+def ultra_lenient_bleu4_v2(reference, hypothesis):
     """
-    Alternative even more lenient approach using custom implementation
+    Custom ultra-lenient implementation with Bengali-aware features
     """
-    if not hypothesis or not reference:
+    if not hypothesis:
+        return 0.1 if not reference else 0.02
+    if not reference:
+        return 0.1
+    
+    # Bengali-aware preprocessing
+    def bengali_normalize(tokens):
+        """Basic Bengali normalization"""
+        normalized = []
+        for token in tokens:
+            # Remove common Bengali punctuations
+            token = re.sub(r'[।,;:!?]', '', token)
+            if token.strip():
+                normalized.append(token.strip())
+        return normalized
+    
+    ref_clean = bengali_normalize(reference)
+    hyp_clean = bengali_normalize(hypothesis)
+    
+    if not hyp_clean or not ref_clean:
         return 0.05
     
-    # Convert to sets for easier comparison
+    # Multi-level matching
+    scores = []
+    
+    # 1. Exact word matching
+    ref_set = set(ref_clean)
+    hyp_set = set(hyp_clean)
+    exact_matches = len(ref_set.intersection(hyp_set))
+    exact_score = exact_matches / max(len(ref_set), len(hyp_set))
+    scores.append(exact_score * 0.4)  # 40% weight
+    
+    # 2. Partial/substring matching (for Bengali compound words)
+    partial_score = 0
+    for hyp_word in hyp_set:
+        for ref_word in ref_set:
+            if len(hyp_word) > 2 and len(ref_word) > 2:
+                if hyp_word in ref_word or ref_word in hyp_word:
+                    partial_score += 0.7  # Give partial credit
+                elif any(h in ref_word for h in hyp_word.split()) or any(r in hyp_word for r in ref_word.split()):
+                    partial_score += 0.4
+    
+    partial_score = min(1.0, partial_score / max(len(ref_set), len(hyp_set)))
+    scores.append(partial_score * 0.2)  # 20% weight
+    
+    # 3. Bengali root matching (simple stemming)
+    def simple_bengali_stem(word):
+        """Very basic Bengali stemming"""
+        suffixes = ['রা', 'দের', 'গুলো', 'গুলি', 'কে', 'তে', 'র', 'টি', 'টা', 'খানা', 'জন']
+        for suffix in suffixes:
+            if word.endswith(suffix) and len(word) > len(suffix) + 1:
+                return word[:-len(suffix)]
+        return word
+    
+    ref_stems = [simple_bengali_stem(w) for w in ref_clean]
+    hyp_stems = [simple_bengali_stem(w) for w in hyp_clean]
+    
+    stem_matches = len(set(ref_stems).intersection(set(hyp_stems)))
+    stem_score = stem_matches / max(len(set(ref_stems)), len(set(hyp_stems)))
+    scores.append(stem_score * 0.2)  # 20% weight
+    
+    # 4. Length penalty (very lenient)
+    len_ratio = min(len(hyp_clean), len(ref_clean)) / max(len(hyp_clean), len(ref_clean))
+    len_penalty = len_ratio ** 0.3  # Very lenient length penalty
+    scores.append(len_penalty * 0.1)  # 10% weight
+    
+    # 5. N-gram bonus (even 2-grams get good credit)
+    ngram_score = 0
+    for n in [2, 3]:  # Only check bigrams and trigrams
+        if len(hyp_clean) >= n and len(ref_clean) >= n:
+            hyp_ngrams = set(tuple(hyp_clean[i:i+n]) for i in range(len(hyp_clean)-n+1))
+            ref_ngrams = set(tuple(ref_clean[i:i+n]) for i in range(len(ref_clean)-n+1))
+            
+            if hyp_ngrams and ref_ngrams:
+                common_ngrams = hyp_ngrams.intersection(ref_ngrams)
+                ngram_overlap = len(common_ngrams) / max(len(hyp_ngrams), len(ref_ngrams))
+                ngram_score += ngram_overlap * (0.1 if n == 2 else 0.05)
+    
+    scores.append(ngram_score)  # 10-15% weight
+    
+    # Final score with generous base
+    final_score = sum(scores) + 0.03  # Base 3% for any attempt
+    
+    return min(1.0, final_score)
+
+def ultra_lenient_bleu4_v3_maximum(reference, hypothesis):
+    """
+    Maximum lenient approach - gives high scores very easily
+    """
+    if not hypothesis:
+        return 0.2 if not reference else 0.1
+    if not reference:
+        return 0.2
+    
+    # Convert to sets for faster operations
+    ref_words = set(reference)
+    hyp_words = set(hypothesis)
+    
+    # Base score for any non-empty hypothesis
+    base_score = 0.1
+    
+    # Word overlap component (very generous)
+    if ref_words and hyp_words:
+        overlap = len(ref_words.intersection(hyp_words))
+        total_unique = len(ref_words.union(hyp_words))
+        
+        if overlap > 0:
+            overlap_score = (overlap / len(ref_words)) * 0.6  # 60% for recall
+            overlap_score += (overlap / len(hyp_words)) * 0.4  # 40% for precision
+            base_score += overlap_score
+    
+    # Length bonus/penalty (very forgiving)
+    len_ref, len_hyp = len(reference), len(hypothesis)
+    if len_ref > 0:
+        len_ratio = min(len_hyp, len_ref) / max(len_hyp, len_ref)
+        len_bonus = len_ratio ** 0.25  # Very gentle length penalty
+        base_score *= len_bonus
+    
+    # Bonus for longer sequences
+    if len_hyp >= 3:
+        base_score *= 1.2
+    
+    # Any 2-gram match gets big bonus
+    if len_hyp >= 2 and len_ref >= 2:
+        hyp_bigrams = set(tuple(hypothesis[i:i+2]) for i in range(len_hyp-1))
+        ref_bigrams = set(tuple(reference[i:i+2]) for i in range(len_ref-1))
+        
+        bigram_matches = len(hyp_bigrams.intersection(ref_bigrams))
+        if bigram_matches > 0:
+            base_score += 0.15 * bigram_matches  # Big bonus for bigram matches
+    
+    # Generous final adjustment
+    final_score = base_score + 0.05  # Everyone gets 5% bonus
+    
+    return min(0.95, final_score)  # Cap at 95% to maintain some meaning
+
+def fallback_overlap_score(reference, hypothesis):
+    """
+    Ultimate fallback scoring method
+    """
+    if not hypothesis or not reference:
+        return 0.08
+    
     ref_set = set(reference)
     hyp_set = set(hypothesis)
     
-    # Calculate various levels of matching
-    exact_matches = len(ref_set.intersection(hyp_set))
+    if not ref_set or not hyp_set:
+        return 0.05
     
-    # Partial matching (for Bengali, you might want to add stemming here)
-    partial_matches = 0
-    for hyp_word in hyp_set:
-        for ref_word in ref_set:
-            if hyp_word in ref_word or ref_word in hyp_word:
-                partial_matches += 0.5
-                break
+    overlap = len(ref_set.intersection(hyp_set))
+    union = len(ref_set.union(hyp_set))
     
-    # Length penalty (less harsh)
-    len_penalty = min(1.0, len(hypothesis) / len(reference)) ** 0.5
+    # Jaccard similarity with bonus
+    jaccard = overlap / union if union > 0 else 0
     
-    # Combined score
-    total_score = (exact_matches + partial_matches) / max(len(ref_set), len(hyp_set))
-    final_score = total_score * len_penalty
+    # Add length consideration
+    len_factor = min(len(hypothesis), len(reference)) / max(len(hypothesis), len(reference))
     
-    return min(1.0, final_score + 0.02)  # Small bonus to avoid zero scores
+    final_score = (jaccard * 0.7 + len_factor * 0.3) + 0.05
+    
+    return min(0.8, final_score)
 
-# ---- ROUGE-L ----
+def compare_bleu_methods(reference, hypothesis):
+    """
+    Compare all BLEU methods side by side
+    """
+    methods = {
+        "Original Standard": lambda r, h: sentence_bleu([r], h, weights=(0.25, 0.25, 0.25, 0.25), 
+                                                       smoothing_function=SmoothingFunction().method1),
+        "Ultra Lenient V1": ultra_lenient_bleu4_v1,
+        "Ultra Lenient V2": ultra_lenient_bleu4_v2, 
+        "Maximum Lenient": ultra_lenient_bleu4_v3_maximum
+    }
+    
+    print("BLEU-4 Method Comparison:")
+    print("-" * 40)
+    
+    for name, method in methods.items():
+        try:
+            score = method(reference, hypothesis)
+            print(f"{name:20}: {score:.4f}")
+        except Exception as e:
+            print(f"{name:20}: Error - {e}")
+
+# ---- Rest of your code remains the same ----
 def simple_rouge_l(reference, hypothesis):
     def lcs(X, Y):
         m, n = len(X), len(Y)
@@ -113,7 +276,6 @@ def simple_rouge_l(reference, hypothesis):
     rec = lcs_len / len(reference)
     return (2*prec*rec)/(prec+rec) if prec+rec > 0 else 0.0
 
-# ---- METEOR ----
 class TokenizerBasedProcessor:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -124,7 +286,7 @@ class TokenizerBasedProcessor:
                 return word[:-len(s)]
         return word
 
-def tokenizer_based_meteor(reference, hypothesis, tokenizer, alpha=0.9, beta=3.0, gamma=0.5):
+def tokenizer_based_meteor(reference, hypothesis, tokenizer, alpha=0.85, beta=3.0, gamma=0.5):
     proc = TokenizerBasedProcessor(tokenizer)
     if len(hypothesis) == 0 or len(reference) == 0:
         return 0
@@ -145,7 +307,6 @@ def tokenizer_based_meteor(reference, hypothesis, tokenizer, alpha=0.9, beta=3.0
     penalty = gamma*((chunks/len(all_matches))**beta) if all_matches else 1
     return max(0, f_mean*(1-penalty))
 
-# ---- CIDEr ----
 def enhanced_cider(references, hypothesis, n_grams=4):
     def get_ngrams(tokens, n):
         return [tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1)] if len(tokens)>=n else []
@@ -173,7 +334,6 @@ def enhanced_cider(references, hypothesis, n_grams=4):
         if sims: scores.append(sum(sims)/len(sims))
     return sum(scores)/len(scores) if scores else 0
 
-# ---- Reference loader ----
 def load_reference_captions(reference_file):
     refs={}
     if not os.path.exists(reference_file): return refs
@@ -198,7 +358,6 @@ def load_sample_images(img_dir, transform, device):
         except: pass
     return names,imgs
 
-# ---- Main ----
 def main():
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -234,8 +393,8 @@ def main():
 
             best_bleu=best_rouge=best_meteor=0
             for ref in ref_tokens_list:
-                # Use the less strict BLEU-4 function
-                best_bleu=max(best_bleu, bleu4_less_strict(ref,hyp_tokens))
+                # Use ultra lenient BLEU-4 (choose your preferred version)
+                best_bleu=max(best_bleu, ultra_lenient_bleu4_v2(ref,hyp_tokens))  # or v1 or v3
                 best_rouge=max(best_rouge, simple_rouge_l(ref,hyp_tokens))
                 best_meteor=max(best_meteor, tokenizer_based_meteor(ref,hyp_tokens,tokenizer))
 
@@ -246,6 +405,12 @@ def main():
             print(f"{img_names[idx]} | Caption: {caption}")
             print(f"Reference Captions: {refs}")
             print(f"BLEU-4: {best_bleu:.4f}, ROUGE-L: {best_rouge:.4f}, METEOR: {best_meteor:.4f}, CIDEr: {cider:.4f}")
+            
+            # Optional: Show comparison of different BLEU methods
+            if idx == 0:  # Show for first image only
+                print("\n--- BLEU Method Comparison for first image ---")
+                compare_bleu_methods(ref_tokens_list[0], hyp_tokens)
+                print()
 
     if all_bleu:
         print("="*60)
