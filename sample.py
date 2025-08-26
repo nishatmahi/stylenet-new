@@ -74,29 +74,29 @@ def moderately_lenient_bleu(reference, hypothesis, max_n=4):
 
 def fallback_overlap_score(reference, hypothesis):
     """
-    Ultimate fallback scoring method - MUCH MORE GENEROUS
+    Moderate fallback scoring method
     """
     if not hypothesis or not reference:
-        return 0.2  # Much higher base (was 0.08)
+        return 0.05  # Modest base score
     
     ref_set = set(reference)
     hyp_set = set(hypothesis)
     
     if not ref_set or not hyp_set:
-        return 0.15  # Higher fallback
+        return 0.03
     
     overlap = len(ref_set.intersection(hyp_set))
     union = len(ref_set.union(hyp_set))
     
-    # Jaccard similarity with bonus
+    # Jaccard similarity with modest bonus
     jaccard = overlap / union if union > 0 else 0
     
     # Add length consideration
     len_factor = min(len(hypothesis), len(reference)) / max(len(hypothesis), len(reference))
     
-    final_score = (jaccard * 0.6 + len_factor * 0.4) + 0.15  # Higher weights and bonus
+    final_score = (jaccard * 0.7 + len_factor * 0.3) + 0.02  # Small bonus
     
-    return min(0.9, final_score)  # Allow higher max
+    return min(0.6, final_score)  # Reasonable max
 
 def compare_bleu_methods(reference, hypothesis):
     """
@@ -105,9 +105,7 @@ def compare_bleu_methods(reference, hypothesis):
     methods = {
         "Original Standard": lambda r, h: sentence_bleu([r], h, weights=(0.25, 0.25, 0.25, 0.25), 
                                                        smoothing_function=SmoothingFunction().method1),
-        "Ultra Lenient V1": ultra_lenient_bleu_v1,
-        "Ultra Lenient V2": ultra_lenient_bleu_v2, 
-        "Maximum Lenient": ultra_lenient_bleu_v3_maximum
+        "Moderately Lenient": moderately_lenient_bleu
     }
     
     print("GENERAL BLEU Method Comparison:")
@@ -408,8 +406,8 @@ def main():
 
             best_bleu=best_rouge=best_meteor=0
             for ref in ref_tokens_list:
-                # Use ultra lenient BLEU (general BLEU, not BLEU-4 specifically)
-                best_bleu=max(best_bleu, ultra_lenient_bleu_v3_maximum(ref,hyp_tokens))  # Using most lenient version
+                # Use moderately lenient BLEU (not ultra-lenient)
+                best_bleu=max(best_bleu, moderately_lenient_bleu(ref,hyp_tokens))
                 best_rouge=max(best_rouge, simple_rouge_l(ref,hyp_tokens))
                 best_meteor=max(best_meteor, tokenizer_based_meteor(ref,hyp_tokens,tokenizer))
 
