@@ -15,7 +15,7 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-def bleu4(reference, hypothesis):
+def bleu4_with_smoothing(reference, hypothesis):
     return sentence_bleu(
         [reference], hypothesis,
         weights=(0.25, 0.25, 0.25, 0.25),
