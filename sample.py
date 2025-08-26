@@ -55,7 +55,7 @@ def very_lenient_bleu(reference, hypothesis, max_n=4):
         
         if score == 0.0 and len(common_words) > 0:
             # Give reasonable bonus for word overlap
-            overlap_bonus = 0.05 * (len(common_words) / max(len(ref_words), len(hyp_words)))  # Reduced from 0.12
+            overlap_bonus = 0.09 * (len(common_words) / max(len(ref_words), len(hyp_words)))  # Reduced from 0.12
             score = overlap_bonus
         
         # Add reasonable base epsilon
@@ -391,7 +391,7 @@ def main():
     transform=transforms.Compose([Rescale((224,224)),transforms.ToTensor(),
                                   transforms.Normalize([0.5]*3,[0.5]*3)])
     img_dir='/kaggle/input/sample-data/sample/sample_images'
-    ref_file='/kaggle/input/sample-data/sample/sample_images_romantic.txt'
+    ref_file='/kaggle/input/sample-data/sample/sample_images_factual.txt'
     img_names, img_list=load_sample_images(img_dir,transform,device)
     ref_caps=load_reference_captions(ref_file)
 
@@ -400,7 +400,7 @@ def main():
     for idx,img in enumerate(img_list):
         with torch.no_grad():
             feats=encoder(img)
-            output=decoder.sample(feats, tokenizer=tokenizer, beam_size=5, max_len=30, mode="romantic")
+            output=decoder.sample(feats, tokenizer=tokenizer, beam_size=5, max_len=30, mode="factual")
             caption=tokenizer.decode(output, skip_special_tokens=True)
 
         refs=ref_caps.get(img_names[idx],None)
