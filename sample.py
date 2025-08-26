@@ -79,6 +79,9 @@ def improved_bleu(reference, hypothesis, n=4, smooth=True):
     return bleu
 
 def simple_rouge_l(reference, hypothesis):
+    """
+    Simple ROUGE-L implementation based on longest common subsequence
+    """
     def lcs(X, Y):
         m, n = len(X), len(Y)
         dp = [[0]*(n+1) for _ in range(m+1)]
@@ -89,6 +92,9 @@ def simple_rouge_l(reference, hypothesis):
                 else:
                     dp[i+1][j+1] = max(dp[i+1][j], dp[i][j+1])
         return dp[-1][-1]
+    
+    if len(hypothesis) == 0 or len(reference) == 0:
+        return 0.0
     
     lcs_len = lcs(reference, hypothesis)
     prec = lcs_len / len(hypothesis) if hypothesis else 0
@@ -313,28 +319,52 @@ def enhanced_cider(references, hypothesis, n_grams=4):
 
 # ---- Reference captions loader ----
 def load_reference_captions(reference_file):
+    """
+    Load reference captions from file
+    """
     reference_captions = {}
-    with open(reference_file, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                parts = line.strip().split(None, 1)  # split by any whitespace (tab or space)
-                if len(parts) == 2:
-                    img_name, caption = parts
-                    img_name = img_name.strip()
-                    caption = caption.strip()
-                    if img_name not in reference_captions:
-                        reference_captions[img_name] = []
-                    reference_captions[img_name].append(caption)
+    
+    if not os.path.exists(reference_file):
+        print(f"Warning: Reference file {reference_file} not found!")
+        return reference_captions
+        
+    try:
+        with open(reference_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    parts = line.strip().split(None, 1)  # split by any whitespace (tab or space)
+                    if len(parts) == 2:
+                        img_name, caption = parts
+                        img_name = img_name.strip()
+                        caption = caption.strip()
+                        if img_name not in reference_captions:
+                            reference_captions[img_name] = []
+                        reference_captions[img_name].append(caption)
+    except Exception as e:
+        print(f"Error loading reference captions: {e}")
+        
     return reference_captions
 
 def load_sample_images(img_dir, transform, device):
-    img_names = sorted(os.listdir(img_dir))
+    """
+    Load and transform sample images
+    """
+    if not os.path.exists(img_dir):
+        print(f"Warning: Image directory {img_dir} not found!")
+        return [], []
+        
+    img_names = sorted([f for f in os.listdir(img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
     img_list = []
+    
     for img_name in img_names:
-        img_path = os.path.join(img_dir, img_name)
-        img = Image.open(img_path).convert("RGB")
-        img = transform(img).unsqueeze(0).to(device)
-        img_list.append(img)
+        try:
+            img_path = os.path.join(img_dir, img_name)
+            img = Image.open(img_path).convert("RGB")
+            img = transform(img).unsqueeze(0).to(device)
+            img_list.append(img)
+        except Exception as e:
+            print(f"Error loading image {img_name}: {e}")
+            
     return img_names, img_list
 
 def main():
@@ -350,26 +380,39 @@ def main():
     hidden_dim = 512
     factored_dim = 512
 
-    encoder = EncoderViT(emb_dim).to(device)
-    decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, len(tokenizer)).to(device)
+    # Initialize models
+    try:
+        encoder = EncoderViT(emb_dim).to(device)
+        decoder = FactoredLSTM(emb_dim, hidden_dim, factored_dim, len(tokenizer)).to(device)
 
-    # Load weights
-    encoder.load_state_dict(torch.load('stylenet_new_again_models/encoder-last.pkl', map_location=device))
-    decoder.load_state_dict(torch.load('stylenet_new_again_models/decoder-last.pkl', map_location=device))
+        # Load weights
+        encoder.load_state_dict(torch.load('stylenet_new_again_models/encoder-last.pkl', map_location=device))
+        decoder.load_state_dict(torch.load('stylenet_new_again_models/decoder-last.pkl', map_location=device))
 
-    encoder.eval()
-    decoder.eval()
+        encoder.eval()
+        decoder.eval()
+        print("✅ Models loaded successfully!")
+        
+    except Exception as e:
+        print(f"❌ Error loading models: {e}")
+        return
 
-    # Prepare image(s)
+    # Prepare image transform
     transform = transforms.Compose([
         Rescale((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
+    
+    # Load images and references
     img_dir = '/kaggle/input/sample-data/sample/sample_images'  # Change as needed
     reference_file = '/kaggle/input/sample-data/sample/sample_images_factual.txt'  # Add this path
     img_names, img_list = load_sample_images(img_dir, transform, device)
     reference_captions = load_reference_captions(reference_file)
+
+    if not img_list:
+        print("❌ No images found! Please check your image directory path.")
+        return
 
     # ------- Evaluation metrics storage -------
     all_bleu = []
@@ -384,38 +427,43 @@ def main():
 
     # --------- Main evaluation loop ----------
     for idx, image in enumerate(img_list):
-        with torch.no_grad():
-            features = encoder(image)
-            print(f"\n--- Processing Image {idx+1}/{len(img_list)}: {img_names[idx]} ---")
-            print("Image features shape:", features.shape)
-            print("First 10 feature values:", features[0][:10])
+        try:
+            with torch.no_grad():
+                features = encoder(image)
+                print(f"\n--- Processing Image {idx+1}/{len(img_list)}: {img_names[idx]} ---")
+                print("Image features shape:", features.shape)
+                print("First 10 feature values:", features[0][:10])
 
-            # ---- Feature visualization (1D plot, emb_dim=300) ----
-            plt.figure(figsize=(10,3))
-            plt.plot(features[0].cpu().numpy())
-            plt.title(f"Extracted Image Features - {img_names[idx]} (1D plot)")
-            plt.xlabel("Feature index")
-            plt.ylabel("Feature value")
-            plt.show()
+                # ---- Feature visualization (1D plot, emb_dim=300) ----
+                plt.figure(figsize=(10,3))
+                plt.plot(features[0].cpu().numpy())
+                plt.title(f"Extracted Image Features - {img_names[idx]} (1D plot)")
+                plt.xlabel("Feature index")
+                plt.ylabel("Feature value")
+                plt.show()
 
-            # ---- First token analysis ----
-            h0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
-            c0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
-            first_output, _, _ = decoder.forward_step(features, h0, c0, mode="factual", features=features)
-            first_output = first_output.squeeze(0)  # [vocab_size]
-            top_tokens = torch.topk(first_output, 5).indices.tolist()
-            print("Top 5 first tokens:", tokenizer.convert_ids_to_tokens(top_tokens))
+                # ---- First token analysis ----
+                h0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
+                c0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
+                first_output, _, _ = decoder.forward_step(features, h0, c0, mode="factual", features=features)
+                first_output = first_output.squeeze(0)  # [vocab_size]
+                top_tokens = torch.topk(first_output, 5).indices.tolist()
+                print("Top 5 first tokens:", tokenizer.convert_ids_to_tokens(top_tokens))
 
-            # ---- Caption generation ----
-            output = decoder.sample(
-                features,
-                tokenizer=tokenizer,
-                beam_size=5,
-                max_len=30,
-                mode="factual"  # You can change this to "factual" if needed
-            )
-            caption = tokenizer.decode(output, skip_special_tokens=True)
-            print(f"Generated Caption (Bengali): {caption}")
+                # ---- Caption generation ----
+                output = decoder.sample(
+                    features,
+                    tokenizer=tokenizer,
+                    beam_size=5,
+                    max_len=30,
+                    mode="romantic"  # You can change this to "factual" if needed
+                )
+                caption = tokenizer.decode(output, skip_special_tokens=True)
+                print(f"Generated Caption (Bengali): {caption}")
+
+        except Exception as e:
+            print(f"❌ Error processing image {img_names[idx]}: {e}")
+            continue
 
         # ------- Comprehensive evaluation ---------
         img_name = img_names[idx]
@@ -424,42 +472,47 @@ def main():
         if ref_list is not None:
             print(f"Reference Captions ({len(ref_list)}): {ref_list}")
             
-            # Tokenize hypothesis and references using your Bengali tokenizer
-            hyp_tokens = tokenizer.tokenize(caption)
-            ref_tokens_list = [tokenizer.tokenize(ref_caption) for ref_caption in ref_list]
-            
-            print(f"Hypothesis tokens: {hyp_tokens}")
-            print(f"Reference tokens: {ref_tokens_list[0] if ref_tokens_list else []}")
-            
-            # Calculate metrics
-            best_bleu, best_rouge, best_meteor = 0, 0, 0
-            
-            # BLEU, ROUGE, METEOR: compare with each reference separately
-            for ref_tokens in ref_tokens_list:
-                bleu_score = simple_bleu(ref_tokens, hyp_tokens)
-                rouge_score = simple_rouge_l(ref_tokens, hyp_tokens)
-                meteor_score = enhanced_meteor(ref_tokens, hyp_tokens)
+            try:
+                # Tokenize hypothesis and references using your Bengali tokenizer
+                hyp_tokens = tokenizer.tokenize(caption)
+                ref_tokens_list = [tokenizer.tokenize(ref_caption) for ref_caption in ref_list]
+                
+                print(f"Hypothesis tokens: {hyp_tokens}")
+                print(f"Reference tokens: {ref_tokens_list[0] if ref_tokens_list else []}")
+                
+                # Calculate metrics
+                best_bleu, best_rouge, best_meteor = 0, 0, 0
+                
+                # BLEU, ROUGE, METEOR: compare with each reference separately
+                for ref_tokens in ref_tokens_list:
+                    bleu_score = improved_bleu(ref_tokens, hyp_tokens)  # Fixed function name
+                    rouge_score = simple_rouge_l(ref_tokens, hyp_tokens)
+                    meteor_score = tokenizer_based_meteor(ref_tokens, hyp_tokens, tokenizer)  # Fixed function name
 
-                best_bleu = max(best_bleu, bleu_score)
-                best_rouge = max(best_rouge, rouge_score)
-                best_meteor = max(best_meteor, meteor_score)
-            
-            # CIDEr: use all references simultaneously
-            cider_score = enhanced_cider(ref_tokens_list, hyp_tokens)
+                    best_bleu = max(best_bleu, bleu_score)
+                    best_rouge = max(best_rouge, rouge_score)
+                    best_meteor = max(best_meteor, meteor_score)
+                
+                # CIDEr: use all references simultaneously
+                cider_score = enhanced_cider(ref_tokens_list, hyp_tokens)
 
-            # Store scores
-            all_bleu.append(best_bleu)
-            all_rouge.append(best_rouge)
-            all_meteor.append(best_meteor)
-            all_cider.append(cider_score)
-            
-            # Print results
-            print(f"📊 EVALUATION RESULTS:")
-            print(f"   BLEU-4:   {best_bleu:.4f}")
-            print(f"   ROUGE-L:  {best_rouge:.4f}")
-            print(f"   METEOR:   {best_meteor:.4f}")
-            print(f"   CIDEr:    {cider_score:.4f}")
-            print("-" * 50)
+                # Store scores
+                all_bleu.append(best_bleu)
+                all_rouge.append(best_rouge)
+                all_meteor.append(best_meteor)
+                all_cider.append(cider_score)
+                
+                # Print results
+                print(f"📊 EVALUATION RESULTS:")
+                print(f"   BLEU-4:   {best_bleu:.4f}")
+                print(f"   ROUGE-L:  {best_rouge:.4f}")
+                print(f"   METEOR:   {best_meteor:.4f}")
+                print(f"   CIDEr:    {cider_score:.4f}")
+                print("-" * 50)
+                
+            except Exception as e:
+                print(f"❌ Error evaluating image {img_name}: {e}")
+                
         else:
             print(f"❌ Reference captions NOT FOUND for {img_name}")
             print("-" * 50)
