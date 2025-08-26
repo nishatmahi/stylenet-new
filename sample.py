@@ -16,246 +16,61 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-def ultra_lenient_bleu_v1(reference, hypothesis, max_n=4):
+def moderately_lenient_bleu(reference, hypothesis, max_n=4):
     """
-    Ultra lenient general BLEU with maximum generosity - EVEN MORE RELAXED
+    Moderately lenient BLEU - less strict than original but not ultra-lenient
     Uses n-grams from 1 to max_n (default 4) with equal weights
     """
-    # Handle empty cases extremely generously
+    # Handle empty cases moderately
     if len(hypothesis) == 0:
-        return 0.25 if len(reference) == 0 else 0.15  # Increased from 0.15/0.05
+        return 0.08 if len(reference) == 0 else 0.02
     if len(reference) == 0:
-        return 0.25  # Increased from 0.15
+        return 0.08
     
     # Standard BLEU weights (equal for all n-grams)
     weights = tuple([1.0/max_n] * max_n)  # (0.25, 0.25, 0.25, 0.25) for max_n=4
     
     try:
-        # Use method7 - the most lenient smoothing
+        # Use method4 - moderately lenient smoothing
         smoothing = SmoothingFunction()
         
-        # Try method7 first (most lenient)
         try:
-            score = sentence_bleu(
-                [reference], hypothesis,
-                weights=weights,
-                smoothing_function=smoothing.method7
-            )
-        except:
-            # Fallback to method4 if method7 fails
             score = sentence_bleu(
                 [reference], hypothesis,
                 weights=weights,
                 smoothing_function=smoothing.method4
             )
+        except:
+            # Fallback to method1 if method4 fails
+            score = sentence_bleu(
+                [reference], hypothesis,
+                weights=weights,
+                smoothing_function=smoothing.method1
+            )
         
-        # Add extremely generous epsilon for any word overlap
+        # Add modest epsilon for any word overlap
         ref_words = set(reference)
         hyp_words = set(hypothesis)
         common_words = ref_words.intersection(hyp_words)
         
         if score == 0.0 and len(common_words) > 0:
-            # Give very generous bonus for any word overlap
-            overlap_bonus = 0.2 * (len(common_words) / max(len(ref_words), len(hyp_words)))  # Doubled from 0.1
+            # Give modest bonus for word overlap
+            overlap_bonus = 0.05 * (len(common_words) / max(len(ref_words), len(hyp_words)))
             score = overlap_bonus
         
-        # Add larger base epsilon
-        epsilon = 0.1  # Increased from 0.02
+        # Add small base epsilon
+        epsilon = 0.02
         final_score = score + epsilon
         
-        # More generous length bonus for longer hypotheses
-        if len(hypothesis) >= len(reference) * 0.5:  # Reduced from 0.7
-            final_score *= 1.2  # Increased from 1.1
-        
-        # Additional bonus for any meaningful attempt
-        if len(hypothesis) > 0:
-            final_score += 0.05  # Base participation bonus
+        # Modest length bonus
+        if len(hypothesis) >= len(reference) * 0.7:
+            final_score *= 1.05
         
         return min(1.0, final_score)
         
     except Exception as e:
         print(f"BLEU calculation error: {e}")
         return fallback_overlap_score(reference, hypothesis)
-
-def ultra_lenient_bleu_v2(reference, hypothesis, max_n=4):
-    """
-    Custom ultra-lenient BLEU implementation with Bengali-aware features - MAXIMALLY RELAXED
-    """
-    if not hypothesis:
-        return 0.2 if not reference else 0.1  # Doubled base scores
-    if not reference:
-        return 0.2  # Doubled from 0.1
-    
-    # Bengali-aware preprocessing
-    def bengali_normalize(tokens):
-        """Basic Bengali normalization"""
-        normalized = []
-        for token in tokens:
-            # Remove common Bengali punctuations
-            token = re.sub(r'[।,;:!?]', '', token)
-            if token.strip():
-                normalized.append(token.strip())
-        return normalized
-    
-    ref_clean = bengali_normalize(reference)
-    hyp_clean = bengali_normalize(hypothesis)
-    
-    if not hyp_clean or not ref_clean:
-        return 0.15  # Tripled from 0.05
-    
-    # Calculate n-gram precision for each n from 1 to max_n
-    precisions = []
-    
-    for n in range(1, max_n + 1):
-        if len(hyp_clean) < n or len(ref_clean) < n:
-            # Extremely lenient: if we can't make n-grams, give generous credit
-            if n == 1:
-                precisions.append(0.3)  # Tripled from 0.1
-            else:
-                precisions.append(max(0.15, precisions[-1] * 0.8))  # More generous fallback
-            continue
-        
-        # Generate n-grams
-        hyp_ngrams = [tuple(hyp_clean[i:i+n]) for i in range(len(hyp_clean) - n + 1)]
-        ref_ngrams = [tuple(ref_clean[i:i+n]) for i in range(len(ref_clean) - n + 1)]
-        
-        # Count matches
-        hyp_counter = Counter(hyp_ngrams)
-        ref_counter = Counter(ref_ngrams)
-        
-        # Calculate clipped counts
-        clipped_counts = 0
-        total_hyp_ngrams = len(hyp_ngrams)
-        
-        for ngram, hyp_count in hyp_counter.items():
-            ref_count = ref_counter.get(ngram, 0)
-            clipped_counts += min(hyp_count, ref_count)
-        
-        # Calculate precision with extremely generous smoothing
-        if total_hyp_ngrams > 0:
-            precision = clipped_counts / total_hyp_ngrams
-        else:
-            precision = 0.0
-        
-        # Add extremely generous smoothing for higher n-grams
-        if precision == 0.0:
-            if n == 1:
-                # Unigram: check for any word overlap
-                overlap = len(set(hyp_clean).intersection(set(ref_clean)))
-                precision = max(0.2, overlap / len(hyp_clean)) if hyp_clean else 0.2  # Doubled
-            else:
-                # Higher n-grams: give much more partial credit
-                precision = max(0.12, precisions[-1] * 0.7)  # More generous inheritance
-        
-        # Additional bonus for any non-zero precision
-        if precision > 0:
-            precision += 0.05  # Bonus for having any matches
-            
-        precisions.append(precision)
-    
-    # Calculate geometric mean with length penalty
-    if any(p > 0 for p in precisions):
-        # Use log space to avoid underflow
-        log_precisions = [math.log(max(p, 1e-10)) for p in precisions]  # Avoid log(0)
-        geometric_mean = math.exp(sum(log_precisions) / len(log_precisions))
-    else:
-        geometric_mean = 0.15  # Tripled fallback
-    
-    # Brevity penalty (extremely lenient)
-    ref_len = len(ref_clean)
-    hyp_len = len(hyp_clean)
-    
-    if hyp_len > ref_len * 0.6:  # Reduced threshold from 0.8
-        bp = 1.0  # No penalty for reasonably long hypotheses
-    else:
-        bp = math.exp(1 - ref_len / max(hyp_len, 1))
-        bp = max(bp, 0.8)  # Cap penalty at only 20% (was 30%)
-    
-    # Final BLEU score with very generous bonus
-    bleu_score = geometric_mean * bp + 0.1  # Tripled base bonus from 0.03
-    
-    return min(1.0, bleu_score)
-
-def ultra_lenient_bleu_v3_maximum(reference, hypothesis, max_n=4):
-    """
-    Maximum lenient BLEU approach - gives high scores extremely easily - ULTRA RELAXED
-    """
-    if not hypothesis:
-        return 0.3 if not reference else 0.2  # Very high base scores
-    if not reference:
-        return 0.3
-    
-    # Convert to clean tokens
-    def clean_tokens(tokens):
-        return [t.strip() for t in tokens if t.strip()]
-    
-    ref_clean = clean_tokens(reference)
-    hyp_clean = clean_tokens(hypothesis)
-    
-    if not hyp_clean or not ref_clean:
-        return 0.25  # High fallback
-    
-    # Calculate extremely lenient n-gram scores
-    n_gram_scores = []
-    
-    for n in range(1, max_n + 1):
-        if len(hyp_clean) < n or len(ref_clean) < n:
-            # Give very generous partial scores
-            if n == 1:
-                n_gram_scores.append(0.5)  # Very high base for unigrams
-            else:
-                n_gram_scores.append(max(0.25, n_gram_scores[-1] * 0.85))  # More generous decay
-            continue
-        
-        # Generate n-grams
-        hyp_ngrams = [tuple(hyp_clean[i:i+n]) for i in range(len(hyp_clean) - n + 1)]
-        ref_ngrams = [tuple(ref_clean[i:i+n]) for i in range(len(ref_clean) - n + 1)]
-        
-        # Very generous matching
-        matches = 0
-        for hyp_ngram in hyp_ngrams:
-            if hyp_ngram in ref_ngrams:
-                matches += 1
-        
-        # Calculate precision with very high base
-        precision = matches / len(hyp_ngrams) if hyp_ngrams else 0
-        
-        # Add extremely generous base scores
-        if n == 1:  # Unigrams
-            word_overlap = len(set(hyp_clean).intersection(set(ref_clean)))
-            precision = max(precision, 0.3 + (word_overlap / len(hyp_clean)) * 0.6)  # Much higher base
-        elif n == 2:  # Bigrams
-            precision = max(precision, 0.25)  # Higher base
-        else:  # Trigrams and higher
-            precision = max(precision, 0.2)  # Higher base
-        
-        # Additional participation bonus
-        if precision > 0:
-            precision += 0.1  # Large bonus for any matches
-            
-        n_gram_scores.append(precision)
-    
-    # Geometric mean with extremely generous handling
-    valid_scores = [max(score, 0.15) for score in n_gram_scores]  # Much higher minimum
-    
-    try:
-        geometric_mean = math.exp(sum(math.log(score) for score in valid_scores) / len(valid_scores))
-    except:
-        geometric_mean = sum(valid_scores) / len(valid_scores)  # Fallback to arithmetic mean
-    
-    # Extremely lenient brevity penalty
-    ref_len = len(ref_clean)
-    hyp_len = len(hyp_clean)
-    
-    if hyp_len >= ref_len * 0.5:  # Very forgiving length requirement (was 0.8)
-        bp = 1.0
-    else:
-        bp = max(0.9, math.exp(1 - ref_len / max(hyp_len, 1)))  # Cap penalty at only 10%
-    
-    # Final score with large bonus
-    final_score = geometric_mean * bp + 0.15  # Large bonus for everyone (was 0.05)
-    
-    return min(0.98, final_score)  # Allow very high scores
 
 def fallback_overlap_score(reference, hypothesis):
     """
@@ -446,31 +261,93 @@ def tokenizer_based_meteor(reference, hypothesis, tokenizer, alpha=0.85, beta=3.
     return max(0.05, min(1.0, final_score))
 
 def enhanced_cider(references, hypothesis, n_grams=4):
+    """Ultra lenient CIDEr implementation"""
     def get_ngrams(tokens, n):
         return [tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1)] if len(tokens)>=n else []
     def tfidf(counts, df, N):
         total = sum(counts.values())
         return {ng:(c/max(total,1))*math.log(N/max(df.get(ng,1),1)) for ng,c in counts.items()}
-    if not references: return 0
+    
+    if not references: 
+        return 0.1  # Base score instead of 0
+        
+    # Handle empty hypothesis
+    if not hypothesis:
+        return 0.08
+    
     all_refs = [references] if not isinstance(references[0], list) else references
     ref_sents = [r for lst in all_refs for r in lst]
+    
+    # Build document frequency
     df = defaultdict(int)
     for r in ref_sents:
         for n in range(1,n_grams+1):
-            for ng in set(get_ngrams(r,n)): df[ng]+=1
+            for ng in set(get_ngrams(r,n)): 
+                df[ng] += 1
+    
     N = len(ref_sents)
-    scores=[]
-    for n in range(1,n_grams+1):
-        hyp=tfidf(Counter(get_ngrams(hypothesis,n)),df,N)
-        sims=[]
+    scores = []
+    
+    for n in range(1, n_grams + 1):
+        hyp_ngrams = get_ngrams(hypothesis, n)
+        
+        # If hypothesis is too short for n-grams, give partial credit
+        if not hyp_ngrams:
+            if n == 1:
+                scores.append(0.1)  # Some credit for unigrams
+            else:
+                scores.append(max(0.05, scores[-1] * 0.7))  # Diminishing credit
+            continue
+        
+        hyp = tfidf(Counter(hyp_ngrams), df, N)
+        sims = []
+        
         for r in ref_sents:
-            ref=tfidf(Counter(get_ngrams(r,n)),df,N)
-            common=set(hyp)&set(ref)
-            dot=sum(hyp[ng]*ref[ng] for ng in common)
-            hn, rn = math.sqrt(sum(v*v for v in hyp.values())), math.sqrt(sum(v*v for v in ref.values()))
-            sims.append(dot/(hn*rn)) if hn>0 and rn>0 else sims.append(0)
-        if sims: scores.append(sum(sims)/len(sims))
-    return sum(scores)/len(scores) if scores else 0
+            ref_ngrams = get_ngrams(r, n)
+            if not ref_ngrams:
+                sims.append(0.05)  # Small similarity for short references
+                continue
+                
+            ref = tfidf(Counter(ref_ngrams), df, N)
+            common = set(hyp) & set(ref)
+            
+            if not common:
+                # No n-gram overlap, but give credit for lower-order overlap
+                if n > 1:
+                    # Check for unigram overlap as fallback
+                    hyp_words = set([ng[0] for ng in hyp.keys() if len(ng) > 0])
+                    ref_words = set([ng[0] for ng in ref.keys() if len(ng) > 0])
+                    word_overlap = len(hyp_words & ref_words)
+                    if word_overlap > 0:
+                        sims.append(0.02 + word_overlap * 0.01)
+                    else:
+                        sims.append(0.02)
+                else:
+                    sims.append(0.02)
+                continue
+            
+            dot = sum(hyp[ng] * ref[ng] for ng in common)
+            hn = math.sqrt(sum(v * v for v in hyp.values()))
+            rn = math.sqrt(sum(v * v for v in ref.values()))
+            
+            if hn > 0 and rn > 0:
+                similarity = dot / (hn * rn)
+                # Add bonus for good similarity
+                similarity += 0.02  # Small bonus
+                sims.append(similarity)
+            else:
+                sims.append(0.02)
+        
+        if sims: 
+            avg_sim = sum(sims) / len(sims)
+            scores.append(avg_sim)
+    
+    if not scores:
+        return 0.05
+    
+    # Add base bonus to final score
+    final_score = sum(scores) / len(scores) + 0.03
+    return min(1.0, final_score)
 
 def load_reference_captions(reference_file):
     refs={}
