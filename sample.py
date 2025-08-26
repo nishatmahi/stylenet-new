@@ -15,12 +15,12 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-# ---- BLEU-4 with smoothing ----
-def bleu4_with_smoothing(reference, hypothesis):
-    smoothie = SmoothingFunction().method4
-    return sentence_bleu([reference], hypothesis,
-                         weights=(0.25,0.25,0.25,0.25),
-                         smoothing_function=smoothie)
+def bleu4(reference, hypothesis):
+    return sentence_bleu(
+        [reference], hypothesis,
+        weights=(0.25, 0.25, 0.25, 0.25),
+        smoothing_function=SmoothingFunction().method4
+    )
 
 # ---- ROUGE-L ----
 def simple_rouge_l(reference, hypothesis):
