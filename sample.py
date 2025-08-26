@@ -15,12 +15,33 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-def bleu4_with_smoothing(reference, hypothesis):
-    smoothie = SmoothingFunction().method4
-    return sentence_bleu([reference], hypothesis,
-                         weights=(0.25, 0.25, 0.25, 0.25),
-                         smoothing_function=smoothie)
+def bleu4_with_smoothing(reference, hypothesis, n=4):
+    import math
+    from collections import Counter
 
+    def ngram_counts(tokens, n):
+        return Counter(tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1))
+
+    weights = [1.0/n] * n
+    p_ns = []
+
+    for i in range(1, n+1):
+        ref_counts = ngram_counts(reference, i)
+        hyp_counts = ngram_counts(hypothesis, i)
+
+        overlap = sum((hyp_counts & ref_counts).values())
+        total = max(sum(hyp_counts.values()), 1)
+
+        p = overlap / total
+        if p == 0:       # smoothing
+            p = 1e-9
+        p_ns.append(p)
+
+    ref_len, hyp_len = len(reference), len(hypothesis)
+    bp = 1.0 if hyp_len >= ref_len else math.exp(1 - ref_len / max(hyp_len, 1))
+
+    bleu = bp * math.exp(sum(w * math.log(p) for w, p in zip(weights, p_ns)))
+    return bleu
 # ---- ROUGE-L ----
 def simple_rouge_l(reference, hypothesis):
     def lcs(X, Y):
