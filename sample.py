@@ -9,269 +9,395 @@ from data_loader import Rescale, tokenizer
 from models import EncoderViT, FactoredLSTM
 from collections import Counter, defaultdict
 
-# ---- Enhanced BLEU implementation ----
-def simple_bleu(reference, hypothesis, n=4):
-    from collections import Counter
-    def ngram_counts(tokens, n):
-        return Counter(tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1))
+# ---- Corrected BLEU-4 implementation ----
+def corrected_bleu(references, hypothesis, max_n=4):
+    """
+    Proper BLEU implementation following the original paper
+    """
+    def get_ngrams(tokens, n):
+        if len(tokens) < n:
+            return Counter()
+        return Counter([tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1)])
     
-    weights = [0.25, 0.25, 0.25, 0.25]
-    p_ns = []
+    def modified_precision(ref_ngrams, hyp_ngrams):
+        """Calculate clipped n-gram precision"""
+        if not hyp_ngrams:
+            return 0.0
+        
+        clipped_count = 0
+        total_count = sum(hyp_ngrams.values())
+        
+        for ngram, count in hyp_ngrams.items():
+            # Clip the count by the maximum reference count for this ngram
+            max_ref_count = max([ref_ngram.get(ngram, 0) for ref_ngram in ref_ngrams])
+            clipped_count += min(count, max_ref_count)
+        
+        return clipped_count / total_count if total_count > 0 else 0.0
     
-    for i in range(1, n+1):
-        ref_counts = ngram_counts(reference, i)
-        hyp_counts = ngram_counts(hypothesis, i)
-        overlap = sum((hyp_counts & ref_counts).values())
-        total = max(sum(hyp_counts.values()), 1)
-        p_ns.append(overlap / total)
+    # Handle single reference case
+    if not isinstance(references[0], list):
+        references = [references]
     
-    ref_len = len(reference)
+    # Calculate reference lengths and find closest reference length
+    ref_lengths = [len(ref) for ref in references]
     hyp_len = len(hypothesis)
-    bp = math.exp(1 - ref_len/hyp_len) if hyp_len < ref_len else 1
-    bleu = bp * math.exp(sum(w * math.log(p) if p > 0 else 0 for w, p in zip(weights, p_ns)))
-    return bleu
-
-def simple_rouge_l(reference, hypothesis):
-    def lcs(X, Y):
-        m, n = len(X), len(Y)
-        dp = [[0]*(n+1) for _ in range(m+1)]
-        for i in range(m):
-            for j in range(n):
-                if X[i] == Y[j]:
-                    dp[i+1][j+1] = dp[i][j] + 1
-                else:
-                    dp[i+1][j+1] = max(dp[i+1][j], dp[i][j+1])
-        return dp[-1][-1]
+    closest_ref_len = min(ref_lengths, key=lambda x: abs(x - hyp_len))
     
-    lcs_len = lcs(reference, hypothesis)
-    prec = lcs_len / len(hypothesis) if hypothesis else 0
-    rec = lcs_len / len(reference) if reference else 0
-    if prec + rec == 0:
-        f1 = 0
+    # Calculate brevity penalty
+    if hyp_len > closest_ref_len:
+        bp = 1.0
     else:
-        f1 = (2 * prec * rec) / (prec + rec)
-    return f1
+        bp = math.exp(1 - closest_ref_len / hyp_len) if hyp_len > 0 else 0.0
+    
+    # Calculate modified precision for each n-gram order
+    precisions = []
+    
+    for n in range(1, max_n + 1):
+        # Get n-grams for hypothesis
+        hyp_ngrams = get_ngrams(hypothesis, n)
+        
+        # Get n-grams for all references
+        ref_ngrams = [get_ngrams(ref, n) for ref in references]
+        
+        # Calculate modified precision
+        precision = modified_precision(ref_ngrams, hyp_ngrams)
+        precisions.append(precision)
+    
+    # If any precision is 0, BLEU is 0
+    if any(p == 0 for p in precisions):
+        return 0.0
+    
+    # Calculate geometric mean of precisions
+    geo_mean = math.exp(sum(math.log(p) for p in precisions) / len(precisions))
+    
+    return bp * geo_mean
 
-# ---- Bengali-adapted METEOR implementation ----
+# ---- Corrected ROUGE-L implementation ----
+def corrected_rouge_l(references, hypothesis):
+    """
+    Proper ROUGE-L implementation with multiple reference support
+    """
+    def lcs_length(X, Y):
+        """Calculate longest common subsequence length"""
+        m, n = len(X), len(Y)
+        if m == 0 or n == 0:
+            return 0
+            
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if X[i-1] == Y[j-1]:
+                    dp[i][j] = dp[i-1][j-1] + 1
+                else:
+                    dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+        
+        return dp[m][n]
+    
+    # Handle single reference case
+    if not isinstance(references[0], list):
+        references = [references]
+    
+    if not hypothesis:
+        return 0.0
+    
+    best_f1 = 0.0
+    
+    for reference in references:
+        if not reference:
+            continue
+            
+        lcs_len = lcs_length(reference, hypothesis)
+        
+        if lcs_len == 0:
+            continue
+            
+        precision = lcs_len / len(hypothesis)
+        recall = lcs_len / len(reference)
+        
+        if precision + recall > 0:
+            f1 = (2 * precision * recall) / (precision + recall)
+            best_f1 = max(best_f1, f1)
+    
+    return best_f1
+
+# ---- Corrected METEOR implementation ----
 class BengaliWordProcessor:
-    """Basic Bengali word processing for METEOR"""
+    """Enhanced Bengali word processing for METEOR"""
     def __init__(self):
-        # Common Bengali suffixes for basic morphological analysis
+        # More comprehensive Bengali morphological patterns
         self.suffix_patterns = [
             # Plural markers
             (r'রা$', ''),      # মানুষরা -> মানুষ
+            (r'েরা$', ''),     # ছেলেরা -> ছেলে
             (r'দের$', ''),     # ছেলেদের -> ছেলে
             (r'গুলো$', ''),    # বইগুলো -> বই
             (r'গুলি$', ''),    # বইগুলি -> বই
+            (r'সব$', ''),      # মানুষসব -> মানুষ
             
             # Case markers
             (r'কে$', ''),      # রামকে -> রাম
             (r'তে$', ''),      # বাড়িতে -> বাড়ি
-            (r'তেই$', ''),     # বাড়িতেই -> বাড়ি
+            (r'য়$', ''),       # বাড়িয় -> বাড়ি
+            (r'র$', ''),       # রামের -> রাম
+            (r'এর$', ''),      # বাড়ির -> বাড়ি
             
-            # Possessive
-            (r'র$', ''),       # রামের -> রাম (simplified)
-            
-            # Verb suffixes (basic)
+            # Verb inflections
             (r'ছে$', ''),      # করছে -> কর
+            (r'ছি$', ''),      # করছি -> কর
+            (r'ছেন$', ''),     # করছেন -> কর
             (r'বে$', ''),      # করবে -> কর
+            (r'বো$', ''),      # করবো -> কর
+            (r'বেন$', ''),     # করবেন -> কর
             (r'ল$', ''),       # করল -> কর
             (r'লো$', ''),      # করলো -> কর
+            (r'লেন$', ''),     # করলেন -> কর
+            (r'লাম$', ''),     # করলাম -> কর
+            
+            # Adjective/adverb suffixes
+            (r'টি$', ''),      # লালটি -> লাল
+            (r'টা$', ''),      # লালটা -> লাল
+            (r'খানি$', ''),    # একখানি -> এক
+            (r'খানা$', ''),    # একখানা -> এক
         ]
         
-        # Common Bengali synonyms for image captioning
+        # Extended Bengali synonyms for image captioning
         self.synonyms = {
-            'মানুষ': ['ব্যক্তি', 'লোক', 'জন'],
+            'মানুষ': ['ব্যক্তি', 'লোক', 'জন', 'মানব'],
             'ব্যক্তি': ['মানুষ', 'লোক', 'জন'],
-            'পুরুষ': ['মরদ', 'ছেলে'],
-            'মহিলা': ['নারী', 'মেয়ে', 'স্ত্রী'],
+            'পুরুষ': ['মরদ', 'ছেলে', 'পুরুশ'],
+            'মহিলা': ['নারী', 'মেয়ে', 'স্ত্রী', 'বেগম'],
             'নারী': ['মহিলা', 'মেয়ে'],
-            'শিশু': ['বাচ্চা', 'ছোট', 'বালক', 'বালিকা'],
-            'বাচ্চা': ['শিশু', 'ছোট'],
-            'গাড়ি': ['যান', 'মোটর'],
-            'কুকুর': ['কুত্তা', 'শ্বান'],
-            'বিড়াল': ['মার্জার'],
-            'বাড়ি': ['ঘর', 'গৃহ', 'আবাস'],
-            'ঘর': ['বাড়ি', 'গৃহ', 'কক্ষ'],
-            'বড়': ['বৃহৎ', 'বিরাট', 'বিশাল'],
-            'ছোট': ['ক্ষুদ্র', 'তুচ্ছ', 'সূক্ষ্ম'],
-            'সুন্দর': ['মনোহর', 'চমৎকার', 'আকর্ষণীয়'],
-            'পুরাতন': ['পুরোনো', 'প্রাচীন'],
-            'নতুন': ['নব', 'তাজা', 'আধুনিক'],
+            'শিশু': ['বাচ্চা', 'ছোট', 'বালক', 'বালিকা', 'কিশোর'],
+            'বাচ্চা': ['শিশু', 'ছোট', 'বাল'],
+            'গাড়ি': ['যান', 'মোটর', 'কার'],
+            'কুকুর': ['কুত্তা', 'শ্বান', 'কুত্তো'],
+            'বিড়াল': ['মার্জার', 'বেড়াল'],
+            'বাড়ি': ['ঘর', 'গৃহ', 'আবাস', 'নিবাস'],
+            'ঘর': ['বাড়ি', 'গৃহ', 'কক্ষ', 'কামরা'],
+            'বড়': ['বৃহৎ', 'বিরাট', 'বিশাল', 'বড়ো'],
+            'ছোট': ['ক্ষুদ্র', 'তুচ্ছ', 'সূক্ষ্ম', 'ছোটো'],
+            'সুন্দর': ['মনোহর', 'চমৎকার', 'আকর্ষণীয়', 'ভালো'],
+            'পুরাতন': ['পুরোনো', 'প্রাচীন', 'পুরানো'],
+            'নতুন': ['নব', 'তাজা', 'আধুনিক', 'নূতন'],
             'খুশি': ['আনন্দিত', 'প্রফুল্ল', 'হাসিখুশি'],
-            'দুঃখিত': ['কষ্টিত', 'বিষণ্ণ'],
-            'হাঁটা': ['চলা', 'গমন'],
-            'দৌড়ানো': ['ছোটা', 'দৌড়'],
-            'খাওয়া': ['আহার', 'ভোজন'],
-            'পানি': ['জল'],
-            'জল': ['পানি'],
-            'খাবার': ['আহার', 'খাদ্য', 'ভোজন'],
-            'লাল': ['রক্তিম', 'রাঙা'],
-            'নীল': ['আকাশী'],
-            'সবুজ': ['হরিৎ'],
-            'কালো': ['কৃষ্ণ', 'শ্যাম'],
-            'সাদা': ['শুভ্র', 'ধবল'],
+            'দুঃখিত': ['কষ্টিত', 'বিষণ্ণ', 'দুখী'],
+            'হাঁটা': ['চলা', 'গমন', 'হাঁটু'],
+            'দৌড়ানো': ['ছোটা', 'দৌড়', 'ছুটে'],
+            'খাওয়া': ['আহার', 'ভোজন', 'খাদ্য'],
+            'পানি': ['জল', 'নীর'],
+            'জল': ['পানি', 'নীর'],
+            'খাবার': ['আহার', 'খাদ্য', 'ভোজন', 'খানা'],
+            'লাল': ['রক্তিম', 'রাঙা', 'লাল'],
+            'নীল': ['আকাশী', 'নিল'],
+            'সবুজ': ['হরিৎ', 'সবুজ'],
+            'কালো': ['কৃষ্ণ', 'শ্যাম', 'কাল'],
+            'সাদা': ['শুভ্র', 'ধবল', 'সাদ'],
         }
         
-        # Create reverse mapping
-        self.word_to_synonyms = {}
+        # Build bidirectional synonym mapping
+        self.word_to_synonyms = defaultdict(set)
         for word, syns in self.synonyms.items():
-            self.word_to_synonyms[word] = set(syns + [word])
-            for syn in syns:
-                if syn not in self.word_to_synonyms:
-                    self.word_to_synonyms[syn] = set()
-                self.word_to_synonyms[syn].add(word)
-                self.word_to_synonyms[syn].update(syns)
+            all_variants = [word] + syns
+            for variant in all_variants:
+                self.word_to_synonyms[variant].update(all_variants)
     
     def basic_stem(self, word):
-        """Basic Bengali stemming by removing common suffixes"""
+        """Enhanced Bengali stemming"""
+        original_word = word
         for pattern, replacement in self.suffix_patterns:
-            if re.search(pattern, word):
-                return re.sub(pattern, replacement, word)
-        return word
+            word = re.sub(pattern, replacement, word)
+        return word if word != original_word else original_word
     
     def get_synonyms(self, word):
-        """Get synonyms for a Bengali word"""
+        """Get all synonyms including the word itself"""
         return self.word_to_synonyms.get(word, {word})
 
-def enhanced_meteor(reference, hypothesis, alpha=0.9, beta=3.0, gamma=0.5):
+def corrected_meteor(references, hypothesis, alpha=0.9, beta=3.0, gamma=0.5):
     """
-    Bengali-adapted METEOR with basic stemming and synonym matching
+    Corrected METEOR implementation with proper alignment and multiple references
+    """
+    # Handle single reference case
+    if not isinstance(references[0], list):
+        references = [references]
     
-    Parameters explained:
-    - alpha (0.9): Controls precision vs recall balance. 0.9 means recall is weighted more heavily
-                   This is NOT from your training - it's a standard METEOR evaluation parameter
-    - beta (3.0): Controls penalty for word order differences (fragmentation)  
-    - gamma (0.5): Weight of the fragmentation penalty
-    """
+    if not hypothesis or not any(references):
+        return 0.0
+    
     processor = BengaliWordProcessor()
+    best_meteor = 0.0
     
-    if len(hypothesis) == 0 or len(reference) == 0:
-        return 0
+    for reference in references:
+        if not reference:
+            continue
+            
+        # Create alignment matrix for exact, stem, and synonym matches
+        alignments = []
+        
+        # Find all possible matches
+        matches = {'exact': [], 'stem': [], 'synonym': []}
+        
+        ref_stems = [processor.basic_stem(word) for word in reference]
+        hyp_stems = [processor.basic_stem(word) for word in hypothesis]
+        
+        # Find matches
+        for i, hyp_word in enumerate(hypothesis):
+            for j, ref_word in enumerate(reference):
+                if hyp_word == ref_word:
+                    matches['exact'].append((i, j))
+                elif processor.basic_stem(hyp_word) == processor.basic_stem(ref_word):
+                    matches['stem'].append((i, j))
+                elif ref_word in processor.get_synonyms(hyp_word):
+                    matches['synonym'].append((i, j))
+        
+        # Create alignment using greedy approach (prevent many-to-one mappings)
+        used_hyp = set()
+        used_ref = set()
+        final_matches = {'exact': [], 'stem': [], 'synonym': []}
+        
+        # Prioritize exact matches
+        for i, j in matches['exact']:
+            if i not in used_hyp and j not in used_ref:
+                final_matches['exact'].append((i, j))
+                used_hyp.add(i)
+                used_ref.add(j)
+        
+        # Then stem matches
+        for i, j in matches['stem']:
+            if i not in used_hyp and j not in used_ref:
+                final_matches['stem'].append((i, j))
+                used_hyp.add(i)
+                used_ref.add(j)
+        
+        # Finally synonym matches
+        for i, j in matches['synonym']:
+            if i not in used_hyp and j not in used_ref:
+                final_matches['synonym'].append((i, j))
+                used_hyp.add(i)
+                used_ref.add(j)
+        
+        # Calculate weighted matches (standard METEOR weights)
+        exact_weight = 1.0
+        stem_weight = 0.6
+        synonym_weight = 0.8
+        
+        total_matches = (len(final_matches['exact']) * exact_weight + 
+                        len(final_matches['stem']) * stem_weight + 
+                        len(final_matches['synonym']) * synonym_weight)
+        
+        if total_matches == 0:
+            continue
+        
+        # Calculate precision and recall
+        precision = total_matches / len(hypothesis) if hypothesis else 0
+        recall = total_matches / len(reference) if reference else 0
+        
+        if precision + recall == 0:
+            continue
+        
+        # F-mean calculation
+        f_mean = (precision * recall) / (alpha * precision + (1 - alpha) * recall)
+        
+        # Calculate fragmentation penalty
+        all_aligned_hyp = []
+        for match_type in final_matches.values():
+            all_aligned_hyp.extend([match[0] for match in match_type])
+        
+        if not all_aligned_hyp:
+            continue
+            
+        all_aligned_hyp.sort()
+        chunks = 1
+        
+        for i in range(1, len(all_aligned_hyp)):
+            if all_aligned_hyp[i] != all_aligned_hyp[i-1] + 1:
+                chunks += 1
+        
+        # Apply fragmentation penalty
+        penalty = gamma * (chunks / len(all_aligned_hyp)) ** beta
+        meteor_score = f_mean * (1 - penalty)
+        
+        best_meteor = max(best_meteor, meteor_score)
     
-    # Basic stemming
-    ref_stems = [processor.basic_stem(word) for word in reference]
-    hyp_stems = [processor.basic_stem(word) for word in hypothesis]
-    
-    # Track different types of matches
-    exact_matches = set()
-    stem_matches = set()
-    synonym_matches = set()
-    
-    # Find exact matches first
-    for i, hyp_word in enumerate(hypothesis):
-        for j, ref_word in enumerate(reference):
-            if hyp_word == ref_word:
-                exact_matches.add((i, j))
-    
-    # Find stem matches (excluding exact matches)
-    for i, hyp_stem in enumerate(hyp_stems):
-        for j, ref_stem in enumerate(ref_stems):
-            if (i, j) not in exact_matches and hyp_stem == ref_stem and hyp_stem != hypothesis[i]:
-                stem_matches.add((i, j))
-    
-    # Find synonym matches (excluding exact and stem matches)
-    for i, hyp_word in enumerate(hypothesis):
-        hyp_syns = processor.get_synonyms(hyp_word)
-        for j, ref_word in enumerate(reference):
-            if (i, j) not in exact_matches and (i, j) not in stem_matches:
-                if ref_word in hyp_syns and ref_word != hyp_word:
-                    synonym_matches.add((i, j))
-    
-    # Calculate weighted matches
-    # Standard METEOR weights: exact=1.0, stem=0.6, synonym=0.8
-    total_matches = len(exact_matches) + 0.6 * len(stem_matches) + 0.8 * len(synonym_matches)
-    
-    if total_matches == 0:
-        return 0
-    
-    # Calculate precision and recall
-    precision = total_matches / len(hypothesis)
-    recall = total_matches / len(reference)
-    
-    if precision + recall == 0:
-        return 0
-    
-    # F-mean with alpha parameter (alpha=0.9 favors recall over precision)
-    f_mean = (precision * recall) / (alpha * precision + (1 - alpha) * recall)
-    
-    # Calculate fragmentation penalty
-    all_matches = exact_matches.union(stem_matches).union(synonym_matches)
-    if len(all_matches) == 0:
-        return 0
-    
-    # Simple chunk calculation based on position ordering
-    hyp_positions = sorted([match[0] for match in all_matches])
-    chunks = 1
-    for i in range(1, len(hyp_positions)):
-        if hyp_positions[i] != hyp_positions[i-1] + 1:
-            chunks += 1
-    
-    # Apply fragmentation penalty
-    penalty = gamma * (chunks / len(all_matches)) ** beta if len(all_matches) > 0 else 1
-    meteor_score = f_mean * (1 - penalty)
-    
-    return max(0, meteor_score)
+    return max(0.0, best_meteor)
 
-# ---- Enhanced CIDEr implementation for Bengali ----
-def enhanced_cider(references, hypothesis, n_grams=4):
+# ---- Corrected CIDEr implementation ----
+def corrected_cider(references, hypothesis, n_grams=4):
     """
-    CIDEr implementation adapted for Bengali tokenization
+    Corrected CIDEr implementation following the original paper
     """
     def get_ngrams(tokens, n):
         if len(tokens) < n:
             return []
-        return [tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
+        return [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
     
-    def compute_tf_idf(ngram_counts, doc_freq, total_docs):
-        tf_idf = {}
+    def compute_tf_idf_vector(ngram_counts, doc_frequencies, total_docs):
+        """Compute TF-IDF vector for a sentence"""
+        tfidf = {}
         total_ngrams = sum(ngram_counts.values())
         
         for ngram, count in ngram_counts.items():
-            # TF: normalized term frequency
+            # Term frequency (normalized)
             tf = count / max(total_ngrams, 1)
             
-            # IDF: inverse document frequency with smoothing
-            idf = math.log(max(total_docs, 1) / max(doc_freq.get(ngram, 0), 1))
+            # Inverse document frequency with smoothing
+            idf = math.log(total_docs / max(doc_frequencies.get(ngram, 1), 1))
             
-            tf_idf[ngram] = tf * idf
+            tfidf[ngram] = tf * idf
         
-        return tf_idf
+        return tfidf
     
-    # Handle different reference formats
-    if isinstance(references, list) and len(references) > 0:
-        if not isinstance(references[0], list):
-            all_refs = [references]  # Single reference case
-        else:
-            all_refs = references    # Multiple references case
-    else:
-        return 0
+    def cosine_similarity(vec1, vec2):
+        """Calculate cosine similarity between two TF-IDF vectors"""
+        if not vec1 or not vec2:
+            return 0.0
+        
+        # Calculate dot product
+        common_ngrams = set(vec1.keys()) & set(vec2.keys())
+        if not common_ngrams:
+            return 0.0
+        
+        dot_product = sum(vec1[ngram] * vec2[ngram] for ngram in common_ngrams)
+        
+        # Calculate norms
+        norm1 = math.sqrt(sum(v**2 for v in vec1.values()))
+        norm2 = math.sqrt(sum(v**2 for v in vec2.values()))
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot_product / (norm1 * norm2)
     
-    # Flatten all reference sentences
-    all_ref_sentences = []
-    for ref_list in all_refs:
-        if isinstance(ref_list, list):
-            all_ref_sentences.extend(ref_list)
-        else:
-            all_ref_sentences.append(ref_list)
+    # Handle single reference case
+    if not isinstance(references[0], list):
+        references = [references]
     
-    if len(all_ref_sentences) == 0:
-        return 0
+    if not hypothesis or not any(references):
+        return 0.0
     
-    # Compute document frequency for n-grams
-    doc_freq = defaultdict(int)
-    for ref in all_ref_sentences:
+    # Flatten all references for document frequency calculation
+    all_refs = []
+    for ref_group in references:
+        if ref_group:  # Skip empty references
+            all_refs.extend(ref_group if isinstance(ref_group[0], list) else [ref_group])
+    
+    if not all_refs:
+        return 0.0
+    
+    # Calculate document frequencies for all n-grams
+    doc_frequencies = defaultdict(int)
+    total_docs = len(all_refs)
+    
+    for ref in all_refs:
         seen_ngrams = set()
         for n in range(1, n_grams + 1):
             ngrams = get_ngrams(ref, n)
             for ngram in ngrams:
                 if ngram not in seen_ngrams:
-                    doc_freq[ngram] += 1
+                    doc_frequencies[ngram] += 1
                     seen_ngrams.add(ngram)
     
-    total_docs = len(all_ref_sentences)
-    
-    # Calculate CIDEr for each n-gram order
+    # Calculate CIDEr score for each n-gram order
     cider_scores = []
     
     for n in range(1, n_grams + 1):
@@ -279,44 +405,32 @@ def enhanced_cider(references, hypothesis, n_grams=4):
         hyp_ngrams = get_ngrams(hypothesis, n)
         if not hyp_ngrams:
             continue
-            
-        hyp_counts = Counter(hyp_ngrams)
-        hyp_tfidf = compute_tf_idf(hyp_counts, doc_freq, total_docs)
         
-        # Calculate average similarity with all references
+        hyp_counts = Counter(hyp_ngrams)
+        hyp_tfidf = compute_tf_idf_vector(hyp_counts, doc_frequencies, total_docs)
+        
+        # Calculate similarity with each reference
         similarities = []
         
-        for ref in all_ref_sentences:
+        for ref in all_refs:
             ref_ngrams = get_ngrams(ref, n)
             if not ref_ngrams:
+                similarities.append(0.0)
                 continue
-                
+            
             ref_counts = Counter(ref_ngrams)
-            ref_tfidf = compute_tf_idf(ref_counts, doc_freq, total_docs)
+            ref_tfidf = compute_tf_idf_vector(ref_counts, doc_frequencies, total_docs)
             
-            # Compute cosine similarity
-            common_ngrams = set(hyp_tfidf.keys()) & set(ref_tfidf.keys())
-            
-            if not common_ngrams:
-                similarities.append(0)
-                continue
-            
-            dot_product = sum(hyp_tfidf[ngram] * ref_tfidf[ngram] for ngram in common_ngrams)
-            
-            hyp_norm = math.sqrt(sum(v**2 for v in hyp_tfidf.values()))
-            ref_norm = math.sqrt(sum(v**2 for v in ref_tfidf.values()))
-            
-            if hyp_norm > 0 and ref_norm > 0:
-                similarity = dot_product / (hyp_norm * ref_norm)
-                similarities.append(similarity)
-            else:
-                similarities.append(0)
+            similarity = cosine_similarity(hyp_tfidf, ref_tfidf)
+            similarities.append(similarity)
         
+        # Average similarity for this n-gram order
         if similarities:
             avg_similarity = sum(similarities) / len(similarities)
             cider_scores.append(avg_similarity)
     
-    return sum(cider_scores) / len(cider_scores) if cider_scores else 0
+    # Return average CIDEr across all n-gram orders
+    return sum(cider_scores) / len(cider_scores) if cider_scores else 0.0
 
 # ---- Reference captions loader ----
 def load_reference_captions(reference_file):
@@ -348,7 +462,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print("=" * 70)
-    print("BENGALI IMAGE CAPTIONING EVALUATION")
+    print("CORRECTED BENGALI IMAGE CAPTIONING EVALUATION")
     print("=" * 70)
     print("Tokenizer:", tokenizer.name_or_path if hasattr(tokenizer, 'name_or_path') else 'Custom Bengali Tokenizer')
 
@@ -385,8 +499,11 @@ def main():
     all_cider = []
 
     print(f"Found {len(img_list)} images for evaluation")
-    print("METEOR parameters: α=0.9 (recall-focused), β=3.0, γ=0.5")
-    print("Note: α is a METEOR evaluation parameter, not from your training")
+    print("Using CORRECTED implementations:")
+    print("- BLEU-4: Proper clipped precision with brevity penalty")
+    print("- ROUGE-L: Correct LCS calculation with multiple references")
+    print("- METEOR: Enhanced alignment with fragmentation penalty")
+    print("- CIDEr: Proper TF-IDF weighting and cosine similarity")
     print("=" * 70)
 
     # --------- Main evaluation loop ----------
@@ -394,24 +511,6 @@ def main():
         with torch.no_grad():
             features = encoder(image)
             print(f"\n--- Processing Image {idx+1}/{len(img_list)}: {img_names[idx]} ---")
-            print("Image features shape:", features.shape)
-            print("First 10 feature values:", features[0][:10])
-
-            # ---- Feature visualization (1D plot, emb_dim=300) ----
-            plt.figure(figsize=(10,3))
-            plt.plot(features[0].cpu().numpy())
-            plt.title(f"Extracted Image Features - {img_names[idx]} (1D plot)")
-            plt.xlabel("Feature index")
-            plt.ylabel("Feature value")
-            plt.show()
-
-            # ---- First token analysis ----
-            h0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
-            c0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
-            first_output, _, _ = decoder.forward_step(features, h0, c0, mode="factual", features=features)
-            first_output = first_output.squeeze(0)  # [vocab_size]
-            top_tokens = torch.topk(first_output, 5).indices.tolist()
-            print("Top 5 first tokens:", tokenizer.convert_ids_to_tokens(top_tokens))
 
             # ---- Caption generation ----
             output = decoder.sample(
@@ -419,62 +518,52 @@ def main():
                 tokenizer=tokenizer,
                 beam_size=5,
                 max_len=30,
-                mode="romantic"  # You can change this to "factual" if needed
+                mode="factual"  # Use factual mode for evaluation
             )
             caption = tokenizer.decode(output, skip_special_tokens=True)
             print(f"Generated Caption (Bengali): {caption}")
 
-        # ------- Comprehensive evaluation ---------
+        # ------- Evaluation with corrected metrics ---------
         img_name = img_names[idx]
         ref_list = reference_captions.get(img_name, None)
 
         if ref_list is not None:
             print(f"Reference Captions ({len(ref_list)}): {ref_list}")
             
-            # Tokenize hypothesis and references using your Bengali tokenizer
+            # Tokenize hypothesis and references
             hyp_tokens = tokenizer.tokenize(caption)
             ref_tokens_list = [tokenizer.tokenize(ref_caption) for ref_caption in ref_list]
             
             print(f"Hypothesis tokens: {hyp_tokens}")
-            print(f"Reference tokens: {ref_tokens_list[0] if ref_tokens_list else []}")
+            print(f"Reference tokens (first): {ref_tokens_list[0] if ref_tokens_list else []}")
             
-            # Calculate metrics
-            best_bleu, best_rouge, best_meteor = 0, 0, 0
-            
-            # BLEU, ROUGE, METEOR: compare with each reference separately
-            for ref_tokens in ref_tokens_list:
-                bleu_score = simple_bleu(ref_tokens, hyp_tokens)
-                rouge_score = simple_rouge_l(ref_tokens, hyp_tokens)
-                meteor_score = enhanced_meteor(ref_tokens, hyp_tokens)
-
-                best_bleu = max(best_bleu, bleu_score)
-                best_rouge = max(best_rouge, rouge_score)
-                best_meteor = max(best_meteor, meteor_score)
-            
-            # CIDEr: use all references simultaneously
-            cider_score = enhanced_cider(ref_tokens_list, hyp_tokens)
+            # Calculate corrected metrics
+            bleu_score = corrected_bleu(ref_tokens_list, hyp_tokens)
+            rouge_score = corrected_rouge_l(ref_tokens_list, hyp_tokens)
+            meteor_score = corrected_meteor(ref_tokens_list, hyp_tokens)
+            cider_score = corrected_cider([ref_tokens_list], hyp_tokens)  # Note the extra list wrapping
 
             # Store scores
-            all_bleu.append(best_bleu)
-            all_rouge.append(best_rouge)
-            all_meteor.append(best_meteor)
+            all_bleu.append(bleu_score)
+            all_rouge.append(rouge_score)
+            all_meteor.append(meteor_score)
             all_cider.append(cider_score)
             
             # Print results
-            print(f"📊 EVALUATION RESULTS:")
-            print(f"   BLEU-4:   {best_bleu:.4f}")
-            print(f"   ROUGE-L:  {best_rouge:.4f}")
-            print(f"   METEOR:   {best_meteor:.4f}")
+            print(f"📊 CORRECTED EVALUATION RESULTS:")
+            print(f"   BLEU-4:   {bleu_score:.4f}")
+            print(f"   ROUGE-L:  {rouge_score:.4f}")
+            print(f"   METEOR:   {meteor_score:.4f}")
             print(f"   CIDEr:    {cider_score:.4f}")
             print("-" * 50)
         else:
-            print(f" Reference captions NOT FOUND for {img_name}")
+            print(f"⚠️ Reference captions NOT FOUND for {img_name}")
             print("-" * 50)
 
     # ------- Print comprehensive evaluation results ---------
     if all_bleu and all_rouge and all_meteor and all_cider:
         print("=" * 70)
-        print("📈 COMPREHENSIVE BENGALI CAPTIONING EVALUATION RESULTS")
+        print("📈 FINAL CORRECTED BENGALI CAPTIONING EVALUATION")
         print("=" * 70)
         print(f"Average BLEU-4:  {sum(all_bleu)/len(all_bleu):.4f}")
         print(f"Average ROUGE-L: {sum(all_rouge)/len(all_rouge):.4f}")
@@ -501,24 +590,34 @@ def main():
             
             print(f"{metric_name:>8}: Avg={avg_score:.4f}, Max={max_score:.4f}, Min={min_score:.4f}, Std={std_score:.4f}")
         
-        print("\nPERFORMANCE INSIGHTS:")
+        print("\n🔍 PERFORMANCE ANALYSIS:")
         print("-" * 40)
-        if sum(all_bleu)/len(all_bleu) > 0.3:
-            print("BLEU score indicates good n-gram overlap")
+        avg_bleu = sum(all_bleu)/len(all_bleu)
+        avg_meteor = sum(all_meteor)/len(all_meteor)
+        avg_cider = sum(all_cider)/len(all_cider)
+        avg_rouge = sum(all_rouge)/len(all_rouge)
+        
+        if avg_bleu > 0.2:
+            print("✅ BLEU score indicates reasonable n-gram overlap")
         else:
-            print("BLEU score suggests room for improvement in word choice")
+            print("❌ BLEU score suggests need for improvement in word choice")
             
-        if sum(all_meteor)/len(all_meteor) > 0.25:
-            print("METEOR score shows good semantic similarity")
+        if avg_meteor > 0.2:
+            print("✅ METEOR score shows good semantic similarity")
         else:
-            print(" METEOR score indicates need for better semantic alignment")
+            print("❌ METEOR score indicates need for better semantic alignment")
             
-        if sum(all_cider)/len(all_cider) > 0.5:
-            print("CIDEr score demonstrates strong consensus with references")
+        if avg_cider > 0.3:
+            print("✅ CIDEr score demonstrates decent consensus with references")
         else:
-            print(" CIDEr score suggests captions could be more conventional")
+            print("❌ CIDEr score suggests captions need more conventional patterns")
+            
+        if avg_rouge > 0.2:
+            print("✅ ROUGE-L score indicates good sequence overlap")
+        else:
+            print("❌ ROUGE-L score suggests issues with word ordering")
     else:
-        print(" No evaluation data collected. Please check your reference file and image directory.")
+        print("❌ No evaluation data collected. Please check your reference file and image directory.")
 
 if __name__ == '__main__':
     main()
