@@ -445,7 +445,7 @@ def main():
 
             cider=enhanced_cider(ref_tokens_list,hyp_tokens)
             all_bleu.append(best_bleu); all_rouge.append(best_rouge)
-            all_meteor.append(best_meteor); all_cider.append(best_cider)
+            all_meteor.append(best_meteor); all_cider.append(cider)
 
             print(f"{img_names[idx]} | Caption: {caption}")
             print(f"Reference Captions: {refs}")
