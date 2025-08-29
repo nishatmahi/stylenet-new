@@ -128,19 +128,19 @@ def main(args):
                           % (epoch+1, epoch_num, i, total_lang_step, loss.item()))
 
          # styled (romantic)
-        if styled_data_loader_romantic:
-            for i, (captions, lengths) in enumerate(styled_data_loader_romantic):
-                captions = captions.long().to(device)
-                lengths = lengths.to(device)
-                decoder.zero_grad()
-                outputs = decoder(captions, mode='romantic')
-                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-                optimizer_lang.step()
-                if i % args.log_step_language == 0 or i == total_romantic_step-1:
-                    print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
-                          % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
+        # if styled_data_loader_romantic:
+        #     for i, (captions, lengths) in enumerate(styled_data_loader_romantic):
+        #         captions = captions.long().to(device)
+        #         lengths = lengths.to(device)
+        #         decoder.zero_grad()
+        #         outputs = decoder(captions, mode='romantic')
+        #         loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+        #         loss.backward()
+        #         torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
+        #         optimizer_lang.step()
+        #         if i % args.log_step_language == 0 or i == total_romantic_step-1:
+        #             print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
+        #                   % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
 
         # ======== SAVE: After every epoch =========
         os.makedirs(permanent_save_folder, exist_ok=True)
@@ -194,6 +194,7 @@ if __name__ == '__main__':
                         help='steps for print log while train language model')
     args = parser.parse_args()
     main(args)
+
 
 
 
