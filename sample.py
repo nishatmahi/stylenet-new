@@ -400,7 +400,7 @@ def main():
     for idx,img in enumerate(img_list):
         with torch.no_grad():
             feats=encoder(img)
-            output=decoder.sample(feats, tokenizer=tokenizer, beam_size=5, max_len=30, mode="factual")
+            output=decoder.sample(feats, tokenizer=tokenizer, beam_size=5, max_len=30, mode="humorous")
             caption=tokenizer.decode(output, skip_special_tokens=True)
 
         refs=ref_caps.get(img_names[idx],None)
