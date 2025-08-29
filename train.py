@@ -83,8 +83,8 @@ def main(args):
     print("=============================")
 
     total_cap_step = len(data_loader)
-    # total_lang_step = len(styled_data_loader) if styled_data_loader else 0
-    total_romantic_step = len(styled_data_loader_romantic) if styled_data_loader_romantic else 0
+     total_lang_step = len(styled_data_loader) if styled_data_loader else 0
+    # total_romantic_step = len(styled_data_loader_romantic) if styled_data_loader_romantic else 0
     epoch_num = args.epoch_num
 
     # ========================= Training Loop =========================
@@ -194,6 +194,7 @@ if __name__ == '__main__':
                         help='steps for print log while train language model')
     args = parser.parse_args()
     main(args)
+
 
 
 
