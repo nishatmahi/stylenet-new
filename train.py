@@ -24,10 +24,10 @@ def main(args):
     # Data loaders
     data_loader = get_data_loader(
         args.img_path, args.factual_caption_path, batch_size=args.caption_batch_size, shuffle=True)
-    # styled_data_loader = get_styled_data_loader(
-    #     args.humorous_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.humorous_caption_path else None
-    styled_data_loader_romantic = get_styled_data_loader(
-        args.romantic_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.romantic_caption_path else None
+    styled_data_loader = get_styled_data_loader(
+        args.humorous_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.humorous_caption_path else None
+    # styled_data_loader_romantic = get_styled_data_loader(
+    #     args.romantic_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.romantic_caption_path else None
 
     # Models
     encoder = EncoderViT(args.emb_dim).to(device)
@@ -194,6 +194,7 @@ if __name__ == '__main__':
                         help='steps for print log while train language model')
     args = parser.parse_args()
     main(args)
+
 
 
 
