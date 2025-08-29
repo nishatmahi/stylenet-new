@@ -51,39 +51,66 @@ class Flickr7kBanglaDataset(Dataset):
     '''Flickr7k-style dataset for Bangla image-caption'''
     def __init__(self, img_dir, caption_file, transform=None):
         self.img_dir = img_dir
-        self.imgname_caption_list = self._get_imgname_and_caption(caption_file)
+        self.imgname_caption_list = self._get_imgname_and_caption(caption_file)  # <-- filtered & resolved
         self.transform = transform if transform else image_transform
 
     def _get_imgname_and_caption(self, caption_file):
+        # CHANGED: এখানে invalid/missing ইমেজগুলো আগেই বাদ দিচ্ছি।
         with open(caption_file, 'r', encoding='utf-8') as f:
-            res = f.readlines()
+            res = [ln.strip() for ln in f if ln.strip()]
+
         imgname_caption_list = []
         r = re.compile(r'#\d*')
+
+        missing, malformed = 0, 0
         for line in res:
-            img_and_cap = r.split(line)
-            img_and_cap = [x.strip() for x in img_and_cap]
-            imgname_caption_list.append(img_and_cap)
+            parts = [x.strip() for x in r.split(line) if x.strip()]
+            # Expect: [img_name, caption]
+            if len(parts) < 2:
+                malformed += 1
+                continue
+
+            img_name, caption = parts[0], parts[1]
+            img_id = strip_ext(img_name)
+            img_path = find_image_with_any_ext(self.img_dir, img_id)
+
+            if img_path is None or not os.path.exists(img_path):
+                missing += 1
+                continue  # <-- skip missing/invalid image
+
+            # এখানে সরাসরি resolved path রেখে দিচ্ছি
+            imgname_caption_list.append((img_path, caption))
+
+        if malformed > 0:
+            print(f"[WARN] Skipped {malformed} malformed caption lines (no/invalid caption).")
+        if missing > 0:
+            print(f"[WARN] Dropped {missing} samples due to missing image files.")
+
+        if len(imgname_caption_list) == 0:
+            raise RuntimeError("[Flickr7kBanglaDataset] No valid samples found after filtering.")
+
         return imgname_caption_list
 
     def __len__(self):
         return len(self.imgname_caption_list)
 
     def __getitem__(self, ix):
-        img_name = self.imgname_caption_list[ix][0]
-        img_id = strip_ext(img_name)
-        img_path = find_image_with_any_ext(self.img_dir, img_id)
-        caption = self.imgname_caption_list[ix][1]
+        # CHANGED: এখন এখানে img_name নয়, সরাসরি resolved img_path আছে।
+        img_path, caption = self.imgname_caption_list[ix]
+
         # Robust image loading (RGB, RGBA, Grayscale)
         try:
             image = Image.open(img_path)
         except Exception as e:
-            print(f"[ERROR] Could not open image: {img_path}, {e}")
+            # খুবই রেয়ার কেস: ফাইল আছে কিন্তু corrupt
+            print(f"[ERROR] Could not open image (corrupt?): {img_path}, {e}")
             image = Image.new("RGB", (224, 224))
+
         if image.mode != "RGB":
             image = image.convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
-        return image, caption  # <-- NOTE: raw string caption, NOT tokenized!
+        return image, caption  # <-- raw string caption
 
 class FlickrStyle7kBanglaDataset(Dataset):
     '''Styled caption dataset'''
@@ -171,4 +198,3 @@ if __name__ == "__main__":
     for i, (captions, lengths) in enumerate(styled_loader_romantic):
         print(f"Romantic batch: {i}", captions.shape, lengths)
         if i == 2: break
-
