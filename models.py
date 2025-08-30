@@ -61,16 +61,16 @@ class FactoredLSTM(nn.Module):
         self.F_c = nn.Linear(emb_dim, factored_dim)  # Feature influence on cell gate
 
         # Style-specific transformations for romantic
-        self.S_ri = nn.Linear(factored_dim, factored_dim)
-        self.S_rf = nn.Linear(factored_dim, factored_dim)
-        self.S_ro = nn.Linear(factored_dim, factored_dim)
-        self.S_rc = nn.Linear(factored_dim, factored_dim)
+        # self.S_ri = nn.Linear(factored_dim, factored_dim)
+        # self.S_rf = nn.Linear(factored_dim, factored_dim)
+        # self.S_ro = nn.Linear(factored_dim, factored_dim)
+        # self.S_rc = nn.Linear(factored_dim, factored_dim)
 
         # Style-specific transformations for humorous/funny (COMMENTED OUT)
-        # self.S_hi = nn.Linear(factored_dim, factored_dim)
-        # self.S_hf = nn.Linear(factored_dim, factored_dim)
-        # self.S_ho = nn.Linear(factored_dim, factored_dim)
-        # self.S_hc = nn.Linear(factored_dim, factored_dim)
+        self.S_hi = nn.Linear(factored_dim, factored_dim)
+        self.S_hf = nn.Linear(factored_dim, factored_dim)
+        self.S_ho = nn.Linear(factored_dim, factored_dim)
+        self.S_hc = nn.Linear(factored_dim, factored_dim)
 
         self.C = nn.Linear(hidden_dim, vocab_size)
 
@@ -114,17 +114,17 @@ class FactoredLSTM(nn.Module):
             o = self.S_fo(o) + visual_o
             c = self.S_fc(c) + visual_c
             
-        elif mode == "romantic":
-            i = self.S_ri(i) + visual_i  # Romantic style + visual info
-            f = self.S_rf(f) + visual_f
-            o = self.S_ro(o) + visual_o
-            c = self.S_rc(c) + visual_c
+        # elif mode == "romantic":
+        #     i = self.S_ri(i) + visual_i  # Romantic style + visual info
+        #     f = self.S_rf(f) + visual_f
+        #     o = self.S_ro(o) + visual_o
+        #     c = self.S_rc(c) + visual_c
             
-        # elif mode == "humorous":
-        #     i = self.S_hi(i) + visual_i  # Humorous style + visual info
-        #     f = self.S_hf(f) + visual_f
-        #     o = self.S_ho(o) + visual_o
-        #     c = self.S_hc(c) + visual_c
+        elif mode == "humorous":
+            i = self.S_hi(i) + visual_i  # Humorous style + visual info
+            f = self.S_hf(f) + visual_f
+            o = self.S_ho(o) + visual_o
+            c = self.S_hc(c) + visual_c
         else:
             sys.stderr.write("mode name wrong!\n")
             raise ValueError(f"Unknown mode: {mode}. Only 'factual' and 'romantic' supported.")
@@ -270,6 +270,7 @@ class FactoredLSTM(nn.Module):
 
             # Return best sequence (EXACT original)
             return candidates[0][4]
+
 
 
 
