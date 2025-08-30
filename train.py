@@ -24,10 +24,10 @@ def main(args):
     # Data loaders
     data_loader = get_data_loader(
         args.img_path, args.factual_caption_path, batch_size=args.caption_batch_size, shuffle=True)
-    styled_data_loader = get_styled_data_loader(
-        args.humorous_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.humorous_caption_path else None
-    # styled_data_loader_romantic = get_styled_data_loader(
-    #     args.romantic_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.romantic_caption_path else None
+    # styled_data_loader = get_styled_data_loader(
+    #     args.humorous_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.humorous_caption_path else None
+    styled_data_loader_romantic = get_styled_data_loader(
+        args.romantic_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.romantic_caption_path else None
 
     # Models
     encoder = EncoderViT(args.emb_dim).to(device)
@@ -83,8 +83,8 @@ def main(args):
     print("=============================")
 
     total_cap_step = len(data_loader)
-    total_lang_step = len(styled_data_loader) if styled_data_loader else 0
-    # total_romantic_step = len(styled_data_loader_romantic) if styled_data_loader_romantic else 0
+    # total_lang_step = len(styled_data_loader) if styled_data_loader else 0
+    total_romantic_step = len(styled_data_loader_romantic) if styled_data_loader_romantic else 0
     epoch_num = args.epoch_num
 
     # ========================= Training Loop =========================
@@ -113,34 +113,34 @@ def main(args):
         eval_outputs(outputs, tokenizer)
 
         #styled (humorous)
-        if styled_data_loader:
-            for i, (captions, lengths) in enumerate(styled_data_loader):
-                captions = captions.long().to(device)
-                lengths = lengths.to(device)
-                decoder.zero_grad()
-                outputs = decoder(captions, mode='humorous')
-                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-                optimizer_lang.step()
-                if i % args.log_step_language == 0 or i == total_lang_step-1:
-                    print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
-                          % (epoch+1, epoch_num, i, total_lang_step, loss.item()))
-
-         # styled (romantic)
-        # if styled_data_loader_romantic:
-        #     for i, (captions, lengths) in enumerate(styled_data_loader_romantic):
+        # if styled_data_loader:
+        #     for i, (captions, lengths) in enumerate(styled_data_loader):
         #         captions = captions.long().to(device)
         #         lengths = lengths.to(device)
         #         decoder.zero_grad()
-        #         outputs = decoder(captions, mode='romantic')
+        #         outputs = decoder(captions, mode='humorous')
         #         loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
         #         loss.backward()
         #         torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
         #         optimizer_lang.step()
-        #         if i % args.log_step_language == 0 or i == total_romantic_step-1:
-        #             print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
-        #                   % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
+        #         if i % args.log_step_language == 0 or i == total_lang_step-1:
+        #             print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
+        #                   % (epoch+1, epoch_num, i, total_lang_step, loss.item()))
+
+         # styled (romantic)
+        if styled_data_loader_romantic:
+            for i, (captions, lengths) in enumerate(styled_data_loader_romantic):
+                captions = captions.long().to(device)
+                lengths = lengths.to(device)
+                decoder.zero_grad()
+                outputs = decoder(captions, mode='romantic')
+                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
+                optimizer_lang.step()
+                if i % args.log_step_language == 0 or i == total_romantic_step-1:
+                    print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
+                          % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
 
         # ======== SAVE: After every epoch =========
         os.makedirs(permanent_save_folder, exist_ok=True)
@@ -165,13 +165,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla: Generating Attractive Visual Captions with Styles')
     parser.add_argument('--model_path', type=str, default='pretrained_models',
                         help='path for saving trained models')
-    parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset-new/data/Images',
+    parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Flicker8k_Dataset',
                     help='path for train images directory')
-    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset-new/data/factual_caption.txt',
+    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_train.txt',
                         help='path for factual caption file')
     parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset-new/data/humorous caption.txt',
                         help='path for humorous caption file')
-    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_data.txt',
+    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_text.txt',
                         help='path for romantic caption file')
     parser.add_argument('--caption_batch_size', type=int, default=32,
                         help='mini batch size for caption model training')
@@ -194,6 +194,7 @@ if __name__ == '__main__':
                         help='steps for print log while train language model')
     args = parser.parse_args()
     main(args)
+
 
 
 
