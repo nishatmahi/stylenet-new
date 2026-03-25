@@ -65,13 +65,14 @@ def create_data_splits(args):
 
 def validate_epoch(encoder, decoder, val_loader, val_styled_loader_romantic, criterion, device):
     """
-    Run validation for one epoch
+    Run validation for one epoch.
+    Returns factual and romantic losses separately.
     """
     encoder.eval()
     decoder.eval()
-    
-    total_loss = 0.0
-    total_samples = 0
+
+    factual_val_loss = float('inf')
+    romantic_val_loss = float('inf')
     
     with torch.no_grad():
         # Validate factual captions
@@ -93,10 +94,8 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader_romantic, cri
                 factual_samples += captions.size(0)
             
             if factual_samples > 0:
-                factual_loss /= factual_samples
-                total_loss += factual_loss * factual_samples
-                total_samples += factual_samples
-                print(f"Validation Factual Loss: {factual_loss:.4f}")
+                factual_val_loss = factual_loss / factual_samples
+                print(f"Validation Factual Loss: {factual_val_loss:.4f}")
         
         # Validate romantic captions
         if val_styled_loader_romantic:
@@ -108,19 +107,18 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader_romantic, cri
                 lengths = lengths.to(device)
                 
                 outputs = decoder(captions, mode='romantic')
-                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+                # FIX: slice outputs[:, :-1, :] to correctly align with captions[:, 1:]
+                loss = criterion(outputs[:, :-1, :].contiguous(),
+                                 captions[:, 1:].contiguous(), lengths - 1)
                 
                 romantic_loss += loss.item() * captions.size(0)
                 romantic_samples += captions.size(0)
             
             if romantic_samples > 0:
-                romantic_loss /= romantic_samples
-                total_loss += romantic_loss * romantic_samples
-                total_samples += romantic_samples
-                print(f"Validation Romantic Loss: {romantic_loss:.4f}")
-    
-    avg_val_loss = total_loss / total_samples if total_samples > 0 else float('inf')
-    return avg_val_loss
+                romantic_val_loss = romantic_loss / romantic_samples
+                print(f"Validation Romantic Loss: {romantic_val_loss:.4f}")
+
+    return factual_val_loss, romantic_val_loss
 
 def eval_outputs(outputs, tokenizer):
     indices = torch.topk(outputs, 1)[1]
@@ -233,8 +231,11 @@ def main(args):
         encoder.train()
         decoder.train()
 
-        epoch_train_loss = 0.0
-        train_samples = 0
+        # FIX: track factual and romantic train losses separately
+        factual_train_loss = 0.0
+        factual_train_samples = 0
+        romantic_train_loss = 0.0
+        romantic_train_samples = 0
 
         #factual (image+caption)
         for i, (images, captions, lengths) in enumerate(data_loader):
@@ -252,8 +253,8 @@ def main(args):
             torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
             optimizer_cap.step()
 
-            epoch_train_loss += loss.item() * captions.size(0)
-            train_samples += captions.size(0)
+            factual_train_loss += loss.item() * captions.size(0)
+            factual_train_samples += captions.size(0)
 
             if i % args.log_step_caption == 0 or i == total_cap_step-1:
                 print("Epoch [%d/%d], CAP, Step [%d/%d], Loss: %.4f"
@@ -287,24 +288,29 @@ def main(args):
                 torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
                 optimizer_lang.step()
 
-                epoch_train_loss += loss.item() * captions.size(0)
-                train_samples += captions.size(0)
+                romantic_train_loss += loss.item() * captions.size(0)
+                romantic_train_samples += captions.size(0)
 
                 if i % args.log_step_language == 0 or i == total_romantic_step-1:
                     print("Epoch [%d/%d], ROM, Step [%d/%d], Loss: %.4f"
                           % (epoch+1, epoch_num, i, total_romantic_step, loss.item()))
 
-        avg_train_loss = epoch_train_loss / train_samples if train_samples > 0 else 0.0
-        print(f"\n[EPOCH {epoch+1}] Average Training Loss: {avg_train_loss:.4f}")
+        avg_factual_train_loss = factual_train_loss / factual_train_samples if factual_train_samples > 0 else 0.0
+        avg_romantic_train_loss = romantic_train_loss / romantic_train_samples if romantic_train_samples > 0 else 0.0
+        print(f"\n[EPOCH {epoch+1}] Average Factual  Training Loss: {avg_factual_train_loss:.4f}")
+        print(f"[EPOCH {epoch+1}] Average Romantic Training Loss: {avg_romantic_train_loss:.4f}")
 
         # Validation phase
         print(f"[EPOCH {epoch+1}] Running validation...")
-        val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader_romantic, criterion, device)
-        print(f"[EPOCH {epoch+1}] Average Validation Loss: {val_loss:.4f}")
+        # FIX: unpack two separate losses
+        factual_val_loss, romantic_val_loss = validate_epoch(
+            encoder, decoder, val_loader, val_styled_loader_romantic, criterion, device)
+        print(f"[EPOCH {epoch+1}] Factual  Validation Loss: {factual_val_loss:.4f}")
+        print(f"[EPOCH {epoch+1}] Romantic Validation Loss: {romantic_val_loss:.4f}")
 
-        # Early stopping logic
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # FIX: early stopping driven by factual val loss only
+        if factual_val_loss < best_val_loss:
+            best_val_loss = factual_val_loss
             patience_counter = 0
 
             # Save best model
@@ -315,11 +321,11 @@ def main(args):
                 'optimizer_cap_state_dict': optimizer_cap.state_dict(),
                 'optimizer_lang_state_dict': optimizer_lang.state_dict(),
                 'best_val_loss': best_val_loss,
-                'train_loss': avg_train_loss,
-                'val_loss': val_loss,
+                'train_loss': avg_factual_train_loss,
+                'val_loss': factual_val_loss,
                 'patience_counter': patience_counter,
             }, best_model_path)
-            print(f"[EPOCH {epoch+1}] New best model saved! Val loss: {val_loss:.4f}")
+            print(f"[EPOCH {epoch+1}] New best model saved! Factual val loss: {factual_val_loss:.4f}")
 
         else:
             patience_counter += 1
@@ -327,7 +333,7 @@ def main(args):
 
             if patience_counter >= args.patience:
                 print(f"[EARLY STOPPING] No improvement for {args.patience} epochs. Stopping training.")
-                print(f"Best validation loss was: {best_val_loss:.4f}")
+                print(f"Best factual validation loss was: {best_val_loss:.4f}")
                 break
 
         # ======== SAVE: After every epoch =========
@@ -344,8 +350,8 @@ def main(args):
             'optimizer_cap_state_dict': optimizer_cap.state_dict(),
             'optimizer_lang_state_dict': optimizer_lang.state_dict(),
             'best_val_loss': best_val_loss,
-            'train_loss': avg_train_loss,
-            'val_loss': val_loss,
+            'train_loss': avg_factual_train_loss,
+            'val_loss': factual_val_loss,
             'patience_counter': patience_counter,
         }, os.path.join(permanent_save_folder, 'checkpoint-latest.pth'))
         # === DEBUG: List files after saving checkpoint ===
