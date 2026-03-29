@@ -16,17 +16,15 @@ def sequence_mask(sequence_length, max_len=None):
 
 def masked_cross_entropy(logits, target, length):
     length = Variable(length).to(device)
-    """
-    Args:
-        logits: (batch, max_len, vocab_size) — unnormalized logits
-        target: (batch, max_len) — ground truth ids
-        length: (batch,) — caption length (token count per sample)
-    Returns:
-        loss: averaged masked loss (float)
-    """
+
+    # Clamp length to actual sequence dimension to handle last batch edge case
+    max_len = logits.size(1)
+    length = torch.clamp(length, max=max_len)
+    target = target[:, :max_len]  # ensure target doesn't exceed logits seq_len
+
     logits_flat = logits.view(-1, logits.size(-1)).to(device)
     log_probs_flat = F.log_softmax(logits_flat, dim=1)
-    target_flat = target.view(-1, 1).to(device)
+    target_flat = target.contiguous().view(-1, 1).to(device)
     losses_flat = -torch.gather(log_probs_flat, dim=1, index=target_flat)
     losses = losses_flat.view(*target.size())
     mask = sequence_mask(sequence_length=length, max_len=target.size(1))
