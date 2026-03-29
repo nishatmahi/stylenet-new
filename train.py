@@ -107,8 +107,8 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader_romantic, cri
                 lengths = lengths.to(device)
                 
                 outputs = decoder(captions, mode='romantic')
-                # FIX: slice outputs[:, :-1, :] to correctly align with captions[:, 1:]
-                loss = criterion(outputs[:, :-1, :].contiguous(),
+                # FIX: use [:, 1:, :] on outputs (consistent with factual, drops BOS token position)
+                loss = criterion(outputs[:, 1:, :].contiguous(),
                                  captions[:, 1:].contiguous(), lengths - 1)
                 
                 romantic_loss += loss.item() * captions.size(0)
@@ -231,13 +231,12 @@ def main(args):
         encoder.train()
         decoder.train()
 
-        # FIX: track factual and romantic train losses separately
         factual_train_loss = 0.0
         factual_train_samples = 0
         romantic_train_loss = 0.0
         romantic_train_samples = 0
 
-        #factual (image+caption)
+        # Factual (image+caption)
         for i, (images, captions, lengths) in enumerate(data_loader):
             images = images.to(device)
             captions = captions.long().to(device)
@@ -268,7 +267,7 @@ def main(args):
         #         lengths = lengths.to(device)
         #         decoder.zero_grad()
         #         outputs = decoder(captions, mode='humorous')
-        #         loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+        #         loss = criterion(outputs[:, 1:, :].contiguous(), captions[:, 1:].contiguous(), lengths - 1)
         #         loss.backward()
         #         torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
         #         optimizer_lang.step()
@@ -276,14 +275,16 @@ def main(args):
         #             print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
         #                   % (epoch+1, epoch_num, i, total_lang_step, loss.item()))
 
-         # styled (romantic)
+        # Styled (romantic)
         if styled_data_loader_romantic:
             for i, (captions, lengths) in enumerate(styled_data_loader_romantic):
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
                 decoder.zero_grad()
                 outputs = decoder(captions, mode='romantic')
-                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+                # FIX: use [:, 1:, :] on outputs (consistent with factual, drops BOS token position)
+                loss = criterion(outputs[:, 1:, :].contiguous(),
+                                 captions[:, 1:].contiguous(), lengths - 1)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
                 optimizer_lang.step()
@@ -302,13 +303,12 @@ def main(args):
 
         # Validation phase
         print(f"[EPOCH {epoch+1}] Running validation...")
-        # FIX: unpack two separate losses
         factual_val_loss, romantic_val_loss = validate_epoch(
             encoder, decoder, val_loader, val_styled_loader_romantic, criterion, device)
         print(f"[EPOCH {epoch+1}] Factual  Validation Loss: {factual_val_loss:.4f}")
         print(f"[EPOCH {epoch+1}] Romantic Validation Loss: {romantic_val_loss:.4f}")
 
-        # FIX: early stopping driven by factual val loss only
+        # Early stopping driven by factual val loss only
         if factual_val_loss < best_val_loss:
             best_val_loss = factual_val_loss
             patience_counter = 0
@@ -394,7 +394,7 @@ if __name__ == '__main__':
                         help='learning rate for caption model training')
     parser.add_argument('--lr_language', type=float, default=0.00004,
                         help='learning rate for language model training')
-    parser.add_argument('--epoch_num', type=int, default=13)
+    parser.add_argument('--epoch_num', type=int, default=12)
     parser.add_argument('--patience', type=int, default=5,
                         help='patience for early stopping')
     parser.add_argument('--log_step_caption', type=int, default=200,
