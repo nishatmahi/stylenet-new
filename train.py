@@ -107,7 +107,7 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader_romantic, cri
                 lengths = lengths.to(device)
                 
                 outputs = decoder(captions, mode='romantic')
-                loss = criterion(outputs.contiguous(),
+                loss = criterion(outputs[:, 1:, :].contiguous(),
                                  captions[:, 1:].contiguous(), lengths - 1)
                 
                 romantic_loss += loss.item() * captions.size(0)
@@ -142,6 +142,7 @@ def main(args):
     # Data loaders
     data_loader = get_data_loader(
         args.img_path, split_paths['factual_train'], batch_size=args.caption_batch_size, shuffle=True)
+
     styled_data_loader_romantic = get_styled_data_loader(
         split_paths['romantic_train'], batch_size=args.language_batch_size, shuffle=True) if split_paths['romantic_train'] else None
 
@@ -161,10 +162,21 @@ def main(args):
     encoder = EncoderViT(args.emb_dim).to(device)
     decoder = FactoredLSTM(args.emb_dim, args.hidden_dim, args.factored_dim, len(tokenizer)).to(device)
 
-    # Optimizer, loss
-    criterion = masked_cross_entropy
+    # -----------------------------------------------------------------------
+    # CHANGED: cap_params = encoder.A + ALL decoder params (shared + factual S-matrices)
+    #          lang_params = ONLY the romantic S-matrices
+    #          This prevents romantic training from overwriting what factual training learned
+    #          in the shared weights (B, U_*, W_*, C, V_*, F_*)
+    # -----------------------------------------------------------------------
     cap_params = list(decoder.parameters()) + list(encoder.A.parameters())
-    lang_params = list(decoder.parameters())
+
+    lang_params = [
+        decoder.S_ri.weight, decoder.S_ri.bias,
+        decoder.S_rf.weight, decoder.S_rf.bias,
+        decoder.S_ro.weight, decoder.S_ro.bias,
+        decoder.S_rc.weight, decoder.S_rc.bias,
+    ]
+
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
@@ -233,6 +245,7 @@ def main(args):
         romantic_train_samples = 0
 
         # Factual (image+caption)
+        # optimizer_cap updates: encoder.A + ALL decoder params
         for i, (images, captions, lengths) in enumerate(data_loader):
             images = images.to(device)
             captions = captions.long().to(device)
@@ -257,13 +270,15 @@ def main(args):
         eval_outputs(outputs, tokenizer)
 
         # Styled (romantic)
+        # optimizer_lang updates: ONLY S_ri, S_rf, S_ro, S_rc
+        # Shared weights (B, U_*, W_*, C, V_*, F_*) are NOT touched here
         if styled_data_loader_romantic:
             for i, (captions, lengths) in enumerate(styled_data_loader_romantic):
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
                 decoder.zero_grad()
                 outputs = decoder(captions, mode='romantic')
-                loss = criterion(outputs.contiguous(),
+                loss = criterion(outputs[:, 1:, :].contiguous(),
                                  captions[:, 1:].contiguous(), lengths - 1)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
@@ -279,7 +294,7 @@ def main(args):
         avg_factual_train_loss = factual_train_loss / factual_train_samples if factual_train_samples > 0 else 0.0
         avg_romantic_train_loss = romantic_train_loss / romantic_train_samples if romantic_train_samples > 0 else 0.0
         print(f"\n[EPOCH {epoch+1}] Average Factual  Training Loss: {avg_factual_train_loss:.4f}")
-        print(f"[EPOCH {epoch+1}] Average Romantic Training Loss: {avg_romantic_train_loss:.4f}")
+        print(f"\n[EPOCH {epoch+1}] Average Romantic Training Loss: {avg_romantic_train_loss:.4f}")
 
         # Validation phase
         print(f"[EPOCH {epoch+1}] Running validation...")
@@ -352,7 +367,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, default='pretrained_models',
                         help='path for saving trained models')
     parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images',
-                        help='path for train images directory')
+                    help='path for train images directory')
     parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_caption.txt',
                         help='path for factual caption file')
     parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset-new/data/humorous caption.txt',
@@ -369,11 +384,11 @@ if __name__ == '__main__':
                         help='hidden state size of factored LSTM')
     parser.add_argument('--factored_dim', type=int, default=512,
                         help='size of factored matrix')
-    parser.add_argument('--lr_caption', type=float, default=0.00002,
+    parser.add_argument('--lr_caption', type=float, default=0.0001,
                         help='learning rate for caption model training')
-    parser.add_argument('--lr_language', type=float, default=0.00004,
-                        help='learning rate for language model training')
-    parser.add_argument('--epoch_num', type=int, default=12)
+    parser.add_argument('--lr_language', type=float, default=0.0002,
+                        help='learning rate for language model training (only romantic S-matrices)')
+    parser.add_argument('--epoch_num', type=int, default=30)
     parser.add_argument('--patience', type=int, default=5,
                         help='patience for early stopping')
     parser.add_argument('--log_step_caption', type=int, default=200,
