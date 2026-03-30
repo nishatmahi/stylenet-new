@@ -107,8 +107,7 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader_romantic, cri
                 lengths = lengths.to(device)
                 
                 outputs = decoder(captions, mode='romantic')
-                # FIX: use [:, 1:, :] on outputs (consistent with factual, drops BOS token position)
-                loss = criterion(outputs[:, 1:, :].contiguous(),
+                loss = criterion(outputs.contiguous(),
                                  captions[:, 1:].contiguous(), lengths - 1)
                 
                 romantic_loss += loss.item() * captions.size(0)
@@ -143,8 +142,6 @@ def main(args):
     # Data loaders
     data_loader = get_data_loader(
         args.img_path, split_paths['factual_train'], batch_size=args.caption_batch_size, shuffle=True)
-    # styled_data_loader = get_styled_data_loader(
-    #     args.humorous_caption_path, batch_size=args.language_batch_size, shuffle=True) if args.humorous_caption_path else None
     styled_data_loader_romantic = get_styled_data_loader(
         split_paths['romantic_train'], batch_size=args.language_batch_size, shuffle=True) if split_paths['romantic_train'] else None
 
@@ -220,7 +217,6 @@ def main(args):
     print("=============================")
 
     total_cap_step = len(data_loader)
-    # total_lang_step = len(styled_data_loader) if styled_data_loader else 0
     total_romantic_step = len(styled_data_loader_romantic) if styled_data_loader_romantic else 0
     epoch_num = args.epoch_num
 
@@ -260,21 +256,6 @@ def main(args):
                       % (epoch+1, epoch_num, i, total_cap_step, loss.item()))
         eval_outputs(outputs, tokenizer)
 
-        #styled (humorous)
-        # if styled_data_loader:
-        #     for i, (captions, lengths) in enumerate(styled_data_loader):
-        #         captions = captions.long().to(device)
-        #         lengths = lengths.to(device)
-        #         decoder.zero_grad()
-        #         outputs = decoder(captions, mode='humorous')
-        #         loss = criterion(outputs[:, 1:, :].contiguous(), captions[:, 1:].contiguous(), lengths - 1)
-        #         loss.backward()
-        #         torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-        #         optimizer_lang.step()
-        #         if i % args.log_step_language == 0 or i == total_lang_step-1:
-        #             print("Epoch [%d/%d], LANG, Step [%d/%d], Loss: %.4f"
-        #                   % (epoch+1, epoch_num, i, total_lang_step, loss.item()))
-
         # Styled (romantic)
         if styled_data_loader_romantic:
             for i, (captions, lengths) in enumerate(styled_data_loader_romantic):
@@ -282,8 +263,7 @@ def main(args):
                 lengths = lengths.to(device)
                 decoder.zero_grad()
                 outputs = decoder(captions, mode='romantic')
-                # FIX: use [:, 1:, :] on outputs (consistent with factual, drops BOS token position)
-                loss = criterion(outputs[:, 1:, :].contiguous(),
+                loss = criterion(outputs.contiguous(),
                                  captions[:, 1:].contiguous(), lengths - 1)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
@@ -354,7 +334,6 @@ def main(args):
             'val_loss': factual_val_loss,
             'patience_counter': patience_counter,
         }, os.path.join(permanent_save_folder, 'checkpoint-latest.pth'))
-        # === DEBUG: List files after saving checkpoint ===
         print(f"[DEBUG] Saved checkpoint and models at epoch {epoch+1}")
         print(f"[DEBUG] Files in checkpoint folder AFTER saving:", os.listdir(permanent_save_folder))
 
@@ -373,7 +352,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, default='pretrained_models',
                         help='path for saving trained models')
     parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images',
-                    help='path for train images directory')
+                        help='path for train images directory')
     parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_caption.txt',
                         help='path for factual caption file')
     parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset-new/data/humorous caption.txt',
