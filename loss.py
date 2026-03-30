@@ -16,12 +16,6 @@ def sequence_mask(sequence_length, max_len=None):
 
 def masked_cross_entropy(logits, target, length):
     length = Variable(length).to(device)
-
-    # Clamp length to actual sequence dimension to handle last batch edge case
-    max_len = logits.size(1)
-    length = torch.clamp(length, max=max_len)
-    target = target[:, :max_len]  # ensure target doesn't exceed logits seq_len
-
     logits_flat = logits.view(-1, logits.size(-1)).to(device)
     log_probs_flat = F.log_softmax(logits_flat, dim=1)
     target_flat = target.contiguous().view(-1, 1).to(device)
