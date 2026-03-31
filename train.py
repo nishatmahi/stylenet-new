@@ -180,6 +180,8 @@ def main(args):
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
+    criterion = masked_cross_entropy
+
     # ======= Checkpoint Loading =======
     start_epoch = 0
     best_val_loss = float('inf')
