@@ -360,7 +360,7 @@ if __name__ == '__main__':
                         help='size of factored matrix')
     parser.add_argument('--lr_caption', type=float, default=0.00002,
                         help='learning rate for caption model training')
-    parser.add_argument('--lr_language', type=float, default=0.00005,
+    parser.add_argument('--lr_language', type=float, default=0.00001,
                         help='learning rate for language model training')
     parser.add_argument('--epoch_num', type=int, default=80,
                         help='number of epochs to train')
