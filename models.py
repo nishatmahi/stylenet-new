@@ -75,7 +75,7 @@ class FactoredLSTM(nn.Module):
         self.C = nn.Linear(hidden_dim, vocab_size)
 
         # Optional dropout for regularization
-        self.dropout = nn.Dropout(p=0.5)
+        self.dropout = nn.Dropout(p=0.3)
 
     def forward_step(self, embedded, h_0, c_0, mode, features=None):
         """
