@@ -6,7 +6,7 @@ import torchvision.models as models
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-
+# --------- EncoderCNN (ResNet152) ---------
 class EncoderViT(nn.Module):
     def __init__(self, emb_dim):
         super(EncoderViT, self).__init__()
@@ -54,7 +54,7 @@ class FactoredLSTM(nn.Module):
         self.V_c = nn.Linear(emb_dim, factored_dim)
         self.W_c = nn.Linear(hidden_dim, hidden_dim)
 
-        # Feature-to-gate transformations for visual conditioning
+        # NEW: Feature-to-gate transformations for visual conditioning
         self.F_i = nn.Linear(emb_dim, factored_dim)  # Feature influence on input gate
         self.F_f = nn.Linear(emb_dim, factored_dim)  # Feature influence on forget gate
         self.F_o = nn.Linear(emb_dim, factored_dim)  # Feature influence on output gate
@@ -148,7 +148,10 @@ class FactoredLSTM(nn.Module):
 
     def forward(self, captions, features=None, mode="factual"):
         """
-        
+        Args:
+            features: [batch, emb_dim] - visual features from images
+            captions: [batch, max_len] - caption token sequences  
+            mode: str - caption style ("factual", "romantic")
         
         Training Strategy:
         - Factual mode: Use image+caption pairs (features provided)
@@ -215,7 +218,7 @@ class FactoredLSTM(nn.Module):
             end_id = tokenizer.eos_token_id
 
             # Initialize beam (EXACT original structure)
-            symbol_id = torch.tensor([start_id], device=device).unsqueeze(0)
+            symbol_id = torch.tensor([start_id], device=device)  # shape [1], matches subsequent beam steps
             candidates = [[0.0, symbol_id, h_t, c_t, [start_id]]]
 
             # Beam search (EXACT original logic)
@@ -270,17 +273,6 @@ class FactoredLSTM(nn.Module):
 
             # Return best sequence (EXACT original)
             return candidates[0][4]
-
-
-
-
-
-
-
-
-
-
-
 
 
 
