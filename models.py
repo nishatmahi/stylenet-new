@@ -4,7 +4,6 @@ import torch.nn as nn
 from transformers import ViTModel
 import torchvision.models as models
 import torch.nn.functional as F
-from torch.autograd import Variable
 
 # --------- EncoderCNN (ResNet152) ---------
 class EncoderViT(nn.Module):
@@ -74,8 +73,14 @@ class FactoredLSTM(nn.Module):
 
         self.C = nn.Linear(hidden_dim, vocab_size)
 
-        # Optional dropout for regularization
+        # Dropout for regularization (0.3 is more stable for LSTM hidden states)
         self.dropout = nn.Dropout(p=0.3)
+
+        # Feature dropout: during factual training, randomly zero out visual
+        # conditioning so shared weights (U_*, W_*) learn to handle both
+        # with and without visual features. This enables proper composition
+        # of style + vision at inference for romantic/humorous modes.
+        self.feature_dropout = nn.Dropout(p=0.25)
 
     def forward_step(self, embedded, h_0, c_0, mode, features=None):
         """
@@ -99,6 +104,16 @@ class FactoredLSTM(nn.Module):
             visual_f = self.F_f(features)
             visual_o = self.F_o(features)
             visual_c = self.F_c(features)
+
+            # Feature dropout during training: randomly zero out visual signal
+            # so shared weights learn to work with AND without visual features.
+            # This is critical for romantic/humorous modes to properly compose
+            # style + vision at inference time.
+            if self.training:
+                visual_i = self.feature_dropout(visual_i)
+                visual_f = self.feature_dropout(visual_f)
+                visual_o = self.feature_dropout(visual_o)
+                visual_c = self.feature_dropout(visual_c)
         else:
             # If no features provided, use zeros (for text-only training)
             batch_size = embedded.size(0)
@@ -168,14 +183,12 @@ class FactoredLSTM(nn.Module):
         if mode == "factual" and features is not None:
             embedded = torch.cat((features.unsqueeze(1), embedded), 1)
 
-        # Initialize hidden/cell state with uniform distribution (matching original)
-        h_t = Variable(torch.Tensor(batch_size, self.hidden_dim))
-        c_t = Variable(torch.Tensor(batch_size, self.hidden_dim))
-        nn.init.uniform_(h_t)
-        nn.init.uniform_(c_t)
-        if torch.cuda.is_available():
-            h_t = h_t.cuda()
-            c_t = c_t.cuda()
+        # Initialize hidden/cell state
+        device = captions.device
+        h_t = torch.zeros(batch_size, self.hidden_dim, device=device)
+        c_t = torch.zeros(batch_size, self.hidden_dim, device=device)
+        nn.init.uniform_(h_t, -0.1, 0.1)
+        nn.init.uniform_(c_t, -0.1, 0.1)
 
         all_outputs = []
         for ix in range(embedded.size(1) - 1):
@@ -202,13 +215,10 @@ class FactoredLSTM(nn.Module):
             device = feature.device
 
             # Initialize hidden state (EXACT original)
-            h_t = torch.Tensor(1, self.hidden_dim)
-            c_t = torch.Tensor(1, self.hidden_dim)
-            # EXACTLY match original initialization
-            torch.nn.init.uniform_(h_t)
-            torch.nn.init.uniform_(c_t)
-            h_t = h_t.to(device)
-            c_t = c_t.to(device)
+            h_t = torch.zeros(1, self.hidden_dim, device=device)
+            c_t = torch.zeros(1, self.hidden_dim, device=device)
+            nn.init.uniform_(h_t, -0.1, 0.1)
+            nn.init.uniform_(c_t, -0.1, 0.1)
 
             # Forward 1 step with image feature (ALL modes get visual conditioning during inference)
             _, h_t, c_t = self.forward_step(feature, h_t, c_t, mode=mode, features=feature)
