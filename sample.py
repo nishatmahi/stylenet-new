@@ -3,14 +3,9 @@ import torch
 from PIL import Image
 from torchvision import transforms
 from transformers import AutoTokenizer
+from config import config
 from models import EncoderViT, FactoredLSTM
 from data_loader import Rescale
-
-# ---- Hyperparameters (must match train.py defaults) ----
-EMB_DIM = 300
-HIDDEN_DIM = 512
-FACTORED_DIM = 512
-SAMPLE_IMG_DIR = "/kaggle/input/sample-data/sample/sample_images"  # <-- adjust to your sample images path
 
 
 def load_sample_images(img_dir, transform):
@@ -33,8 +28,8 @@ tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/stylenet/tokenizer-ex
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-encoder = EncoderViT(EMB_DIM).to(device)
-decoder = FactoredLSTM(EMB_DIM, HIDDEN_DIM, FACTORED_DIM, vocab_size=len(tokenizer)).to(device)
+encoder = EncoderViT(config.emb_dim).to(device)
+decoder = FactoredLSTM(config.emb_dim, config.hidden_dim, config.factored_dim, vocab_size=len(tokenizer)).to(device)
 
 encoder.load_state_dict(torch.load("/kaggle/working/stylenet_new_again_models/encoder-last.pkl", map_location=device))
 decoder.load_state_dict(torch.load("/kaggle/working/stylenet_new_again_models/decoder-last.pkl", map_location=device))
@@ -47,10 +42,11 @@ decoder.eval()
 transform = transforms.Compose([
     Rescale((224, 224)),     # PIL resize — same as training
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    # ImageNet normalization — matches ViT-base-patch16-224 pretraining
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-img_names, img_list = load_sample_images(SAMPLE_IMG_DIR, transform)
+img_names, img_list = load_sample_images(config.simg_path, transform)
 
 # ---- No ground-truth section from here ----
 with torch.no_grad():
