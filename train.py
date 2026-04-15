@@ -6,9 +6,11 @@ from data_loader import get_data_loader, get_styled_data_loader, tokenizer
 from models import EncoderViT, FactoredLSTM
 from loss import masked_cross_entropy
 
-def split_caption_file(input_file, train_file, val_file, train_ratio=0.8, seed=42):
+def split_caption_file(input_file, train_file, val_file, train_ratio=0.8, seed=42, group_by_image=False):
     """
-    Split a caption file into training and validation sets
+    Split a caption file into training and validation sets.
+    If group_by_image=True, groups lines by image ID (before '#') to prevent
+    data leakage (same image in both train and val).
     """
     if not os.path.exists(input_file):
         print(f"Warning: {input_file} not found, skipping split")
@@ -17,14 +19,42 @@ def split_caption_file(input_file, train_file, val_file, train_ratio=0.8, seed=4
     with open(input_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     
-    # Shuffle with fixed seed for reproducibility
     random.seed(seed)
-    random.shuffle(lines)
     
-    # Split
-    split_idx = int(len(lines) * train_ratio)
-    train_lines = lines[:split_idx]
-    val_lines = lines[split_idx:]
+    if group_by_image:
+        # Group lines by image ID (text before first '#')
+        import re
+        image_to_lines = {}
+        for line in lines:
+            match = re.match(r'^([^#]+)', line)
+            if match:
+                img_id = match.group(1).strip()
+                # Strip file extension for grouping
+                for ext in ['.jpg', '.jpeg', '.png']:
+                    if img_id.lower().endswith(ext):
+                        img_id = img_id[:len(img_id)-len(ext)]
+                        break
+                image_to_lines.setdefault(img_id, []).append(line)
+            else:
+                image_to_lines.setdefault('__unknown__', []).append(line)
+        
+        # Shuffle image IDs, then split
+        image_ids = list(image_to_lines.keys())
+        random.shuffle(image_ids)
+        split_idx = int(len(image_ids) * train_ratio)
+        
+        train_lines = []
+        for img_id in image_ids[:split_idx]:
+            train_lines.extend(image_to_lines[img_id])
+        val_lines = []
+        for img_id in image_ids[split_idx:]:
+            val_lines.extend(image_to_lines[img_id])
+    else:
+        # Simple line-level shuffle (for styled text without image IDs)
+        random.shuffle(lines)
+        split_idx = int(len(lines) * train_ratio)
+        train_lines = lines[:split_idx]
+        val_lines = lines[split_idx:]
     
     # Write split files
     os.makedirs(os.path.dirname(train_file), exist_ok=True)
@@ -46,11 +76,10 @@ def create_data_splits(args):
     train_dir = '/kaggle/working/train_split'
     val_dir = '/kaggle/working/val_split'
     
-    
     # Split factual captions
     factual_train = os.path.join(train_dir, 'factual_train.txt')
     factual_val = os.path.join(val_dir, 'factual_val.txt')
-    split_caption_file(args.factual_caption_path, factual_train, factual_val)
+    split_caption_file(args.factual_caption_path, factual_train, factual_val, group_by_image=True)
     
     # Split romantic captions
     romantic_train = os.path.join(train_dir, 'romantic_train.txt')
@@ -66,45 +95,58 @@ def create_data_splits(args):
     }
 
 def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device):
+    """
+    Run validation for one epoch.
+    Early stopping and best model saving are based on factual loss only.
+    Romantic loss is computed and printed for monitoring purposes only.
+    """
     encoder.eval()
     decoder.eval()
 
-    factual_val_loss = float('inf')
-    romantic_val_loss = float('inf')
+    factual_loss = 0.0
+    factual_samples = 0
 
     with torch.no_grad():
+        # Validate factual captions
         if val_loader:
-            factual_loss = 0.0
-            factual_samples = 0
             for images, captions, lengths in val_loader:
                 images = images.to(device)
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
+
                 features = encoder(images)
                 outputs = decoder(captions, features, mode="factual")
                 loss = criterion(outputs[:, 1:, :].contiguous(),
                                captions[:, 1:].contiguous(), lengths - 1)
+
                 factual_loss += loss.item() * captions.size(0)
                 factual_samples += captions.size(0)
-            if factual_samples > 0:
-                factual_val_loss = factual_loss / factual_samples
-                print(f"Validation Factual Loss: {factual_val_loss:.4f}")
 
+            if factual_samples > 0:
+                factual_loss /= factual_samples
+                print(f"Validation Factual Loss: {factual_loss:.4f}")
+
+        # Validate romantic captions — printed for monitoring only, not used for early stopping
         if val_styled_loader:
             romantic_loss = 0.0
             romantic_samples = 0
+
             for captions, lengths in val_styled_loader:
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
+
                 outputs = decoder(captions, mode='romantic')
                 loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+
                 romantic_loss += loss.item() * captions.size(0)
                 romantic_samples += captions.size(0)
-            if romantic_samples > 0:
-                romantic_val_loss = romantic_loss / romantic_samples
-                print(f"Validation Romantic Loss: {romantic_val_loss:.4f}")
 
-    return factual_val_loss, romantic_val_loss
+            if romantic_samples > 0:
+                romantic_loss /= romantic_samples
+                print(f"Validation Romantic Loss (monitor only): {romantic_loss:.4f}")
+
+    # Only return factual loss — drives early stopping and best model saving
+    return factual_loss if factual_samples > 0 else float('inf')
 
 def eval_outputs(outputs, tokenizer):
     indices = torch.topk(outputs, 1)[1]
@@ -155,16 +197,12 @@ def main(args):
     # Optimizer, loss
     criterion = masked_cross_entropy
     cap_params = list(decoder.parameters()) + list(encoder.A.parameters())
-    # CHANGED: lang_params now only contains romantic S-matrices
-    # so romantic training does not overwrite shared weights learned during factual training
     lang_params = [
-        decoder.S_ri.weight, decoder.S_ri.bias,
-        decoder.S_rf.weight, decoder.S_rf.bias,
-        decoder.S_ro.weight, decoder.S_ro.bias,
-        decoder.S_rc.weight, decoder.S_rc.bias,
+        p for name, p in decoder.named_parameters()
+        if not any(x in name for x in ['S_fi', 'S_ff', 'S_fo', 'S_fc'])
     ]
-    optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
-    optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
+    optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption, weight_decay=1e-4)
+    optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language, weight_decay=1e-4)
 
     # Checkpoint loading
     start_epoch = 0
@@ -180,7 +218,18 @@ def main(args):
     print("Files in checkpoint folder BEFORE loading:", os.listdir(permanent_save_folder) if os.path.exists(permanent_save_folder) else "Folder doesn't exist")
     print("=============================")
 
-    if os.path.exists(checkpoint_path):
+    # ---- FINETUNE MODE: load weights only, fresh optimizer + epoch ----
+    if args.finetune and args.pretrained_path:
+        if not os.path.exists(args.pretrained_path):
+            raise FileNotFoundError(f"Pretrained checkpoint not found: {args.pretrained_path}")
+        checkpoint = torch.load(args.pretrained_path, map_location=device)
+        encoder.load_state_dict(checkpoint['encoder_state_dict'])
+        decoder.load_state_dict(checkpoint['decoder_state_dict'])
+        print(f"[FINETUNE] Loaded weights from: {args.pretrained_path}")
+        print(f"[FINETUNE] Optimizer + epoch reset for fresh fine-tuning.")
+
+    # ---- NORMAL MODE: resume from checkpoint ----
+    elif os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
         encoder.load_state_dict(checkpoint['encoder_state_dict'])
         decoder.load_state_dict(checkpoint['decoder_state_dict'])
@@ -190,7 +239,7 @@ def main(args):
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         patience_counter = checkpoint.get('patience_counter', 0)
         print(f"[DEBUG] Loaded checkpoint from epoch {checkpoint['epoch']+1}")
-        print(f"[DEBUG] Best val loss so far: {best_val_loss:.4f}")
+        print(f"[DEBUG] Best factual val loss so far: {best_val_loss:.4f}")
         print(f"[DEBUG] Patience counter: {patience_counter}")
     else:
         encoder_last_path = os.path.join(permanent_save_folder, "encoder-last.pkl")
@@ -275,16 +324,15 @@ def main(args):
 
         # Validation phase
         print(f"[EPOCH {epoch+1}] Running validation...")
-        # CHANGED: returns factual and romantic losses separately
-        factual_val_loss, romantic_val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device)
-        print(f"[EPOCH {epoch+1}] Factual Validation Loss: {factual_val_loss:.4f}")
-        print(f"[EPOCH {epoch+1}] Romantic Validation Loss: {romantic_val_loss:.4f}")
+        val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device)
+        print(f"[EPOCH {epoch+1}] Factual Validation Loss (early stopping): {val_loss:.4f}")
 
-        # CHANGED: best model and early stopping based on factual val loss only
-        if factual_val_loss < best_val_loss:
-            best_val_loss = factual_val_loss
+        # Early stopping logic — based on factual validation loss only
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             patience_counter = 0
             
+            # Save best model
             torch.save({
                 'epoch': epoch,
                 'encoder_state_dict': encoder.state_dict(),
@@ -293,10 +341,10 @@ def main(args):
                 'optimizer_lang_state_dict': optimizer_lang.state_dict(),
                 'best_val_loss': best_val_loss,
                 'train_loss': avg_train_loss,
-                'val_loss': factual_val_loss,
+                'val_loss': val_loss,
                 'patience_counter': patience_counter,
             }, best_model_path)
-            print(f"[EPOCH {epoch+1}] New best model saved! Factual val loss: {factual_val_loss:.4f}")
+            print(f"[EPOCH {epoch+1}] New best model saved! Factual val loss: {val_loss:.4f}")
             
         else:
             patience_counter += 1
@@ -320,7 +368,7 @@ def main(args):
             'optimizer_lang_state_dict': optimizer_lang.state_dict(),
             'best_val_loss': best_val_loss,
             'train_loss': avg_train_loss,
-            'val_loss': factual_val_loss,
+            'val_loss': val_loss,
             'patience_counter': patience_counter,
         }, checkpoint_path)
         
@@ -328,7 +376,7 @@ def main(args):
 
     # Load best model for final evaluation
     if os.path.exists(best_model_path):
-        print(f"\nTraining completed. Loading best model (val loss: {best_val_loss:.4f}) for final evaluation...")
+        print(f"\nTraining completed. Loading best model (factual val loss: {best_val_loss:.4f}) for final evaluation...")
         best_checkpoint = torch.load(best_model_path, map_location=device)
         encoder.load_state_dict(best_checkpoint['encoder_state_dict'])
         decoder.load_state_dict(best_checkpoint['decoder_state_dict'])
@@ -340,13 +388,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla with Validation: Generating Attractive Visual Captions with Styles')
     parser.add_argument('--model_path', type=str, default='pretrained_models',
                         help='path for saving trained models')
-    parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images',
+    parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Flicker8k_Dataset',
                     help='path for train images directory')
-    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_caption.txt',
+    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_train.txt',
                         help='path for factual caption file')
     parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset/data/humorous_text.txt',
                         help='path for humorous caption file')
-    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_data.txt',
+    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_text.txt',
                         help='path for romantic caption file')
     parser.add_argument('--caption_batch_size', type=int, default=32,
                         help='mini batch size for caption model training')
@@ -364,7 +412,7 @@ if __name__ == '__main__':
                         help='learning rate for language model training')
     parser.add_argument('--epoch_num', type=int, default=80,
                         help='number of epochs to train')
-    parser.add_argument('--patience', type=int, default=5,
+    parser.add_argument('--patience', type=int, default=7,
                         help='patience for early stopping')
     parser.add_argument('--train_split_ratio', type=float, default=0.8,
                         help='ratio for train/validation split')
@@ -372,5 +420,9 @@ if __name__ == '__main__':
                         help='steps for print log while train caption model')
     parser.add_argument('--log_step_language', type=int, default=100,
                         help='steps for print log while train language model')
+    parser.add_argument('--finetune', action='store_true',
+                        help='(Phase 2) Load weights from --pretrained_path, reset optimizer+epoch')
+    parser.add_argument('--pretrained_path', type=str, default='',
+                        help='(Phase 2) Path to Phase 1 best_model.pth')
     args = parser.parse_args()
     main(args)
