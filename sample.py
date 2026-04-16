@@ -46,7 +46,7 @@ transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-img_names, img_list = load_sample_images(config.simg_path, transform)
+img_names, img_list = load_sample_images("/kaggle/input/sample-data/sample/sample_images", transform)
 
 # ---- No ground-truth section from here ----
 with torch.no_grad():
