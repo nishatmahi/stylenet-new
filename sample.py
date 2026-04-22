@@ -4,7 +4,7 @@ from PIL import Image
 from torchvision import transforms
 from transformers import AutoTokenizer
 from config import config
-from models import EncoderViT, FactoredLSTM
+from models import EncoderViT, FactoredGRU
 from data_loader import Rescale
 
 
@@ -24,15 +24,15 @@ def load_sample_images(img_dir, transform):
 
 
 # ---- Setup ----
-tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/tokenizer-extended", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/stylenet/tokenizer-extended", trust_remote_code=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 encoder = EncoderViT(config.emb_dim).to(device)
-decoder = FactoredLSTM(config.emb_dim, config.hidden_dim, config.factored_dim, vocab_size=len(tokenizer)).to(device)
+decoder = FactoredGRU(config.emb_dim, config.hidden_dim, config.factored_dim, vocab_size=len(tokenizer)).to(device)
 
-encoder.load_state_dict(torch.load("/kaggle/working/stylenet_new_again_models/encoder-last.pkl", map_location=device))
-decoder.load_state_dict(torch.load("/kaggle/working/stylenet_new_again_models/decoder-last.pkl", map_location=device))
+encoder.load_state_dict(torch.load("/kaggle/working/stylenet_gru_models/encoder-last.pkl", map_location=device))
+decoder.load_state_dict(torch.load("/kaggle/working/stylenet_gru_models/decoder-last.pkl", map_location=device))
 
 # Set eval mode right after loading weights
 encoder.eval()
@@ -42,11 +42,10 @@ decoder.eval()
 transform = transforms.Compose([
     Rescale((224, 224)),     # PIL resize — same as training
     transforms.ToTensor(),
-    # ImageNet normalization — matches ViT-base-patch16-224 pretraining
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-img_names, img_list = load_sample_images("/kaggle/input/sample-data/sample/sample_images", transform)
+img_names, img_list = load_sample_images(config.simg_path, transform)
 
 # ---- No ground-truth section from here ----
 with torch.no_grad():
