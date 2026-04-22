@@ -1,39 +1,13 @@
 import os
 import re
-import sys
-import json
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
+from transformers import AutoTokenizer
 
-# ---- Load Bangla Tokenizer directly (bypasses HF Hub validation) ----
-_TOK_DIR = "/kaggle/working/stylenet/tokenizer-extended"
-sys.path.insert(0, _TOK_DIR)
-from tokenization_bn import BNTokenizer
-
-_vocab_file = os.path.join(_TOK_DIR, "tokenizer.model")
-_tok_config_file = os.path.join(_TOK_DIR, "tokenizer_config.json")
-
-# Load config to get special tokens and added_tokens
-with open(_tok_config_file, "r", encoding="utf-8") as f:
-    _tok_config = json.load(f)
-
-tokenizer = BNTokenizer(
-    vocab_file=_vocab_file,
-    bos_token=_tok_config.get("bos_token", "<s>"),
-    eos_token=_tok_config.get("eos_token", "</s>"),
-    unk_token=_tok_config.get("unk_token", "<unk>"),
-    pad_token=_tok_config.get("pad_token", "<unk>"),
-)
-
-# Load added tokens if present
-_added_tokens_file = os.path.join(_TOK_DIR, "added_tokens.json")
-if os.path.exists(_added_tokens_file):
-    with open(_added_tokens_file, "r", encoding="utf-8") as f:
-        _added_tokens = json.load(f)
-    if _added_tokens:
-        tokenizer.add_tokens(list(_added_tokens.keys()))
+# ---- HuggingFace Bangla Tokenizer ----
+tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/stylenet/tokenizer-extended", trust_remote_code=True)
 
 class Rescale:
     '''Rescale the image to a given size'''
