@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 from transformers import ViTModel
 import torch.nn.functional as F
-from torch.autograd import Variable
 
 # --------- EncoderViT (UNCHANGED from LSTM version) ---------
 class EncoderViT(nn.Module):
@@ -189,10 +188,10 @@ class FactoredGRU(nn.Module):
             embedded = torch.cat((features.unsqueeze(1), embedded), 1)
 
         # Initialize hidden state ONLY (no cell state needed!)
-        h_t = Variable(torch.Tensor(batch_size, self.hidden_dim))
+        # Create directly on the correct device to avoid CPU→GPU sync overhead
+        device = embedded.device
+        h_t = torch.empty(batch_size, self.hidden_dim, device=device)
         nn.init.uniform_(h_t)
-        if torch.cuda.is_available():
-            h_t = h_t.cuda()
 
         all_outputs = []
         for ix in range(embedded.size(1) - 1):
@@ -219,9 +218,8 @@ class FactoredGRU(nn.Module):
             device = feature.device
 
             # Initialize hidden state ONLY (no cell state)
-            h_t = torch.Tensor(1, self.hidden_dim)
+            h_t = torch.empty(1, self.hidden_dim, device=device)
             torch.nn.init.uniform_(h_t)
-            h_t = h_t.to(device)
 
             # Forward 1 step with image feature
             _, h_t = self.forward_step(feature, h_t, mode=mode, features=feature)
