@@ -2,10 +2,10 @@ import sys
 import torch
 import torch.nn as nn
 from transformers import ViTModel
-import torchvision.models as models
 import torch.nn.functional as F
+from torch.autograd import Variable
 
-# --------- EncoderCNN (ResNet152) ---------
+# --------- EncoderViT (UNCHANGED from LSTM version) ---------
 class EncoderViT(nn.Module):
     def __init__(self, emb_dim):
         super(EncoderViT, self).__init__()
@@ -22,267 +22,265 @@ class EncoderViT(nn.Module):
         features = self.A(features)
         return features
 
-# --------- FactoredLSTM ---------
-class FactoredLSTM(nn.Module):
+# --------- FactoredGRU ---------
+#
+# MAPPING FROM LSTM → GRU:
+# ========================
+#
+# LSTM has 4 gates:            GRU has 3 gates:
+#   i (input gate)      →       z (update gate)
+#   f (forget gate)     →       r (reset gate)
+#   o (output gate)     →       REMOVED (GRU has no output gate)
+#   c (cell candidate)  →       n (candidate hidden state)
+#
+# LSTM state: h_t AND c_t     GRU state: h_t ONLY (no cell state)
+#
+# LSTM equations:               GRU equations:
+#   i = σ(Ui(Si(Vi(x))) + Wi(h))    z = σ(Uz(Sz(Vz(x))) + Wz(h))
+#   f = σ(Uf(Sf(Vf(x))) + Wf(h))    r = σ(Ur(Sr(Vr(x))) + Wr(h))
+#   o = σ(Uo(So(Vo(x))) + Wo(h))    n = tanh(Un(Sn(Vn(x))) + Wn(r*h))
+#   c̃ = tanh(Uc(Sc(Vc(x))) + Wc(h))
+#   c = f*c₀ + i*c̃                  h = (1-z)*h₀ + z*n
+#   h = o * tanh(c)
+#
+# Style matrix mapping:
+#   S_fi, S_ff, S_fo, S_fc  →  S_fz, S_fr, S_fn  (factual: 4→3)
+#   S_ri, S_rf, S_ro, S_rc  →  S_rz, S_rr, S_rn  (romantic: 4→3)
+#
+# Feature gate mapping:
+#   F_i, F_f, F_o, F_c      →  F_z, F_r, F_n     (visual: 4→3)
+#
+
+class FactoredGRU(nn.Module):
     def __init__(self, emb_dim, hidden_dim, factored_dim, vocab_size):
-        super(FactoredLSTM, self).__init__()
+        super(FactoredGRU, self).__init__()
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
         self.emb_dim = emb_dim
 
+        # Embedding layer (SAME as LSTM)
         self.B = nn.Embedding(vocab_size, emb_dim)
 
-        # Factored LSTM weights for each gate
-        self.U_i = nn.Linear(factored_dim, hidden_dim)
-        self.S_fi = nn.Linear(factored_dim, factored_dim)
-        self.V_i = nn.Linear(emb_dim, factored_dim)
-        self.W_i = nn.Linear(hidden_dim, hidden_dim)
+        # ---- GRU Gate: z (update gate) ----
+        # Controls how much of the new candidate vs old hidden state to use
+        # Replaces BOTH input gate (i) and forget gate (f) from LSTM
+        self.U_z = nn.Linear(factored_dim, hidden_dim)
+        self.S_fz = nn.Linear(factored_dim, factored_dim)   # factual style
+        self.V_z = nn.Linear(emb_dim, factored_dim)
+        self.W_z = nn.Linear(hidden_dim, hidden_dim)
 
-        self.U_f = nn.Linear(factored_dim, hidden_dim)
-        self.S_ff = nn.Linear(factored_dim, factored_dim)
-        self.V_f = nn.Linear(emb_dim, factored_dim)
-        self.W_f = nn.Linear(hidden_dim, hidden_dim)
+        # ---- GRU Gate: r (reset gate) ----
+        # Controls how much of previous hidden state to forget
+        # before computing the candidate
+        self.U_r = nn.Linear(factored_dim, hidden_dim)
+        self.S_fr = nn.Linear(factored_dim, factored_dim)   # factual style
+        self.V_r = nn.Linear(emb_dim, factored_dim)
+        self.W_r = nn.Linear(hidden_dim, hidden_dim)
 
-        self.U_o = nn.Linear(factored_dim, hidden_dim)
-        self.S_fo = nn.Linear(factored_dim, factored_dim)
-        self.V_o = nn.Linear(emb_dim, factored_dim)
-        self.W_o = nn.Linear(hidden_dim, hidden_dim)
+        # ---- GRU Gate: n (candidate hidden state) ----
+        # Proposes new content, similar to cell candidate in LSTM
+        self.U_n = nn.Linear(factored_dim, hidden_dim)
+        self.S_fn = nn.Linear(factored_dim, factored_dim)   # factual style
+        self.V_n = nn.Linear(emb_dim, factored_dim)
+        self.W_n = nn.Linear(hidden_dim, hidden_dim)
 
-        self.U_c = nn.Linear(factored_dim, hidden_dim)
-        self.S_fc = nn.Linear(factored_dim, factored_dim)
-        self.V_c = nn.Linear(emb_dim, factored_dim)
-        self.W_c = nn.Linear(hidden_dim, hidden_dim)
+        # ---- Feature-to-gate transformations (visual conditioning) ----
+        # 3 gates instead of 4 (no output gate in GRU)
+        self.F_z = nn.Linear(emb_dim, factored_dim)   # Feature → update gate
+        self.F_r = nn.Linear(emb_dim, factored_dim)   # Feature → reset gate
+        self.F_n = nn.Linear(emb_dim, factored_dim)   # Feature → candidate gate
 
-        # NEW: Feature-to-gate transformations for visual conditioning
-        self.F_i = nn.Linear(emb_dim, factored_dim)  # Feature influence on input gate
-        self.F_f = nn.Linear(emb_dim, factored_dim)  # Feature influence on forget gate
-        self.F_o = nn.Linear(emb_dim, factored_dim)  # Feature influence on output gate
-        self.F_c = nn.Linear(emb_dim, factored_dim)  # Feature influence on cell gate
+        # ---- Romantic style matrices ----
+        # 3 per style instead of 4 (no output gate)
+        self.S_rz = nn.Linear(factored_dim, factored_dim)   # romantic update
+        self.S_rr = nn.Linear(factored_dim, factored_dim)   # romantic reset
+        self.S_rn = nn.Linear(factored_dim, factored_dim)   # romantic candidate
 
-        # Style-specific transformations for romantic
-        self.S_ri = nn.Linear(factored_dim, factored_dim)
-        self.S_rf = nn.Linear(factored_dim, factored_dim)
-        self.S_ro = nn.Linear(factored_dim, factored_dim)
-        self.S_rc = nn.Linear(factored_dim, factored_dim)
-
-        # Style-specific transformations for humorous/funny (COMMENTED OUT)
-        # self.S_hi = nn.Linear(factored_dim, factored_dim)
-        # self.S_hf = nn.Linear(factored_dim, factored_dim)
-        # self.S_ho = nn.Linear(factored_dim, factored_dim)
-        # self.S_hc = nn.Linear(factored_dim, factored_dim)
-
+        # Output projection (SAME as LSTM)
         self.C = nn.Linear(hidden_dim, vocab_size)
 
-        # Dropout for regularization (0.3 is more stable for LSTM hidden states)
-        self.dropout = nn.Dropout(p=0.3)
+        # Dropout (SAME as LSTM)
+        self.dropout = nn.Dropout(p=0.5)
 
-        # Feature dropout: during factual training, randomly zero out visual
-        # conditioning so shared weights (U_*, W_*) learn to handle both
-        # with and without visual features. This enables proper composition
-        # of style + vision at inference for romantic/humorous modes.
-        self.feature_dropout = nn.Dropout(p=0.25)
-
-    def forward_step(self, embedded, h_0, c_0, mode, features=None):
+    def forward_step(self, embedded, h_0, mode, features=None):
         """
+        Single GRU step with factored style matrices.
+
         Args:
             embedded: [batch_size, emb_dim] - current input embedding
             h_0: [batch_size, hidden_dim] - previous hidden state
-            c_0: [batch_size, hidden_dim] - previous cell state
             mode: str - "factual" or "romantic"
-            features: [batch_size, emb_dim] - visual features (required for factual mode)
+            features: [batch_size, emb_dim] - visual features (optional)
+
+        NOTE: No c_0 parameter — GRU has no cell state!
         """
-        # Transform input through V matrices
-        i = self.V_i(embedded)
-        f = self.V_f(embedded)
-        o = self.V_o(embedded)
-        c = self.V_c(embedded)
+        # Step 1: Transform input through V matrices (SAME pattern as LSTM)
+        z = self.V_z(embedded)
+        r = self.V_r(embedded)
+        n = self.V_n(embedded)
 
-        # ALL MODES get visual feature conditioning for image-aware generation
+        # Step 2: Visual feature conditioning (SAME pattern, 3 gates instead of 4)
         if features is not None:
-            # Base visual conditioning (applied to all modes)
-            visual_i = self.F_i(features)
-            visual_f = self.F_f(features)
-            visual_o = self.F_o(features)
-            visual_c = self.F_c(features)
-
-            # Feature dropout during training: randomly zero out visual signal
-            # so shared weights learn to work with AND without visual features.
-            # This is critical for romantic/humorous modes to properly compose
-            # style + vision at inference time.
-            if self.training:
-                visual_i = self.feature_dropout(visual_i)
-                visual_f = self.feature_dropout(visual_f)
-                visual_o = self.feature_dropout(visual_o)
-                visual_c = self.feature_dropout(visual_c)
+            visual_z = self.F_z(features)
+            visual_r = self.F_r(features)
+            visual_n = self.F_n(features)
         else:
-            # If no features provided, use zeros (for text-only training)
             batch_size = embedded.size(0)
-            visual_i = torch.zeros(batch_size, i.size(1), device=embedded.device)
-            visual_f = torch.zeros(batch_size, f.size(1), device=embedded.device)
-            visual_o = torch.zeros(batch_size, o.size(1), device=embedded.device)
-            visual_c = torch.zeros(batch_size, c.size(1), device=embedded.device)
+            visual_z = torch.zeros(batch_size, z.size(1), device=embedded.device)
+            visual_r = torch.zeros(batch_size, r.size(1), device=embedded.device)
+            visual_n = torch.zeros(batch_size, n.size(1), device=embedded.device)
 
-        # Apply style-specific transformations + visual conditioning
+        # Step 3: Apply style-specific transformations + visual conditioning
         if mode == "factual":
-            i = self.S_fi(i) + visual_i  # Factual style + visual info
-            f = self.S_ff(f) + visual_f
-            o = self.S_fo(o) + visual_o
-            c = self.S_fc(c) + visual_c
-            
+            z = self.S_fz(z) + visual_z
+            r = self.S_fr(r) + visual_r
+            n = self.S_fn(n) + visual_n
+
         elif mode == "romantic":
-            i = self.S_ri(i) + visual_i  # Romantic style + visual info
-            f = self.S_rf(f) + visual_f
-            o = self.S_ro(o) + visual_o
-            c = self.S_rc(c) + visual_c
-            
-        # elif mode == "humorous":
-        #     i = self.S_hi(i) + visual_i  # Humorous style + visual info
-        #     f = self.S_hf(f) + visual_f
-        #     o = self.S_ho(o) + visual_o
-        #     c = self.S_hc(c) + visual_c
+            z = self.S_rz(z) + visual_z
+            r = self.S_rr(r) + visual_r
+            n = self.S_rn(n) + visual_n
+
         else:
             sys.stderr.write("mode name wrong!\n")
             raise ValueError(f"Unknown mode: {mode}. Only 'factual' and 'romantic' supported.")
 
-        # Compute LSTM gates
-        i_t = torch.sigmoid(self.U_i(i) + self.W_i(h_0))
-        f_t = torch.sigmoid(self.U_f(f) + self.W_f(h_0))
-        o_t = torch.sigmoid(self.U_o(o) + self.W_o(h_0))
-        c_tilda = torch.tanh(self.U_c(c) + self.W_c(h_0))
+        # Step 4: Compute GRU gates
+        # Update gate: controls blend of old h vs new candidate
+        z_t = torch.sigmoid(self.U_z(z) + self.W_z(h_0))
 
-        # Update cell and hidden states
-        c_t = f_t * c_0 + i_t * c_tilda
-        h_t = o_t * torch.tanh(c_t)
+        # Reset gate: controls how much history to forget before computing candidate
+        r_t = torch.sigmoid(self.U_r(r) + self.W_r(h_0))
 
-        # Apply dropout regularization
+        # Candidate: new hidden state proposal
+        # KEY DIFFERENCE from LSTM: reset gate is applied to h_0 BEFORE computing candidate
+        n_t = torch.tanh(self.U_n(n) + self.W_n(r_t * h_0))
+
+        # Step 5: Update hidden state
+        # KEY DIFFERENCE from LSTM: no separate cell state, no output gate
+        # h_t = (1 - z_t) * h_0 + z_t * n_t
+        #        ↑ keep old          ↑ add new
+        h_t = (1 - z_t) * h_0 + z_t * n_t
+
+        # Apply dropout
         h_t = self.dropout(h_t)
 
         # Generate output logits
         outputs = self.C(h_t)
-        return outputs, h_t, c_t
+        return outputs, h_t
 
     def forward(self, captions, features=None, mode="factual"):
         """
+        Full sequence forward pass.
+
         Args:
+            captions: [batch, max_len] - caption token sequences
             features: [batch, emb_dim] - visual features from images
-            captions: [batch, max_len] - caption token sequences  
             mode: str - caption style ("factual", "romantic")
-        
-        Training Strategy:
-        - Factual mode: Use image+caption pairs (features provided)
-        - Romantic: Use style text only (features=None for language modeling)
-        
-        Inference Strategy:
-        - ALL modes: Use image features (features provided) for visual conditioning
+
+        NOTE: Returns 2 values from forward_step (outputs, h_t) instead of
+              3 (outputs, h_t, c_t) — GRU has no cell state.
         """
         batch_size = captions.size(0)
         embedded = self.B(captions)  # [batch, max_len, emb_dim]
-        
-        # For factual training: use features as first timestep (image+caption pairs)
-        # For style training: no features concatenation (text-only language modeling)
+
+        # Factual: features prepended as first timestep (SAME as LSTM)
         if mode == "factual" and features is not None:
             embedded = torch.cat((features.unsqueeze(1), embedded), 1)
 
-        # Initialize hidden/cell state
-        device = captions.device
-        h_t = torch.zeros(batch_size, self.hidden_dim, device=device)
-        c_t = torch.zeros(batch_size, self.hidden_dim, device=device)
-        nn.init.uniform_(h_t, -0.1, 0.1)
-        nn.init.uniform_(c_t, -0.1, 0.1)
+        # Initialize hidden state ONLY (no cell state needed!)
+        h_t = Variable(torch.Tensor(batch_size, self.hidden_dim))
+        nn.init.uniform_(h_t)
+        if torch.cuda.is_available():
+            h_t = h_t.cuda()
 
         all_outputs = []
         for ix in range(embedded.size(1) - 1):
             emb = embedded[:, ix, :]
-            # Pass features for visual conditioning in ALL modes during inference
-            # During training: factual gets features, romantic/humorous get None
-            outputs, h_t, c_t = self.forward_step(emb, h_t, c_t, mode=mode, features=features)
+            outputs, h_t = self.forward_step(emb, h_t, mode=mode, features=features)
             all_outputs.append(outputs)
         all_outputs = torch.stack(all_outputs, 1)
         return all_outputs
 
-    def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual"):
+    def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual", repetition_penalty=1.3):
         """
-        Generate captions from feature vectors with beam search
+        Generate captions with beam search.
+
         Args:
             feature: [1, emb_dim] - visual features for an image
-            beam_size: int - beam size for beam search
-            max_len: int - max sampling length
-            mode: str - caption style ("factual", "romantic", "humorous")
-        
-        NOTE: ALL modes use visual features during inference for image-conditioned generation
+            beam_size: int - beam width
+            max_len: int - max generation length
+            mode: str - "factual" or "romantic"
+            repetition_penalty: float - penalty for repeating tokens (1.0 = off)
+
+        NOTE: Only h_t is tracked per beam candidate (no c_t).
         """
         with torch.no_grad():
             device = feature.device
 
-            # Initialize hidden state (EXACT original)
-            h_t = torch.zeros(1, self.hidden_dim, device=device)
-            c_t = torch.zeros(1, self.hidden_dim, device=device)
-            nn.init.uniform_(h_t, -0.1, 0.1)
-            nn.init.uniform_(c_t, -0.1, 0.1)
+            # Initialize hidden state ONLY (no cell state)
+            h_t = torch.Tensor(1, self.hidden_dim)
+            torch.nn.init.uniform_(h_t)
+            h_t = h_t.to(device)
 
-            # Forward 1 step with image feature (ALL modes get visual conditioning during inference)
-            _, h_t, c_t = self.forward_step(feature, h_t, c_t, mode=mode, features=feature)
+            # Forward 1 step with image feature
+            _, h_t = self.forward_step(feature, h_t, mode=mode, features=feature)
 
-            # Use tokenizer's special tokens
             start_id = tokenizer.bos_token_id
             end_id = tokenizer.eos_token_id
 
-            # Initialize beam (EXACT original structure)
-            symbol_id = torch.tensor([start_id], device=device)  # shape [1], matches subsequent beam steps
-            candidates = [[0.0, symbol_id, h_t, c_t, [start_id]]]
+            # Initialize beam — NOTE: no c_t in the tuple!
+            symbol_id = torch.tensor([start_id], device=device)
+            candidates = [[0.0, symbol_id, h_t, [start_id]]]
 
-            # Beam search (EXACT original logic)
             t = 0
             while t < max_len - 1:
                 t += 1
                 tmp_candidates = []
                 end_flag = True
 
-                for score, last_id, h_t, c_t, id_seq in candidates:
-                    # Skip finished sequences
+                for score, last_id, h_t, id_seq in candidates:
                     if id_seq[-1] == end_id:
-                        tmp_candidates.append([score, last_id, h_t, c_t, id_seq])
+                        tmp_candidates.append([score, last_id, h_t, id_seq])
                         continue
 
                     end_flag = False
                     emb = self.B(last_id)
-                    # ALL modes get visual conditioning during inference
-                    output, h_t, c_t = self.forward_step(
-                        emb, h_t, c_t, mode=mode, features=feature
+                    output, h_t = self.forward_step(
+                        emb, h_t, mode=mode, features=feature
                     )
                     output = output.squeeze(0).squeeze(0)
 
-                    # Log softmax + sort (EXACT original)
+                    # Repetition penalty
+                    if repetition_penalty != 1.0 and len(id_seq) > 1:
+                        for prev_token_id in set(id_seq):
+                            if output[prev_token_id] < 0:
+                                output[prev_token_id] *= repetition_penalty
+                            else:
+                                output[prev_token_id] /= repetition_penalty
+
                     output = torch.log_softmax(output, dim=-1)
                     output, indices = torch.sort(output, descending=True)
                     output = output[:beam_size]
                     indices = indices[:beam_size]
 
-                    # Create new candidates (EXACT original)
                     for score_val, wid in zip(output, indices):
                         new_score = score + score_val.item()
                         new_id_seq = id_seq + [int(wid.item())]
                         tmp_candidates.append([
                             new_score,
-                            wid.unsqueeze(0),  # Keep as tensor [1,1]
+                            wid.unsqueeze(0),
                             h_t,
-                            c_t,
                             new_id_seq
                         ])
 
-                # Break if all candidates finished (EXACT original)
                 if end_flag:
                     break
 
-                # Sort by normalized log probability (EXACT original)
                 candidates = sorted(
                     tmp_candidates,
-                    key=lambda x: x[0] / len(x[4]),  # Normalized score
+                    key=lambda x: x[0] / len(x[3]),
                     reverse=True
                 )[:beam_size]
 
-            # Return best sequence (EXACT original)
-            return candidates[0][4]
-
-
-
+            return candidates[0][3]
