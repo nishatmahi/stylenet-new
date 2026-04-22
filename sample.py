@@ -1,8 +1,9 @@
 import os
+import sys
+import json
 import torch
 from PIL import Image
 from torchvision import transforms
-from transformers import AutoTokenizer
 from config import config
 from models import EncoderViT, FactoredGRU
 from data_loader import Rescale
@@ -23,8 +24,28 @@ def load_sample_images(img_dir, transform):
     return img_names, img_list
 
 
-# ---- Setup ----
-tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/stylenet/tokenizer-extended", trust_remote_code=True, local_files_only=True)
+# ---- Setup: Load tokenizer directly (bypasses HF Hub) ----
+_TOK_DIR = "/kaggle/working/stylenet/tokenizer-extended"
+sys.path.insert(0, _TOK_DIR)
+from tokenization_bn import BNTokenizer
+
+_vocab_file = os.path.join(_TOK_DIR, "tokenizer.model")
+_tok_config_file = os.path.join(_TOK_DIR, "tokenizer_config.json")
+with open(_tok_config_file, "r", encoding="utf-8") as f:
+    _tok_config = json.load(f)
+tokenizer = BNTokenizer(
+    vocab_file=_vocab_file,
+    bos_token=_tok_config.get("bos_token", "<s>"),
+    eos_token=_tok_config.get("eos_token", "</s>"),
+    unk_token=_tok_config.get("unk_token", "<unk>"),
+    pad_token=_tok_config.get("pad_token", "<unk>"),
+)
+_added_tokens_file = os.path.join(_TOK_DIR, "added_tokens.json")
+if os.path.exists(_added_tokens_file):
+    with open(_added_tokens_file, "r", encoding="utf-8") as f:
+        _added_tokens = json.load(f)
+    if _added_tokens:
+        tokenizer.add_tokens(list(_added_tokens.keys()))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
