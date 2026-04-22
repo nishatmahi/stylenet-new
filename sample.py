@@ -57,9 +57,8 @@ with torch.no_grad():
 
     # ---- First token analysis ----
     h0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
-    c0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
-    # FIXED: Pass features= kwarg so visual gates are applied
-    first_output, _, _ = decoder.forward_step(features, h0, c0, mode="factual", features=features)
+    # GRU forward_step: no cell state, returns (output, h_t)
+    first_output, _ = decoder.forward_step(features, h0, mode="factual", features=features)
     first_output = first_output.squeeze(0)  # [vocab_size]
     top_tokens = torch.topk(first_output, 5).indices.tolist()
     print("Top 5 first tokens:", tokenizer.convert_ids_to_tokens(top_tokens))
