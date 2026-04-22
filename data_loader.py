@@ -7,7 +7,7 @@ from torchvision import transforms
 from transformers import AutoTokenizer
 
 # ---- HuggingFace Bangla Tokenizer ----
-tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/tokenizer-extended", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/stylenet/tokenizer-extended", trust_remote_code=True)
 
 class Rescale:
     '''Rescale the image to a given size'''
@@ -31,8 +31,7 @@ class Rescale:
 image_transform = transforms.Compose([
     Rescale((224, 224)),
     transforms.ToTensor(),
-    # ImageNet normalization — matches ViT-base-patch16-224 pretraining
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
 ])
 
 def find_image_with_any_ext(img_folder, img_id):
