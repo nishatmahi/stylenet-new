@@ -24,7 +24,7 @@ def load_sample_images(img_dir, transform):
 
 
 # ---- Setup ----
-tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/stylenet/tokenizer-extended", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/tokenizer-extended", trust_remote_code=True)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
