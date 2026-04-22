@@ -7,7 +7,7 @@ from torchvision import transforms
 from transformers import AutoTokenizer
 
 # ---- HuggingFace Bangla Tokenizer ----
-tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/stylenet/tokenizer-extended", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/tokenizer-extended", trust_remote_code=True)
 
 class Rescale:
     '''Rescale the image to a given size'''
@@ -179,10 +179,10 @@ def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=
 
 # ==== Test/debug block ====
 if __name__ == "__main__":
-    img_dir = "/kaggle/input/dataset/data/Flicker8k_Dataset"
-    factual_file = "/kaggle/input/dataset/data/factual_train.txt"
+    img_dir = "/kaggle/input/dataset/data/Images"
+    factual_file = "/kaggle/input/dataset/data/factual_caption.txt"
     # humorous_file = "/kaggle/input/dataset/data/humorous_train.txt"
-    romantic_file = "/kaggle/input/dataset/data/romantic_train.txt"
+    romantic_file = "/kaggle/input/dataset/data/romantic_data.txt"
 
     data_loader = get_data_loader(img_dir, factual_file, batch_size=3)
     for i, (images, input_ids, lengths) in enumerate(data_loader):
