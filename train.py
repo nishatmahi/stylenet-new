@@ -2,6 +2,7 @@ import os
 import argparse
 import torch
 import random
+from torch.cuda.amp import autocast, GradScaler
 from data_loader import get_data_loader, get_styled_data_loader, tokenizer
 from models import EncoderViT, FactoredGRU
 from loss import masked_cross_entropy
@@ -64,7 +65,7 @@ def create_data_splits(args):
         'romantic_val': romantic_val if os.path.exists(romantic_val) else None
     }
 
-def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device):
+def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device, use_amp=False):
     """
     Run validation for one epoch.
     Early stopping and best model saving are based on factual loss only.
@@ -84,10 +85,11 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, d
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
 
-                features = encoder(images)
-                outputs = decoder(captions, features, mode="factual")
-                loss = criterion(outputs[:, 1:, :].contiguous(),
-                               captions[:, 1:].contiguous(), lengths - 1)
+                with autocast(enabled=use_amp):
+                    features = encoder(images)
+                    outputs = decoder(captions, features, mode="factual")
+                    loss = criterion(outputs[:, 1:, :].contiguous(),
+                                   captions[:, 1:].contiguous(), lengths - 1)
 
                 factual_loss += loss.item() * captions.size(0)
                 factual_samples += captions.size(0)
@@ -105,8 +107,9 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, d
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
 
-                outputs = decoder(captions, mode='romantic')
-                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+                with autocast(enabled=use_amp):
+                    outputs = decoder(captions, mode='romantic')
+                    loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
 
                 romantic_loss += loss.item() * captions.size(0)
                 romantic_samples += captions.size(0)
@@ -130,6 +133,14 @@ def eval_outputs(outputs, tokenizer):
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+
+    # Enable cuDNN auto-tuner for faster convolution/matmul kernels
+    torch.backends.cudnn.benchmark = True
+
+    # Mixed precision scaler — big speedup on T4/P100/V100 GPUs
+    use_amp = device.type == 'cuda'
+    scaler = GradScaler(enabled=use_amp)
+    print(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled (CPU)'}")
 
     permanent_save_folder = "stylenet_gru_models/"
     os.makedirs(permanent_save_folder, exist_ok=True)
@@ -169,7 +180,7 @@ def main(args):
     cap_params = list(decoder.parameters()) + list(encoder.A.parameters())
     lang_params = [
         p for name, p in decoder.named_parameters()
-        if not any(x in name for x in ['S_fi', 'S_ff', 'S_fo', 'S_fc'])
+        if not any(x in name for x in ['S_fz', 'S_fr', 'S_fn'])
     ]
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
@@ -239,15 +250,17 @@ def main(args):
             captions = captions.long().to(device)
             lengths = lengths.to(device)
 
-            decoder.zero_grad()
-            encoder.zero_grad()
-            features = encoder(images)
-            outputs = decoder(captions, features, mode="factual")
-            loss = criterion(outputs[:, 1:, :].contiguous(),
-                             captions[:, 1:].contiguous(), lengths - 1)
-            loss.backward()
+            optimizer_cap.zero_grad(set_to_none=True)
+            with autocast(enabled=use_amp):
+                features = encoder(images)
+                outputs = decoder(captions, features, mode="factual")
+                loss = criterion(outputs[:, 1:, :].contiguous(),
+                                 captions[:, 1:].contiguous(), lengths - 1)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer_cap)
             torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
-            optimizer_cap.step()
+            scaler.step(optimizer_cap)
+            scaler.update()
             
             epoch_train_loss += loss.item() * captions.size(0)
             train_samples += captions.size(0)
@@ -264,12 +277,15 @@ def main(args):
             for i, (captions, lengths) in enumerate(train_styled_loader):
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
-                decoder.zero_grad()
-                outputs = decoder(captions, mode='romantic')
-                loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
-                loss.backward()
+                optimizer_lang.zero_grad(set_to_none=True)
+                with autocast(enabled=use_amp):
+                    outputs = decoder(captions, mode='romantic')
+                    loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer_lang)
                 torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-                optimizer_lang.step()
+                scaler.step(optimizer_lang)
+                scaler.update()
                 
                 epoch_train_loss += loss.item() * captions.size(0)
                 train_samples += captions.size(0)
@@ -283,7 +299,7 @@ def main(args):
 
         # Validation phase
         print(f"[EPOCH {epoch+1}] Running validation...")
-        val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device)
+        val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device, use_amp=use_amp)
         print(f"[EPOCH {epoch+1}] Factual Validation Loss (early stopping): {val_loss:.4f}")
 
         # Early stopping logic — based on factual validation loss only
