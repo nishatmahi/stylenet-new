@@ -24,7 +24,7 @@ def load_sample_images(img_dir, transform):
 
 
 # ---- Setup ----
-tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/tokenizer-extended", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/stylenet/tokenizer-extended", trust_remote_code=True)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -56,21 +56,13 @@ with torch.no_grad():
     print("Image features shape:", features.shape)
     print("First 10 feature values:", features[0, :10].cpu().numpy())
 
-    # ---- First token analysis ----
-    h0 = torch.empty(1, decoder.hidden_dim).uniform_().to(device)
-    # GRU forward_step: no cell state, returns (output, h_t)
-    first_output, _ = decoder.forward_step(features, h0, mode="factual", features=features)
-    first_output = first_output.squeeze(0)  # [vocab_size]
-    top_tokens = torch.topk(first_output, 5).indices.tolist()
-    print("Top 5 first tokens:", tokenizer.convert_ids_to_tokens(top_tokens))
-
     # ---- Caption generation ----
     output = decoder.sample(
         features,
         tokenizer=tokenizer,
         beam_size=5,
         max_len=30,
-        mode="factual"
+        mode="romantic"
     )
     caption = tokenizer.decode(output, skip_special_tokens=True)
     print(img_names[idx], "| Predicted Caption:", caption)
