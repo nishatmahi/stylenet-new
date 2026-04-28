@@ -136,9 +136,10 @@ class FactoredGRU(nn.Module):
             n = self.S_fn(n) + visual_n
 
         elif mode == "romantic":
-            z = self.S_rz(z) + visual_z
-            r = self.S_rr(r) + visual_r
-            n = self.S_rn(n) + visual_n
+            # Romantic mode: PURE style transformation, no visual injection
+            z = self.S_rz(z)
+            r = self.S_rr(r)
+            n = self.S_rn(n)
 
         else:
             sys.stderr.write("mode name wrong!\n")
