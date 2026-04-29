@@ -62,7 +62,7 @@ with torch.no_grad():
         tokenizer=tokenizer,
         beam_size=5,
         max_len=30,
-        mode="factual"
+        mode="romantic"
     )
     caption = tokenizer.decode(output, skip_special_tokens=True)
     print(img_names[idx], "| Predicted Caption:", caption)
