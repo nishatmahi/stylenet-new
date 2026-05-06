@@ -101,6 +101,12 @@ class FactoredGRU(nn.Module):
         # Dropout (SAME as LSTM)
         self.dropout = nn.Dropout(p=0.5)
 
+        # NEW: Learnable weight for romantic visual injection
+        # Initialized small (0.2) to gently guide romantic captions without overwhelming the style
+        # During training this doesn't matter (features=None → visual_* are zeros)
+        # During inference this adds gentle visual grounding to romantic style
+        self.romantic_visual_weight = nn.Parameter(torch.tensor(0.2))
+
     def forward_step(self, embedded, h_0, mode, features=None):
         """
         Single GRU step with factored style matrices.
@@ -136,10 +142,12 @@ class FactoredGRU(nn.Module):
             n = self.S_fn(n) + visual_n
 
         elif mode == "romantic":
-            # Romantic mode: PURE style transformation, no visual injection
-            z = self.S_rz(z)
-            r = self.S_rr(r)
-            n = self.S_rn(n)
+            # Romantic mode: Style transformation + WEIGHTED visual injection
+            # Clamp weight to [0, 1] to keep it in valid range
+            w = self.romantic_visual_weight.clamp(0.0, 1.0)
+            z = self.S_rz(z) + w * visual_z  # Gentle visual guidance
+            r = self.S_rr(r) + w * visual_r
+            n = self.S_rn(n) + w * visual_n
 
         else:
             sys.stderr.write("mode name wrong!\n")
