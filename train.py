@@ -43,16 +43,13 @@ def create_data_splits(args):
     """
     Create train/val splits for all data files
     """
-    # Create split directories
     train_dir = '/kaggle/working/train_split'
     val_dir = '/kaggle/working/val_split'
     
-    # Split factual captions
     factual_train = os.path.join(train_dir, 'factual_train.txt')
     factual_val = os.path.join(val_dir, 'factual_val.txt')
     split_caption_file(args.factual_caption_path, factual_train, factual_val)
     
-    # Split romantic captions
     romantic_train = os.path.join(train_dir, 'romantic_train.txt')
     romantic_val = os.path.join(val_dir, 'romantic_val.txt')
     if args.romantic_caption_path and os.path.exists(args.romantic_caption_path):
@@ -75,10 +72,9 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, d
     decoder.eval()
 
     factual_loss = 0.0
-    factual_samples = 0
+    factual_steps = 0
 
     with torch.no_grad():
-        # Validate factual captions
         if val_loader:
             for images, captions, lengths in val_loader:
                 images = images.to(device)
@@ -91,17 +87,16 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, d
                     loss = criterion(outputs[:, 1:, :].contiguous(),
                                    captions[:, 1:].contiguous(), lengths - 1)
 
-                factual_loss += loss.item() * captions.size(0)
-                factual_samples += captions.size(0)
+                factual_loss += loss.item()
+                factual_steps += 1
 
-            if factual_samples > 0:
-                factual_loss /= factual_samples
+            if factual_steps > 0:
+                factual_loss /= factual_steps
                 print(f"Validation Factual Loss: {factual_loss:.4f}")
 
-        # Validate romantic captions — printed for monitoring only, not used for early stopping
         if val_styled_loader:
             romantic_loss = 0.0
-            romantic_samples = 0
+            romantic_steps = 0
 
             for captions, lengths in val_styled_loader:
                 captions = captions.long().to(device)
@@ -111,21 +106,20 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, d
                     outputs = decoder(captions, mode='romantic')
                     loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
 
-                romantic_loss += loss.item() * captions.size(0)
-                romantic_samples += captions.size(0)
+                romantic_loss += loss.item()
+                romantic_steps += 1
 
-            if romantic_samples > 0:
-                romantic_loss /= romantic_samples
+            if romantic_steps > 0:
+                romantic_loss /= romantic_steps
                 print(f"Validation Romantic Loss (monitor only): {romantic_loss:.4f}")
 
-    # Only return factual loss — drives early stopping and best model saving
-    return factual_loss if factual_samples > 0 else float('inf')
+    return factual_loss if factual_steps > 0 else float('inf')
 
 def eval_outputs(outputs, tokenizer):
     indices = torch.topk(outputs, 1)[1]
     indices = indices.squeeze(2)
     indices = indices.data.cpu().numpy()
-    for i in range(min(3, len(indices))):  # Show max 3 examples
+    for i in range(min(3, len(indices))):
         tokens = tokenizer.convert_ids_to_tokens(indices[i])
         text = tokenizer.convert_tokens_to_string(tokens)
         print(f"Generated {i+1}: {text}")
@@ -134,10 +128,8 @@ def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Enable cuDNN auto-tuner for faster convolution/matmul kernels
     torch.backends.cudnn.benchmark = True
 
-    # Mixed precision scaler — big speedup on T4/P100/V100 GPUs
     use_amp = device.type == 'cuda'
     scaler = GradScaler(enabled=use_amp)
     print(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled (CPU)'}")
@@ -146,11 +138,9 @@ def main(args):
     os.makedirs(permanent_save_folder, exist_ok=True)
     os.makedirs(args.model_path, exist_ok=True)
 
-    # Create data splits
     print("Creating train/validation splits...")
     split_paths = create_data_splits(args)
     
-    # Training data loaders
     train_loader = get_data_loader(
         args.img_path, split_paths['factual_train'], 
         batch_size=args.caption_batch_size, shuffle=True)
@@ -159,7 +149,6 @@ def main(args):
         split_paths['romantic_train'], batch_size=args.language_batch_size, 
         shuffle=True) if split_paths['romantic_train'] else None
 
-    # Validation data loaders
     val_loader = get_data_loader(
         args.img_path, split_paths['factual_val'], 
         batch_size=args.caption_batch_size, shuffle=False) if split_paths['factual_val'] else None
@@ -171,11 +160,9 @@ def main(args):
     print(f"Train batches: Factual={len(train_loader)}, Romantic={len(train_styled_loader) if train_styled_loader else 0}")
     print(f"Val batches: Factual={len(val_loader) if val_loader else 0}, Romantic={len(val_styled_loader) if val_styled_loader else 0}")
 
-    # Models
     encoder = EncoderViT(args.emb_dim).to(device)
     decoder = FactoredGRU(args.emb_dim, args.hidden_dim, args.factored_dim, len(tokenizer)).to(device)
 
-    # Optimizer, loss
     criterion = masked_cross_entropy
     cap_params = list(decoder.parameters()) + list(encoder.A.parameters())
     lang_params = [
@@ -185,7 +172,6 @@ def main(args):
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
-    # Checkpoint loading
     start_epoch = 0
     best_val_loss = float('inf')
     patience_counter = 0
@@ -233,18 +219,18 @@ def main(args):
     print(f"[DEBUG] Final start_epoch = {start_epoch}")
     print("=============================")
 
-    # Training loop with validation and early stopping
     for epoch in range(start_epoch, args.epoch_num):
         print(f"\n[DEBUG] Training epoch {epoch+1} of {args.epoch_num}")
         
-        # Training phase
         encoder.train()
         decoder.train()
         
-        epoch_train_loss = 0.0
-        train_samples = 0
+        factual_loss_sum = 0.0
+        factual_steps = 0
+        romantic_loss_sum = 0.0
+        romantic_steps = 0
         
-        # Train on factual captions (image+caption pairs)
+        # Train factual
         for i, (images, captions, lengths) in enumerate(train_loader):
             images = images.to(device)
             captions = captions.long().to(device)
@@ -262,17 +248,16 @@ def main(args):
             scaler.step(optimizer_cap)
             scaler.update()
             
-            epoch_train_loss += loss.item() * captions.size(0)
-            train_samples += captions.size(0)
+            factual_loss_sum += loss.item()
+            factual_steps += 1
 
             if i % args.log_step_caption == 0 or i == len(train_loader)-1:
                 print(f"Epoch [{epoch+1}/{args.epoch_num}], CAP, Step [{i}/{len(train_loader)}], Loss: {loss.item():.4f}")
         
-        # Show some example outputs
         if len(train_loader) > 0:
             eval_outputs(outputs, tokenizer)
 
-        # Train on romantic captions (text-only)
+        # Train romantic
         if train_styled_loader:
             for i, (captions, lengths) in enumerate(train_styled_loader):
                 captions = captions.long().to(device)
@@ -287,27 +272,27 @@ def main(args):
                 scaler.step(optimizer_lang)
                 scaler.update()
                 
-                epoch_train_loss += loss.item() * captions.size(0)
-                train_samples += captions.size(0)
+                romantic_loss_sum += loss.item()
+                romantic_steps += 1
 
                 if i % args.log_step_language == 0 or i == len(train_styled_loader)-1:
                     print(f"Epoch [{epoch+1}/{args.epoch_num}], ROM, Step [{i}/{len(train_styled_loader)}], Loss: {loss.item():.4f}")
 
-        # Calculate average training loss
-        avg_train_loss = epoch_train_loss / train_samples if train_samples > 0 else 0.0
-        print(f"\n[EPOCH {epoch+1}] Average Training Loss: {avg_train_loss:.4f}")
+        # Print separate averages
+        avg_factual_loss = factual_loss_sum / factual_steps if factual_steps > 0 else 0.0
+        avg_romantic_loss = romantic_loss_sum / romantic_steps if romantic_steps > 0 else 0.0
+        print(f"\n[EPOCH {epoch+1}] Factual Training Loss:  {avg_factual_loss:.4f}")
+        print(f"[EPOCH {epoch+1}] Romantic Training Loss: {avg_romantic_loss:.4f}")
 
-        # Validation phase
+        # Validation
         print(f"[EPOCH {epoch+1}] Running validation...")
         val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device, use_amp=use_amp)
         print(f"[EPOCH {epoch+1}] Factual Validation Loss (early stopping): {val_loss:.4f}")
 
-        # Early stopping logic — based on factual validation loss only
+        # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            
-            # Save best model
             torch.save({
                 'epoch': epoch,
                 'encoder_state_dict': encoder.state_dict(),
@@ -315,22 +300,21 @@ def main(args):
                 'optimizer_cap_state_dict': optimizer_cap.state_dict(),
                 'optimizer_lang_state_dict': optimizer_lang.state_dict(),
                 'best_val_loss': best_val_loss,
-                'train_loss': avg_train_loss,
+                'factual_train_loss': avg_factual_loss,
+                'romantic_train_loss': avg_romantic_loss,
                 'val_loss': val_loss,
                 'patience_counter': patience_counter,
             }, best_model_path)
             print(f"[EPOCH {epoch+1}] New best model saved! Factual val loss: {val_loss:.4f}")
-            
         else:
             patience_counter += 1
             print(f"[EPOCH {epoch+1}] No improvement. Patience: {patience_counter}/{args.patience}")
-            
             if patience_counter >= args.patience:
                 print(f"[EARLY STOPPING] No improvement for {args.patience} epochs. Stopping training.")
                 print(f"Best factual validation loss was: {best_val_loss:.4f}")
                 break
 
-        # Save regular checkpoint
+        # Save checkpoint
         torch.save(decoder.state_dict(), os.path.join(permanent_save_folder, 'decoder-last.pkl'))
         torch.save(encoder.state_dict(), os.path.join(permanent_save_folder, 'encoder-last.pkl'))
         torch.save(decoder.state_dict(), os.path.join(args.model_path, 'decoder-last.pkl'))
@@ -342,14 +326,14 @@ def main(args):
             'optimizer_cap_state_dict': optimizer_cap.state_dict(),
             'optimizer_lang_state_dict': optimizer_lang.state_dict(),
             'best_val_loss': best_val_loss,
-            'train_loss': avg_train_loss,
+            'factual_train_loss': avg_factual_loss,
+            'romantic_train_loss': avg_romantic_loss,
             'val_loss': val_loss,
             'patience_counter': patience_counter,
         }, checkpoint_path)
         
         print(f"[EPOCH {epoch+1}] Checkpoint saved. Files in folder: {os.listdir(permanent_save_folder)}")
 
-    # Load best model for final evaluation
     if os.path.exists(best_model_path):
         print(f"\nTraining completed. Loading best model (factual val loss: {best_val_loss:.4f}) for final evaluation...")
         best_checkpoint = torch.load(best_model_path, map_location=device)
@@ -383,7 +367,7 @@ if __name__ == '__main__':
                         help='size of factored matrix')
     parser.add_argument('--lr_caption', type=float, default=0.00002,
                         help='learning rate for caption model training')
-    parser.add_argument('--lr_language', type=float, default=0.00005,
+    parser.add_argument('--lr_language', type=float, default=0.00002,
                         help='learning rate for language model training')
     parser.add_argument('--epoch_num', type=int, default=80,
                         help='number of epochs to train')
