@@ -238,8 +238,10 @@ def main(args):
         encoder.train()
         decoder.train()
         
-        epoch_train_loss = 0.0
-        train_samples = 0
+        factual_train_loss = 0.0
+        factual_train_samples = 0
+        romantic_train_loss = 0.0
+        romantic_train_samples = 0
         
         # Train on factual captions (image+caption pairs)
         for i, (images, captions, lengths) in enumerate(train_loader):
@@ -259,8 +261,8 @@ def main(args):
             scaler.step(optimizer_cap)
             scaler.update()
             
-            epoch_train_loss += loss.item() * captions.size(0)
-            train_samples += captions.size(0)
+            factual_train_loss += loss.item() * captions.size(0)
+            factual_train_samples += captions.size(0)
 
             if i % args.log_step_caption == 0 or i == len(train_loader)-1:
                 print(f"Epoch [{epoch+1}/{args.epoch_num}], CAP, Step [{i}/{len(train_loader)}], Loss: {loss.item():.4f}")
@@ -284,15 +286,17 @@ def main(args):
                 scaler.step(optimizer_lang)
                 scaler.update()
                 
-                epoch_train_loss += loss.item() * captions.size(0)
-                train_samples += captions.size(0)
+                romantic_train_loss += loss.item() * captions.size(0)
+                romantic_train_samples += captions.size(0)
 
                 if i % args.log_step_language == 0 or i == len(train_styled_loader)-1:
                     print(f"Epoch [{epoch+1}/{args.epoch_num}], ROM, Step [{i}/{len(train_styled_loader)}], Loss: {loss.item():.4f}")
 
-        # Calculate average training loss
-        avg_train_loss = epoch_train_loss / train_samples if train_samples > 0 else 0.0
-        print(f"\n[EPOCH {epoch+1}] Average Training Loss: {avg_train_loss:.4f}")
+        # Print separate training losses
+        avg_factual_loss = factual_train_loss / factual_train_samples if factual_train_samples > 0 else 0.0
+        avg_romantic_loss = romantic_train_loss / romantic_train_samples if romantic_train_samples > 0 else 0.0
+        print(f"\n[EPOCH {epoch+1}] Factual Training Loss:  {avg_factual_loss:.4f}")
+        print(f"[EPOCH {epoch+1}] Romantic Training Loss: {avg_romantic_loss:.4f}")
 
         # Validation phase
         print(f"[EPOCH {epoch+1}] Running validation...")
@@ -312,7 +316,8 @@ def main(args):
                 'optimizer_cap_state_dict': optimizer_cap.state_dict(),
                 'optimizer_lang_state_dict': optimizer_lang.state_dict(),
                 'best_val_loss': best_val_loss,
-                'train_loss': avg_train_loss,
+                'factual_train_loss': avg_factual_loss,
+                'romantic_train_loss': avg_romantic_loss,
                 'val_loss': val_loss,
                 'patience_counter': patience_counter,
             }, best_model_path)
@@ -339,7 +344,8 @@ def main(args):
             'optimizer_cap_state_dict': optimizer_cap.state_dict(),
             'optimizer_lang_state_dict': optimizer_lang.state_dict(),
             'best_val_loss': best_val_loss,
-            'train_loss': avg_train_loss,
+            'factual_train_loss': avg_factual_loss,
+            'romantic_train_loss': avg_romantic_loss,
             'val_loss': val_loss,
             'patience_counter': patience_counter,
         }, checkpoint_path)
