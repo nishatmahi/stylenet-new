@@ -101,12 +101,6 @@ class FactoredGRU(nn.Module):
         # Dropout (SAME as LSTM)
         self.dropout = nn.Dropout(p=0.5)
 
-        # NEW: Learnable weight for romantic visual injection
-        # Initialized small (0.2) to gently guide romantic captions without overwhelming the style
-        # During training this doesn't matter (features=None → visual_* are zeros)
-        # During inference this adds gentle visual grounding to romantic style
-        self.romantic_visual_weight = nn.Parameter(torch.tensor(0.2))
-
     def forward_step(self, embedded, h_0, mode, features=None):
         """
         Single GRU step with factored style matrices.
@@ -142,12 +136,13 @@ class FactoredGRU(nn.Module):
             n = self.S_fn(n) + visual_n
 
         elif mode == "romantic":
-            # Romantic mode: Style transformation + WEIGHTED visual injection
-            # Clamp weight to [0, 1] to keep it in valid range
-            w = self.romantic_visual_weight.clamp(0.0, 1.0)
-            z = self.S_rz(z) + w * visual_z  # Gentle visual guidance
-            r = self.S_rr(r) + w * visual_r
-            n = self.S_rn(n) + w * visual_n
+            # Scale down visual features so romantic style isn't overwhelmed
+            # by image signal (which would produce factual-sounding captions).
+            # 0.2 = gentle visual grounding; adjust if romantic is still too
+            # factual (lower) or too disconnected from image (higher).
+            z = self.S_rz(z) + 0.3 * visual_z
+            r = self.S_rr(r) + 0.3 * visual_r
+            n = self.S_rn(n) + 0.3 * visual_n
 
         else:
             sys.stderr.write("mode name wrong!\n")
@@ -222,6 +217,11 @@ class FactoredGRU(nn.Module):
             repetition_penalty: float - penalty for repeating tokens (1.0 = off)
 
         NOTE: Only h_t is tracked per beam candidate (no c_t).
+
+        StyleNet design: Visual features are ALWAYS passed regardless of mode.
+        - Shared params (U, V, W) + F gates learned visual grounding during factual training.
+        - Romantic style matrices (S_rz, S_rr, S_rn) learned romantic style from text-only training.
+        - At inference: shared visual grounding + romantic style → romantic caption of the image.
         """
         with torch.no_grad():
             device = feature.device
