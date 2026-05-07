@@ -105,7 +105,7 @@ class FactoredGRU(nn.Module):
         # Initialized small (0.2) to gently guide romantic captions without overwhelming the style
         # During training this doesn't matter (features=None → visual_* are zeros)
         # During inference this adds gentle visual grounding to romantic style
-        self.romantic_visual_weight = nn.Parameter(torch.tensor(0.5))
+        self.romantic_visual_weight = nn.Parameter(torch.tensor(0.2))
 
     def forward_step(self, embedded, h_0, mode, features=None):
         """
