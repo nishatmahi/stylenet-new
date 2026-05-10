@@ -50,7 +50,7 @@ img_names, img_list = load_sample_images(config.simg_path, transform)
 
 # ---- No ground-truth section from here ----
 with torch.no_grad():
-    idx = 1  # whichever image you want
+    idx = 0  # whichever image you want
     image = img_list[idx].unsqueeze(0).to(device)
     features = encoder(image)
     print("Image features shape:", features.shape)
@@ -62,7 +62,7 @@ with torch.no_grad():
         tokenizer=tokenizer,
         beam_size=5,
         max_len=30,
-        mode="factual"
+        mode="romantic"
     )
     caption = tokenizer.decode(output, skip_special_tokens=True)
     print(img_names[idx], "| Predicted Caption:", caption)
