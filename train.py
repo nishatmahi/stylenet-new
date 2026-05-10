@@ -137,10 +137,10 @@ def main(args):
     # Enable cuDNN auto-tuner for faster convolution/matmul kernels
     torch.backends.cudnn.benchmark = True
 
-    # Mixed precision scaler — big speedup on T4/P100/V100 GPUs
-    use_amp = device.type == 'cuda'
+    # DISABLED mixed precision for numerical stability
+    use_amp = False  # Changed from: device.type == 'cuda'
     scaler = GradScaler(enabled=use_amp)
-    print(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled (CPU)'}")
+    print(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled for stability'}")
 
     permanent_save_folder = "stylenet_gru_models/"
     os.makedirs(permanent_save_folder, exist_ok=True)
@@ -255,6 +255,17 @@ def main(args):
                 outputs = decoder(captions, features, mode="factual")
                 loss = criterion(outputs[:, 1:, :].contiguous(),
                                  captions[:, 1:].contiguous(), lengths - 1)
+            
+            # ============ NaN DETECTION AND SAFETY CHECK ============
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n!!! NaN/Inf detected at epoch {epoch+1}, step {i}/{len(train_loader)}")
+                print(f"Batch size: {captions.size(0)}, Lengths: min={lengths.min()}, max={lengths.max()}")
+                print(f"Output stats: min={outputs.min():.4f}, max={outputs.max():.4f}, mean={outputs.mean():.4f}")
+                print(f"Feature stats: min={features.min():.4f}, max={features.max():.4f}")
+                print("Skipping this batch to prevent corruption...")
+                continue  # Skip this batch
+            # =========================================================
+            
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer_cap)
             torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
@@ -280,6 +291,16 @@ def main(args):
                 with autocast(enabled=use_amp):
                     outputs = decoder(captions, mode='romantic')
                     loss = criterion(outputs, captions[:, 1:].contiguous(), lengths - 1)
+                
+                # ============ NaN DETECTION FOR ROMANTIC ============
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"\n!!! NaN/Inf in romantic at epoch {epoch+1}, step {i}/{len(train_styled_loader)}")
+                    print(f"Batch size: {captions.size(0)}, Lengths: min={lengths.min()}, max={lengths.max()}")
+                    print(f"Output stats: min={outputs.min():.4f}, max={outputs.max():.4f}")
+                    print("Skipping this batch...")
+                    continue
+                # =====================================================
+                
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer_lang)
                 torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
