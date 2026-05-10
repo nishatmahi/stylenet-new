@@ -50,7 +50,7 @@ img_names, img_list = load_sample_images(config.simg_path, transform)
 
 # ---- No ground-truth section from here ----
 with torch.no_grad():
-    idx = 0  # whichever image you want
+    idx = 2  # whichever image you want
     image = img_list[idx].unsqueeze(0).to(device)
     features = encoder(image)
     print("Image features shape:", features.shape)
