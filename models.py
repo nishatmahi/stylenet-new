@@ -140,9 +140,9 @@ class FactoredGRU(nn.Module):
             # by image signal (which would produce factual-sounding captions).
             # 0.2 = gentle visual grounding; adjust if romantic is still too
             # factual (lower) or too disconnected from image (higher).
-            z = self.S_rz(z) + 0.5 * visual_z
-            r = self.S_rr(r) + 0.5 * visual_r
-            n = self.S_rn(n) + 0.5 * visual_n
+            z = self.S_rz(z) + 0.6 * visual_z
+            r = self.S_rr(r) + 0.6 * visual_r
+            n = self.S_rn(n) + 0.6 * visual_n
 
         else:
             sys.stderr.write("mode name wrong!\n")
