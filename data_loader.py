@@ -51,11 +51,10 @@ class Flickr7kBanglaDataset(Dataset):
     '''Flickr7k-style dataset for Bangla image-caption'''
     def __init__(self, img_dir, caption_file, transform=None):
         self.img_dir = img_dir
-        self.imgname_caption_list = self._get_imgname_and_caption(caption_file)  # <-- filtered & resolved
+        self.imgname_caption_list = self._get_imgname_and_caption(caption_file)  # list of (img_path, caption)
         self.transform = transform if transform else image_transform
 
     def _get_imgname_and_caption(self, caption_file):
-        # CHANGED: এখানে invalid/missing ইমেজগুলো আগেই বাদ দিচ্ছি।
         with open(caption_file, 'r', encoding='utf-8') as f:
             res = [ln.strip() for ln in f if ln.strip()]
 
@@ -65,7 +64,6 @@ class Flickr7kBanglaDataset(Dataset):
         missing, malformed = 0, 0
         for line in res:
             parts = [x.strip() for x in r.split(line) if x.strip()]
-            # Expect: [img_name, caption]
             if len(parts) < 2:
                 malformed += 1
                 continue
@@ -76,9 +74,8 @@ class Flickr7kBanglaDataset(Dataset):
 
             if img_path is None or not os.path.exists(img_path):
                 missing += 1
-                continue  # <-- skip missing/invalid image
+                continue
 
-            # এখানে সরাসরি resolved path রেখে দিচ্ছি
             imgname_caption_list.append((img_path, caption))
 
         if malformed > 0:
@@ -91,18 +88,26 @@ class Flickr7kBanglaDataset(Dataset):
 
         return imgname_caption_list
 
+    def unique_image_paths(self):
+        '''Distinct resolved image paths in this dataset (for building the ViT cache).
+        Order-preserving so extraction order is deterministic.'''
+        seen = set()
+        uniq = []
+        for img_path, _ in self.imgname_caption_list:
+            if img_path not in seen:
+                seen.add(img_path)
+                uniq.append(img_path)
+        return uniq
+
     def __len__(self):
         return len(self.imgname_caption_list)
 
     def __getitem__(self, ix):
-        # CHANGED: এখন এখানে img_name নয়, সরাসরি resolved img_path আছে।
         img_path, caption = self.imgname_caption_list[ix]
 
-        # Robust image loading (RGB, RGBA, Grayscale)
         try:
             image = Image.open(img_path)
         except Exception as e:
-            # খুবই রেয়ার কেস: ফাইল আছে কিন্তু corrupt
             print(f"[ERROR] Could not open image (corrupt?): {img_path}, {e}")
             image = Image.new("RGB", (224, 224))
 
@@ -110,10 +115,11 @@ class Flickr7kBanglaDataset(Dataset):
             image = image.convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
-        return image, caption  # <-- raw string caption
+        # CHANGED: also return img_path so the training loop can look up cached features
+        return image, caption, img_path
 
 class FlickrStyle7kBanglaDataset(Dataset):
-    '''Styled caption dataset'''
+    '''Styled caption dataset (text-only, no images)'''
     def __init__(self, caption_file):
         self.caption_list = self._get_caption(caption_file)
 
@@ -127,24 +133,24 @@ class FlickrStyle7kBanglaDataset(Dataset):
         return len(self.caption_list)
 
     def __getitem__(self, ix):
-        return self.caption_list[ix]  # <--- Return string
+        return self.caption_list[ix]
 
 # --------- Collate functions ---------
 def collate_fn(batch):
-    images, captions = zip(*batch)
+    # CHANGED: batch items are now (image, caption, img_path)
+    images, captions, img_paths = zip(*batch)
     images = torch.stack(images, 0)
-    # --- BOS/EOS manually add for each caption ---
     ids_list = []
     for cap in captions:
         ids = tokenizer.encode(cap, add_special_tokens=False)
         ids = [tokenizer.bos_token_id] + ids + [tokenizer.eos_token_id]
         ids_list.append(torch.tensor(ids, dtype=torch.long))
-    # --- Pad manually
     max_len = max(len(ids) for ids in ids_list)
     padded = [torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=torch.long)]) for ids in ids_list]
     input_ids = torch.stack(padded, 0)
     lengths = torch.tensor([len(ids) for ids in ids_list], dtype=torch.long)
-    return images, input_ids, lengths
+    # CHANGED: return img_paths (tuple of str) as 4th item
+    return images, input_ids, lengths, img_paths
 
 def collate_fn_styled(captions):
     ids_list = []
@@ -181,18 +187,12 @@ def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=
 if __name__ == "__main__":
     img_dir = "/kaggle/input/dataset/data/Images"
     factual_file = "/kaggle/input/dataset/data/factual_caption.txt"
-    # humorous_file = "/kaggle/input/dataset/data/humorous_train.txt"
     romantic_file = "/kaggle/input/dataset/data/romantic_data.txt"
 
     data_loader = get_data_loader(img_dir, factual_file, batch_size=3)
-    for i, (images, input_ids, lengths) in enumerate(data_loader):
-        print(f"Batch: {i}", images.shape, input_ids.shape, lengths)
+    for i, (images, input_ids, lengths, img_paths) in enumerate(data_loader):
+        print(f"Batch: {i}", images.shape, input_ids.shape, lengths, img_paths)
         if i == 2: break
-
-    # styled_loader_humorous = get_styled_data_loader(humorous_file, batch_size=3)
-    # for i, (captions, lengths) in enumerate(styled_loader_humorous):
-    #     print(f"Humorous batch: {i}", captions.shape, lengths)
-    #     if i == 2: break
 
     styled_loader_romantic = get_styled_data_loader(romantic_file, batch_size=3)
     for i, (captions, lengths) in enumerate(styled_loader_romantic):
