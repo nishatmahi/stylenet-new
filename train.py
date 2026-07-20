@@ -7,6 +7,68 @@ from data_loader import get_data_loader, get_styled_data_loader, tokenizer
 from models import EncoderViT, FactoredGRU
 from loss import masked_cross_entropy
 
+
+def build_or_load_vit_cache(encoder, dataset, device, cache_path, use_amp=False, batch=64):
+    """Precompute FROZEN ViT 768-d CLS features for every UNIQUE image once.
+    Stores {img_path: cpu_tensor[768]}. Loaded from disk on later runs so the
+    ViT forward pass never runs during training. The trainable A layer is NOT
+    cached — it stays live in the training loop via encoder.project()."""
+    import os
+    from PIL import Image
+    from data_loader import image_transform
+    if os.path.exists(cache_path):
+        print(f"[CACHE] Loading ViT feature cache from {cache_path}")
+        return torch.load(cache_path, map_location="cpu")
+
+    print(f"[CACHE] Building ViT feature cache (one-time)...")
+    paths = dataset.unique_image_paths()
+    print(f"[CACHE] {len(paths)} unique images to encode.")
+    encoder.eval()
+    cache = {}
+    buf_imgs, buf_paths = [], []
+
+    def flush():
+        if not buf_imgs:
+            return
+        x = torch.stack(buf_imgs, 0).to(device)
+        with torch.no_grad():
+            with autocast(enabled=use_amp):
+                feats = encoder.vit_features(x)      # [B,768] frozen
+        feats = feats.float().cpu()
+        for pth, f in zip(buf_paths, feats):
+            cache[pth] = f
+        buf_imgs.clear(); buf_paths.clear()
+
+    for k, pth in enumerate(paths):
+        try:
+            img = Image.open(pth)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+        except Exception as e:
+            print(f"[CACHE][ERROR] {pth}: {e} -> using blank image")
+            img = Image.new("RGB", (224, 224))
+        buf_imgs.append(image_transform(img))
+        buf_paths.append(pth)
+        if len(buf_imgs) >= batch:
+            flush()
+        if (k + 1) % 1000 == 0:
+            print(f"[CACHE] encoded {k+1}/{len(paths)}")
+    flush()
+
+    try:
+        torch.save(cache, cache_path)
+        print(f"[CACHE] Saved {len(cache)} features to {cache_path}")
+    except Exception as e:
+        print(f"[CACHE][WARN] Could not save cache to disk ({e}); keeping in RAM only.")
+    return cache
+
+
+def lookup_features(encoder, img_paths, cache, device):
+    """Look up cached FROZEN 768-d vectors by path, then apply the LIVE
+    trainable projection A. Gradients flow to A exactly as before."""
+    vit = torch.stack([cache[p] for p in img_paths], 0).to(device)  # [B,768]
+    return encoder.project(vit)                                      # [B,emb_dim], trainable
+
 def split_caption_file(input_file, train_file, val_file, train_ratio=0.8, seed=42):
     """
     Split a caption file into training and validation sets
@@ -65,7 +127,7 @@ def create_data_splits(args):
         'romantic_val': romantic_val if os.path.exists(romantic_val) else None
     }
 
-def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device, use_amp=False):
+def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device, use_amp=False, vit_cache=None):
     """
     Run validation for one epoch.
     Early stopping and best model saving are based on factual loss only.
@@ -80,13 +142,16 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, d
     with torch.no_grad():
         # Validate factual captions
         if val_loader:
-            for images, captions, lengths in val_loader:
-                images = images.to(device)
+            for images, captions, lengths, img_paths in val_loader:
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
 
                 with autocast(enabled=use_amp):
-                    features = encoder(images)
+                    if vit_cache is not None:
+                        vit = torch.stack([vit_cache[pp] for pp in img_paths], 0).to(device)
+                        features = encoder.project(vit)
+                    else:
+                        features = encoder(images.to(device))
                     outputs = decoder(captions, features, mode="factual")
                     loss = criterion(outputs[:, 1:, :].contiguous(),
                                    captions[:, 1:].contiguous(), lengths - 1)
@@ -137,8 +202,8 @@ def main(args):
     # Enable cuDNN auto-tuner for faster convolution/matmul kernels
     torch.backends.cudnn.benchmark = True
 
-    # DISABLED mixed precision for numerical stability
-    use_amp = False  # Changed from: device.type == 'cuda'
+    # Mixed precision ON (T4 benefits). NaN guards + grad clipping already present.
+    use_amp = device.type == 'cuda'
     scaler = GradScaler(enabled=use_amp)
     print(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled for stability'}")
 
@@ -181,6 +246,39 @@ def main(args):
     lang_params = list(decoder.parameters())
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
+
+    # ---- Build (or load) the frozen-ViT feature cache ONCE ----
+    # Keyed by resolved img_path. train_loader.dataset is the Flickr7kBanglaDataset.
+    vit_cache_path = os.path.join(permanent_save_folder, "vit_cache.pt")
+    vit_cache = build_or_load_vit_cache(
+        encoder, train_loader.dataset, device, vit_cache_path, use_amp=use_amp)
+    # Also cover any val images not seen in train (extends same dict, re-saves).
+    if val_loader is not None:
+        missing_val = [p for p in val_loader.dataset.unique_image_paths() if p not in vit_cache]
+        if missing_val:
+            print(f"[CACHE] Encoding {len(missing_val)} extra val images...")
+            from PIL import Image as _Image
+            from data_loader import image_transform as _tf
+            encoder.eval()
+            _buf, _bp = [], []
+            def _flush_val():
+                if not _buf: return
+                x = torch.stack(_buf, 0).to(device)
+                with torch.no_grad():
+                    with autocast(enabled=use_amp):
+                        f = encoder.vit_features(x).float().cpu()
+                for pp, ff in zip(_bp, f): vit_cache[pp] = ff
+                _buf.clear(); _bp.clear()
+            for p in missing_val:
+                try:
+                    im = _Image.open(p);  im = im.convert("RGB") if im.mode!="RGB" else im
+                except Exception:
+                    im = _Image.new("RGB",(224,224))
+                _buf.append(_tf(im)); _bp.append(p)
+                if len(_buf) >= 64: _flush_val()
+            _flush_val()
+            try: torch.save(vit_cache, vit_cache_path)
+            except Exception as e: print(f"[CACHE][WARN] re-save failed: {e}")
 
     # Checkpoint loading
     start_epoch = 0
@@ -244,14 +342,15 @@ def main(args):
         romantic_train_samples = 0
         
         # Train on factual captions (image+caption pairs)
-        for i, (images, captions, lengths) in enumerate(train_loader):
-            images = images.to(device)
+        # NOTE: images are ignored now; frozen ViT features come from the cache,
+        # and the trainable projection A is applied live via encoder.project().
+        for i, (images, captions, lengths, img_paths) in enumerate(train_loader):
             captions = captions.long().to(device)
             lengths = lengths.to(device)
 
             optimizer_cap.zero_grad(set_to_none=True)
             with autocast(enabled=use_amp):
-                features = encoder(images)
+                features = lookup_features(encoder, img_paths, vit_cache, device)
                 outputs = decoder(captions, features, mode="factual")
                 loss = criterion(outputs[:, 1:, :].contiguous(),
                                  captions[:, 1:].contiguous(), lengths - 1)
@@ -321,7 +420,7 @@ def main(args):
 
         # Validation phase
         print(f"[EPOCH {epoch+1}] Running validation...")
-        val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device, use_amp=use_amp)
+        val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device, use_amp=use_amp, vit_cache=vit_cache)
         print(f"[EPOCH {epoch+1}] Factual Validation Loss (early stopping): {val_loss:.4f}")
 
         # Early stopping logic — based on factual validation loss only
