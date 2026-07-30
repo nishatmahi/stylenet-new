@@ -4,10 +4,15 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
-from transformers import AutoTokenizer
+from transformers import MT5Tokenizer
 
-# ---- HuggingFace Bangla Tokenizer ----
-tokenizer = AutoTokenizer.from_pretrained("/kaggle/working/tokenizer-extended", trust_remote_code=True)
+# ---- Pretrained mT5 tokenizer (SentencePiece, covers Bengali) ----
+tokenizer = MT5Tokenizer.from_pretrained('google/mt5-base')
+
+# NOTE: mT5's tokenizer has no bos_token_id (it's None by design for T5-family
+# models). T5 conventionally uses pad_token_id as the decoder "start" token
+# instead of BOS. We use pad_token_id here in place of your old bos_token_id.
+DECODER_START_ID = tokenizer.pad_token_id
 
 class Rescale:
     '''Rescale the image to a given size'''
@@ -27,7 +32,6 @@ class Rescale:
         image = image.resize((new_w, new_h))
         return image
 
-# ---- Image transforms ----
 image_transform = transforms.Compose([
     Rescale((224, 224)),
     transforms.ToTensor(),
@@ -51,7 +55,7 @@ class Flickr7kBanglaDataset(Dataset):
     '''Flickr7k-style dataset for Bangla image-caption'''
     def __init__(self, img_dir, caption_file, transform=None):
         self.img_dir = img_dir
-        self.imgname_caption_list = self._get_imgname_and_caption(caption_file)  # list of (img_path, caption)
+        self.imgname_caption_list = self._get_imgname_and_caption(caption_file)
         self.transform = transform if transform else image_transform
 
     def _get_imgname_and_caption(self, caption_file):
@@ -88,23 +92,11 @@ class Flickr7kBanglaDataset(Dataset):
 
         return imgname_caption_list
 
-    def unique_image_paths(self):
-        '''Distinct resolved image paths in this dataset (for building the ViT cache).
-        Order-preserving so extraction order is deterministic.'''
-        seen = set()
-        uniq = []
-        for img_path, _ in self.imgname_caption_list:
-            if img_path not in seen:
-                seen.add(img_path)
-                uniq.append(img_path)
-        return uniq
-
     def __len__(self):
         return len(self.imgname_caption_list)
 
     def __getitem__(self, ix):
         img_path, caption = self.imgname_caption_list[ix]
-
         try:
             image = Image.open(img_path)
         except Exception as e:
@@ -115,11 +107,10 @@ class Flickr7kBanglaDataset(Dataset):
             image = image.convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
-        # CHANGED: also return img_path so the training loop can look up cached features
-        return image, caption, img_path
+        return image, caption
 
 class FlickrStyle7kBanglaDataset(Dataset):
-    '''Styled caption dataset (text-only, no images)'''
+    '''Styled caption dataset (romantic / humorous — text only, no images)'''
     def __init__(self, caption_file):
         self.caption_list = self._get_caption(caption_file)
 
@@ -136,65 +127,50 @@ class FlickrStyle7kBanglaDataset(Dataset):
         return self.caption_list[ix]
 
 # --------- Collate functions ---------
-def collate_fn(batch):
-    # CHANGED: batch items are now (image, caption, img_path)
-    images, captions, img_paths = zip(*batch)
-    images = torch.stack(images, 0)
+# NOTE: decoder_input_ids start with DECODER_START_ID (pad token, per mT5
+# convention) instead of bos_token_id. labels use -100 for padded positions
+# so mT5's internal loss computation ignores them (standard HF convention).
+
+def _encode_batch(captions):
     ids_list = []
     for cap in captions:
         ids = tokenizer.encode(cap, add_special_tokens=False)
-        ids = [tokenizer.bos_token_id] + ids + [tokenizer.eos_token_id]
+        ids = ids + [tokenizer.eos_token_id]
         ids_list.append(torch.tensor(ids, dtype=torch.long))
+
     max_len = max(len(ids) for ids in ids_list)
-    padded = [torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=torch.long)]) for ids in ids_list]
-    input_ids = torch.stack(padded, 0)
+
+    # labels: pad with -100 (ignored in loss)
+    labels = [torch.cat([ids, torch.full((max_len - len(ids),), -100, dtype=torch.long)]) for ids in ids_list]
+    labels = torch.stack(labels, 0)
+
+    # decoder_input_ids: shifted right, start token = pad_token_id, pad with pad_token_id
+    decoder_input_ids = torch.full((len(ids_list), max_len), tokenizer.pad_token_id, dtype=torch.long)
+    for i, ids in enumerate(ids_list):
+        decoder_input_ids[i, 0] = DECODER_START_ID
+        if len(ids) > 1:
+            decoder_input_ids[i, 1:len(ids)] = ids[:-1]
+
     lengths = torch.tensor([len(ids) for ids in ids_list], dtype=torch.long)
-    # CHANGED: return img_paths (tuple of str) as 4th item
-    return images, input_ids, lengths, img_paths
+    return decoder_input_ids, labels, lengths
+
+def collate_fn(batch):
+    images, captions = zip(*batch)
+    images = torch.stack(images, 0)
+    decoder_input_ids, labels, lengths = _encode_batch(captions)
+    return images, decoder_input_ids, labels, lengths
 
 def collate_fn_styled(captions):
-    ids_list = []
-    for cap in captions:
-        ids = tokenizer.encode(cap, add_special_tokens=False)
-        ids = [tokenizer.bos_token_id] + ids + [tokenizer.eos_token_id]
-        ids_list.append(torch.tensor(ids, dtype=torch.long))
-    max_len = max(len(ids) for ids in ids_list)
-    padded = [torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=torch.long)]) for ids in ids_list]
-    input_ids = torch.stack(padded, 0)
-    lengths = torch.tensor([len(ids) for ids in ids_list], dtype=torch.long)
-    return input_ids, lengths
+    decoder_input_ids, labels, lengths = _encode_batch(captions)
+    return decoder_input_ids, labels, lengths
 
 # --------- Loader functions ---------
 def get_data_loader(img_dir, caption_file, batch_size, shuffle=False, num_workers=2):
     dataset = Flickr7kBanglaDataset(img_dir, caption_file, transform=image_transform)
-    data_loader = DataLoader(dataset=dataset,
-                             batch_size=batch_size,
-                             shuffle=shuffle,
-                             num_workers=num_workers,
-                             collate_fn=collate_fn)
-    return data_loader
+    return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle,
+                       num_workers=num_workers, collate_fn=collate_fn)
 
 def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=2):
     dataset = FlickrStyle7kBanglaDataset(caption_file)
-    data_loader = DataLoader(dataset=dataset,
-                             batch_size=batch_size,
-                             shuffle=shuffle,
-                             num_workers=num_workers,
-                             collate_fn=collate_fn_styled)
-    return data_loader
-
-# ==== Test/debug block ====
-if __name__ == "__main__":
-    img_dir = "/kaggle/input/dataset/data/Images"
-    factual_file = "/kaggle/input/dataset/data/factual_caption.txt"
-    romantic_file = "/kaggle/input/dataset/data/romantic_data.txt"
-
-    data_loader = get_data_loader(img_dir, factual_file, batch_size=3)
-    for i, (images, input_ids, lengths, img_paths) in enumerate(data_loader):
-        print(f"Batch: {i}", images.shape, input_ids.shape, lengths, img_paths)
-        if i == 2: break
-
-    styled_loader_romantic = get_styled_data_loader(romantic_file, batch_size=3)
-    for i, (captions, lengths) in enumerate(styled_loader_romantic):
-        print(f"Romantic batch: {i}", captions.shape, lengths)
-        if i == 2: break
+    return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle,
+                       num_workers=num_workers, collate_fn=collate_fn_styled)
