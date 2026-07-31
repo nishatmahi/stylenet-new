@@ -19,7 +19,12 @@ import argparse
 import gc
 import random
 import torch
-from torch.cuda.amp import GradScaler
+try:
+    # PyTorch >= 2.1
+    from torch.amp import GradScaler
+except ImportError:
+    # PyTorch < 2.1 fallback
+    from torch.cuda.amp import GradScaler
 
 from data_loader import get_precomputed_data_loader, get_styled_data_loader, tokenizer
 from models import FeatureProjection, build_factored_mt5_decoder, set_mode, get_trainable_param_groups
@@ -153,7 +158,10 @@ def main(args):
         print(f"[INFO] Using bf16 autocast (native hardware support)")
     else:
         amp_dtype = torch.float16
-        scaler = GradScaler()
+        try:
+            scaler = GradScaler('cuda')     # PyTorch >= 2.1
+        except TypeError:
+            scaler = GradScaler()           # PyTorch < 2.1
         print(f"[INFO] Using fp16 autocast + GradScaler (T4 / pre-Ampere GPU)")
 
     # ── Directories ───────────────────────────────────────────────────
