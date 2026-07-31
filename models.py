@@ -133,8 +133,10 @@ def get_trainable_param_groups(model):
             lang_params.append(p)
 
         # Cross-attention query projection only — learns to query ViT features
-        # Key/value come from ViT (fixed), only query needs to adapt
-        cross_attn = block.layer[1].layer  # T5LayerCrossAttention -> T5Attention
+        # Key/value come from ViT (fixed), only query needs to adapt.
+        # CORRECTED: block.layer[1] IS the MT5LayerCrossAttention module and
+        # has .EncDecAttention directly — there is no extra .layer wrapper.
+        cross_attn = block.layer[1]  # MT5LayerCrossAttention
         if hasattr(cross_attn, 'EncDecAttention'):
             for p in cross_attn.EncDecAttention.q.parameters():
                 p.requires_grad = True
