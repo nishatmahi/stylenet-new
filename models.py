@@ -5,20 +5,20 @@ from transformers import ViTModel, MT5ForConditionalGeneration
 
 # --------- EncoderViT ---------
 class EncoderViT(nn.Module):
-    """Encodes image into a patch-sequence for cross-attention.
-    (paper fed a single CLS/pooled vector at LSTM step 0; here we keep the
-    full patch sequence since transformer cross-attention needs a sequence
-    to attend over, not one vector.)"""
+    """CLS-token only, exactly matching original StyleNet encoder behavior.
+    Frozen ViT, single trainable linear projection (equivalent to paper's A matrix)."""
     def __init__(self, decoder_hidden_size):
         super().__init__()
         self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
         for p in self.vit.parameters():
             p.requires_grad = False
-        self.proj = nn.Linear(self.vit.config.hidden_size, decoder_hidden_size)  # A matrix equivalent
+        self.proj = nn.Linear(self.vit.config.hidden_size, decoder_hidden_size)
 
     def forward(self, images):
-        out = self.vit(images).last_hidden_state       # [batch, num_patches+1, 768]
-        return self.proj(out)                            # [batch, num_patches+1, decoder_hidden]
+        outputs = self.vit(images)
+        features = outputs.last_hidden_state[:, 0, :]   # CLS token
+        features = self.proj(features)                    # [batch, decoder_hidden]
+        return features.unsqueeze(1)                      # [batch, 1, decoder_hidden] for cross-attn
 
 # --------- Factored FFN (transformer analog of Ux Sx Vx) ---------
 class FactoredFFN(nn.Module):
@@ -26,17 +26,21 @@ class FactoredFFN(nn.Module):
     Mirrors paper eq. (8): Wx = Ux Sx Vx
     - V: shared (paper's Vx)
     - S_<style>: style-specific (paper's Sx — S_F, S_R, S_H)
-    - U: shared (paper's Ux)
-    Applied as a residual addition on top of mT5's pretrained FFN output,
-    so pretrained language knowledge isn't destroyed.
+    - U: shared (paper's Ux) — zero-initialized so the adapter starts as a
+      no-op residual and doesn't perturb pretrained mT5 activations early on.
     """
     def __init__(self, hidden_dim, factored_dim):
         super().__init__()
-        self.V = nn.Linear(hidden_dim, factored_dim)      # shared
-        self.S_factual = nn.Linear(factored_dim, factored_dim)   # style-specific
-        self.S_romantic = nn.Linear(factored_dim, factored_dim)  # style-specific
-        self.S_humorous = nn.Linear(factored_dim, factored_dim)  # style-specific
-        self.U = nn.Linear(factored_dim, hidden_dim)      # shared
+        self.V = nn.Linear(hidden_dim, factored_dim)
+        self.S_factual = nn.Linear(factored_dim, factored_dim)
+        self.S_romantic = nn.Linear(factored_dim, factored_dim)
+        self.S_humorous = nn.Linear(factored_dim, factored_dim)
+        self.U = nn.Linear(factored_dim, hidden_dim)
+
+        # Zero-init U: adapter output starts at 0, grows gradually during training.
+        # Prevents large-magnitude residual additions on top of pretrained weights.
+        nn.init.zeros_(self.U.weight)
+        nn.init.zeros_(self.U.bias)
 
     def forward(self, x, mode):
         h = self.V(x)
@@ -48,14 +52,14 @@ class FactoredFFN(nn.Module):
 
 def _patch_cross_attn_zero_in_style_mode(block):
     """When mode != 'factual', skip cross-attention entirely — equivalent to
-    your original code's features=None path (no visual info at all)."""
+    features=None in the original FactoredLSTM (no visual info at all)."""
     original_forward = block.layer[1].forward
 
     def new_forward(hidden_states, *args, **kwargs):
         if getattr(block, "current_mode", "factual") == "factual":
             return original_forward(hidden_states, *args, **kwargs)
         else:
-            return (hidden_states,)  # pass through unchanged, no cross-attn contribution
+            return (hidden_states,)
 
     block.layer[1].forward = new_forward
 
@@ -71,11 +75,6 @@ def _patch_ffn_with_factored_adapter(block, hidden_dim, factored_dim):
     block.layer[-1].forward = new_ffn_forward
 
 def build_factored_mt5_decoder(vocab_size=None, factored_dim=512, pretrained_name='google/mt5-base'):
-    """
-    Builds the StyleNet decoder equivalent: pretrained mT5 + factored adapters
-    patched into every decoder block, with cross-attention disabled for
-    non-factual (style) modes.
-    """
     model = MT5ForConditionalGeneration.from_pretrained(pretrained_name)
     if vocab_size is not None and vocab_size != model.config.vocab_size:
         model.resize_token_embeddings(vocab_size)
@@ -89,17 +88,10 @@ def build_factored_mt5_decoder(vocab_size=None, factored_dim=512, pretrained_nam
     return model
 
 def set_mode(model, mode):
-    """Call before each forward pass — sets which style branch is active,
-    same role as the `mode` argument in your original FactoredLSTM.forward_step"""
     for block in model.decoder.block:
         block.current_mode = mode
 
 def get_trainable_param_groups(model):
-    """
-    Splits parameters into cap_params (factual/image-grounding) and
-    lang_params (style-specific only), mirroring your original train.py split.
-    Everything else in mT5 is frozen.
-    """
     for p in model.parameters():
         p.requires_grad = False
 
@@ -108,23 +100,19 @@ def get_trainable_param_groups(model):
 
     for block in model.decoder.block:
         adapter = block.factored_adapter
-        # shared V, U + factual S: trained during factual (image) task
         for p in list(adapter.V.parameters()) + list(adapter.U.parameters()) + list(adapter.S_factual.parameters()):
             p.requires_grad = True
             cap_params.append(p)
-        # style-specific S: trained only during their respective style task
         for p in adapter.S_romantic.parameters():
             p.requires_grad = True
             lang_params.append(p)
         for p in adapter.S_humorous.parameters():
             p.requires_grad = True
             lang_params.append(p)
-        # cross-attention: only meaningful in factual mode, part of cap_params
         for p in block.layer[1].parameters():
             p.requires_grad = True
             cap_params.append(p)
 
-    # embeddings: shared, needed if vocab was resized or fine-tuning language
     for p in model.shared.parameters():
         p.requires_grad = True
         cap_params.append(p)
