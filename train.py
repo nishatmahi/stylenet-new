@@ -43,7 +43,7 @@ def create_data_splits(args):
         'humorous_val': humorous_val if os.path.exists(humorous_val) else None
     }
 
-def validate_epoch(encoder, decoder, val_loader, val_styled_loader, device):
+def validate_epoch(encoder, decoder, val_loader, val_styled_loader, device, amp_dtype):
     encoder.eval()
     decoder.eval()
     factual_loss, factual_samples = 0.0, 0
@@ -55,7 +55,7 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, device):
                 decoder_input_ids = decoder_input_ids.to(device)
                 labels = labels.to(device)
 
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.autocast(device_type='cuda', dtype=amp_dtype):
                     features = encoder(images)
                     set_mode(decoder, "factual")
                     outputs = decoder(decoder_input_ids=decoder_input_ids,
@@ -74,7 +74,7 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, device):
                 labels = labels.to(device)
                 batch_size = decoder_input_ids.size(0)
 
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.autocast(device_type='cuda', dtype=amp_dtype):
                     dummy_encoder_out = torch.zeros(batch_size, 1, decoder.config.d_model, device=device)
                     set_mode(decoder, "humorous")
                     outputs = decoder(decoder_input_ids=decoder_input_ids,
@@ -88,9 +88,9 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, device):
 
     return factual_loss if factual_samples > 0 else float('inf')
 
-def eval_outputs(decoder_input_ids, encoder_outputs, decoder, tokenizer):
+def eval_outputs(decoder_input_ids, encoder_outputs, decoder, tokenizer, amp_dtype):
     with torch.no_grad():
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.autocast(device_type='cuda', dtype=amp_dtype):
             set_mode(decoder, "factual")
             out = decoder(decoder_input_ids=decoder_input_ids, encoder_outputs=encoder_outputs)
         indices = torch.argmax(out.logits, dim=-1).cpu().numpy()
@@ -101,6 +101,10 @@ def eval_outputs(decoder_input_ids, encoder_outputs, decoder, tokenizer):
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+
+    use_bf16 = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float32
+    print(f"[DEBUG] bf16 hardware support: {use_bf16} -> using autocast dtype: {amp_dtype}")
 
     permanent_save_folder = "stylenet_new_again_models/"
     os.makedirs(permanent_save_folder, exist_ok=True)
@@ -134,9 +138,6 @@ def main(args):
 
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
-
-    scaler_cap = torch.cuda.amp.GradScaler()
-    scaler_lang = torch.cuda.amp.GradScaler()
 
     accum_steps = args.accum_steps
 
@@ -200,20 +201,18 @@ def main(args):
             decoder_input_ids = decoder_input_ids.to(device)
             labels = labels.to(device)
 
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.autocast(device_type='cuda', dtype=amp_dtype):
                 features = encoder(images)
                 set_mode(decoder, "factual")
                 outputs = decoder(decoder_input_ids=decoder_input_ids,
                                    encoder_outputs=(features,), labels=labels)
                 loss = outputs.loss / accum_steps
 
-            scaler_cap.scale(loss).backward()
+            loss.backward()
 
             if (i + 1) % accum_steps == 0 or i == len(train_loader) - 1:
-                scaler_cap.unscale_(optimizer_cap)
                 torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
-                scaler_cap.step(optimizer_cap)
-                scaler_cap.update()
+                optimizer_cap.step()
                 optimizer_cap.zero_grad()
 
             factual_train_loss += loss.item() * accum_steps * images.size(0)
@@ -223,7 +222,7 @@ def main(args):
                 print(f"Epoch [{epoch+1}/{args.epoch_num}], CAP, Step [{i}/{len(train_loader)}], Loss: {loss.item()*accum_steps:.4f}")
 
         if len(train_loader) > 0:
-            eval_outputs(decoder_input_ids, (features,), decoder, tokenizer)
+            eval_outputs(decoder_input_ids, (features,), decoder, tokenizer, amp_dtype)
 
         # --- Humorous: text only, NO image ---
         if train_styled_loader:
@@ -233,20 +232,18 @@ def main(args):
                 labels = labels.to(device)
                 batch_size = decoder_input_ids.size(0)
 
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.autocast(device_type='cuda', dtype=amp_dtype):
                     dummy_encoder_out = torch.zeros(batch_size, 1, decoder.config.d_model, device=device)
                     set_mode(decoder, "humorous")
                     outputs = decoder(decoder_input_ids=decoder_input_ids,
                                        encoder_outputs=(dummy_encoder_out,), labels=labels)
                     loss = outputs.loss / accum_steps
 
-                scaler_lang.scale(loss).backward()
+                loss.backward()
 
                 if (i + 1) % accum_steps == 0 or i == len(train_styled_loader) - 1:
-                    scaler_lang.unscale_(optimizer_lang)
                     torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-                    scaler_lang.step(optimizer_lang)
-                    scaler_lang.update()
+                    optimizer_lang.step()
                     optimizer_lang.zero_grad()
 
                 humorous_train_loss += loss.item() * accum_steps * batch_size
@@ -260,10 +257,9 @@ def main(args):
         print(f"\n[EPOCH {epoch+1}] Factual Training Loss:  {avg_factual_loss:.4f}")
         print(f"[EPOCH {epoch+1}] Humorous Training Loss: {avg_humorous_loss:.4f}")
 
-        # Validate every epoch on final epoch, else every 2 epochs to save time
         if (epoch + 1) % 2 == 0 or epoch == args.epoch_num - 1:
             print(f"[EPOCH {epoch+1}] Running validation...")
-            val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, device)
+            val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, device, amp_dtype)
             print(f"[EPOCH {epoch+1}] Factual Validation Loss (early stopping): {val_loss:.4f}")
         else:
             print(f"[EPOCH {epoch+1}] Skipping validation this epoch (runs every 2 epochs).")
