@@ -463,8 +463,8 @@ if __name__ == '__main__':
     parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images')
     parser.add_argument('--features_path', type=str, default='/kaggle/working/vit_features.pth',
                         help='Path to precomputed ViT features. Auto-extracted if missing.')
-    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_caption.txt')
-    parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset/data/humorous_generated.txt')
+    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/factual_caption.txt')
+    parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/humorous_generated.txt')
 
     # Batch sizes — these fit comfortably on T4 with precomputed features
     parser.add_argument('--caption_batch_size', type=int, default=48)
