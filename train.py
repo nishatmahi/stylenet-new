@@ -1,4 +1,6 @@
 import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import argparse
 import torch
 import random
@@ -35,6 +37,8 @@ def create_data_splits(args):
     humorous_val = os.path.join(val_dir, 'humorous_val.txt')
     if args.humorous_caption_path and os.path.exists(args.humorous_caption_path):
         split_caption_file(args.humorous_caption_path, humorous_train, humorous_val)
+    else:
+        print(f"[WARN] humorous_caption_path not found: {args.humorous_caption_path}")
 
     return {
         'factual_train': factual_train,
@@ -323,10 +327,10 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, default='pretrained_models')
     parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images')
     parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_caption.txt')
-    parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset/data/humorous_text.txt')
-    parser.add_argument('--caption_batch_size', type=int, default=32)
-    parser.add_argument('--language_batch_size', type=int, default=48)
-    parser.add_argument('--accum_steps', type=int, default=2)
+    parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset/data/humorous_generated.txt')
+    parser.add_argument('--caption_batch_size', type=int, default=16)
+    parser.add_argument('--language_batch_size', type=int, default=24)
+    parser.add_argument('--accum_steps', type=int, default=4)
     parser.add_argument('--factored_dim', type=int, default=512)
     parser.add_argument('--lr_caption', type=float, default=0.00002)
     parser.add_argument('--lr_language', type=float, default=0.00005)
