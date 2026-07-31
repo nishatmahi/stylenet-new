@@ -133,7 +133,7 @@ def main(args):
     print(f"Val batches: Factual={len(val_loader) if val_loader else 0}, Humorous={len(val_styled_loader) if val_styled_loader else 0}")
 
     # Models
-    decoder = build_factored_mt5_decoder(vocab_size=len(tokenizer), factored_dim=args.factored_dim).to(device)
+    decoder = build_factored_mt5_decoder(factored_dim=args.factored_dim).to(device)
     decoder.gradient_checkpointing_enable()
     encoder = EncoderViT(decoder.config.d_model).to(device)
 
