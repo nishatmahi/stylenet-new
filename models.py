@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import ViTModel, MT5ForConditionalGeneration
+from transformers import ViTModel, MT5Config, MT5ForConditionalGeneration
 
 # --------- EncoderViT ---------
 class EncoderViT(nn.Module):
-    """CLS-token only, exactly matching original StyleNet encoder behavior.
-    Frozen ViT, single trainable linear projection (equivalent to paper's A matrix)."""
+    """Frozen ViT + single trainable linear projection.
+    CLS token only — exactly matching original StyleNet encoder behavior."""
     def __init__(self, decoder_hidden_size):
         super().__init__()
         self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
@@ -16,43 +16,40 @@ class EncoderViT(nn.Module):
 
     def forward(self, images):
         outputs = self.vit(images)
-        features = outputs.last_hidden_state[:, 0, :]   # CLS token
-        features = self.proj(features)                    # [batch, decoder_hidden]
-        return features.unsqueeze(1)                      # [batch, 1, decoder_hidden] for cross-attn
+        features = outputs.last_hidden_state[:, 0, :]  # CLS token
+        features = self.proj(features)                  # [batch, decoder_hidden]
+        return features.unsqueeze(1)                    # [batch, 1, decoder_hidden]
 
-# --------- Factored FFN (transformer analog of Ux Sx Vx) ---------
+# --------- Factored FFN ---------
 class FactoredFFN(nn.Module):
     """
-    Mirrors paper eq. (8): Wx = Ux Sx Vx
-    - V: shared (paper's Vx)
-    - S_<style>: style-specific (paper's Sx — S_F, S_R, S_H)
-    - U: shared (paper's Ux) — zero-initialized so the adapter starts as a
-      no-op residual and doesn't perturb pretrained mT5 activations early on.
+    Mirrors paper eq (8): Wx = Ux Sx Vx
+    V, U: shared. S_<style>: style-specific.
+    U zero-initialized so adapter starts as no-op residual.
     """
     def __init__(self, hidden_dim, factored_dim):
         super().__init__()
         self.V = nn.Linear(hidden_dim, factored_dim)
-        self.S_factual = nn.Linear(factored_dim, factored_dim)
-        self.S_romantic = nn.Linear(factored_dim, factored_dim)
+        self.S_factual  = nn.Linear(factored_dim, factored_dim)
         self.S_humorous = nn.Linear(factored_dim, factored_dim)
         self.U = nn.Linear(factored_dim, hidden_dim)
 
-        # Zero-init U: adapter output starts at 0, grows gradually during training.
-        # Prevents large-magnitude residual additions on top of pretrained weights.
         nn.init.zeros_(self.U.weight)
         nn.init.zeros_(self.U.bias)
 
     def forward(self, x, mode):
         h = self.V(x)
-        style_map = {"factual": self.S_factual, "romantic": self.S_romantic, "humorous": self.S_humorous}
-        if mode not in style_map:
-            raise ValueError(f"Unknown mode: {mode}. Only 'factual', 'romantic', 'humorous' supported.")
-        h = style_map[mode](h)
+        if mode == "factual":
+            h = self.S_factual(h)
+        elif mode == "humorous":
+            h = self.S_humorous(h)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
         return self.U(F.relu(h))
 
 def _patch_cross_attn_zero_in_style_mode(block):
-    """When mode != 'factual', skip cross-attention entirely — equivalent to
-    features=None in the original FactoredLSTM (no visual info at all)."""
+    """Style modes: skip cross-attention entirely (no image).
+    Equivalent to features=None in original FactoredLSTM."""
     original_forward = block.layer[1].forward
 
     def new_forward(hidden_states, *args, **kwargs):
@@ -69,16 +66,31 @@ def _patch_ffn_with_factored_adapter(block, hidden_dim, factored_dim):
 
     def new_ffn_forward(hidden_states, *args, **kwargs):
         out = original_ffn_forward(hidden_states, *args, **kwargs)
-        adapter_out = block.factored_adapter(hidden_states, getattr(block, "current_mode", "factual"))
+        adapter_out = block.factored_adapter(
+            hidden_states, getattr(block, "current_mode", "factual"))
         return out + adapter_out
 
     block.layer[-1].forward = new_ffn_forward
 
-def build_factored_mt5_decoder(vocab_size=None, factored_dim=512, pretrained_name='google/mt5-base'):
+def build_factored_mt5_decoder(factored_dim=512, pretrained_name='google/mt5-base'):
+    """
+    FIX 1: Load ONLY the decoder half of mT5 — the mT5 encoder
+    (~1.2GB) is dead weight since EncoderViT is our real encoder.
+    We do this by loading the full model then immediately deleting
+    the encoder and freeing that memory.
+    """
     model = MT5ForConditionalGeneration.from_pretrained(pretrained_name)
-    if vocab_size is not None and vocab_size != model.config.vocab_size:
-        model.resize_token_embeddings(vocab_size)
 
+    # Delete mT5 encoder — we never use it, EncoderViT replaces it
+    del model.encoder
+    torch.cuda.empty_cache()
+
+    # FIX 2: Freeze ALL parameters to start — including model.shared
+    # (250K x 768 embedding = 192M params = ~1.5GB optimizer state if unfrozen)
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # Patch decoder blocks with factored adapters + cross-attn zeroing
     hidden_dim = model.config.d_model
     for block in model.decoder.block:
         block.current_mode = "factual"
@@ -92,29 +104,40 @@ def set_mode(model, mode):
         block.current_mode = mode
 
 def get_trainable_param_groups(model):
-    for p in model.parameters():
-        p.requires_grad = False
+    """
+    FIX 3: Only train factored adapters + cross-attention projection
+    for factual (cap_params), and style-specific S matrices for
+    humorous (lang_params).
 
-    cap_params = []
+    Cross-attention: only the query projection (Wq) needs to learn
+    to attend to ViT features — key/value come from ViT which is
+    fixed. Much lighter than unfreezing all 12 full cross-attn blocks.
+    model.shared and all other mT5 weights stay frozen.
+    """
+    cap_params  = []
     lang_params = []
 
     for block in model.decoder.block:
         adapter = block.factored_adapter
-        for p in list(adapter.V.parameters()) + list(adapter.U.parameters()) + list(adapter.S_factual.parameters()):
-            p.requires_grad = True
-            cap_params.append(p)
-        for p in adapter.S_romantic.parameters():
-            p.requires_grad = True
-            lang_params.append(p)
-        for p in adapter.S_humorous.parameters():
-            p.requires_grad = True
-            lang_params.append(p)
-        for p in block.layer[1].parameters():
+
+        # Shared V, U + factual S: trained on image+caption task
+        for p in (list(adapter.V.parameters()) +
+                  list(adapter.U.parameters()) +
+                  list(adapter.S_factual.parameters())):
             p.requires_grad = True
             cap_params.append(p)
 
-    for p in model.shared.parameters():
-        p.requires_grad = True
-        cap_params.append(p)
+        # Humorous S: trained on text-only humorous task
+        for p in adapter.S_humorous.parameters():
+            p.requires_grad = True
+            lang_params.append(p)
+
+        # Cross-attention query projection only — learns to query ViT features
+        # Key/value come from ViT (fixed), only query needs to adapt
+        cross_attn = block.layer[1].layer  # T5LayerCrossAttention -> T5Attention
+        if hasattr(cross_attn, 'EncDecAttention'):
+            for p in cross_attn.EncDecAttention.q.parameters():
+                p.requires_grad = True
+                cap_params.append(p)
 
     return cap_params, lang_params
