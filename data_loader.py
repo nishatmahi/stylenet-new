@@ -14,10 +14,10 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
-from transformers import MT5Tokenizer
+from transformers import AutoTokenizer
 
 # ---- Pretrained mT5 tokenizer (SentencePiece, covers Bengali) ----
-tokenizer = MT5Tokenizer.from_pretrained('google/mt5-base')
+tokenizer = AutoTokenizer.from_pretrained('google/mt5-base')
 
 # NOTE: mT5's tokenizer has no bos_token_id (it's None by design for T5-family
 # models). T5 conventionally uses pad_token_id as the decoder "start" token
