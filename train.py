@@ -1,12 +1,34 @@
+"""
+train.py — StyleNet Transformer training with precomputed ViT features.
+
+Memory optimizations for Kaggle T4 (16 GB VRAM):
+  1) Precomputed ViT features  — no ViT on GPU at all (saves ~2.85 GB)
+  2) Delete mT5 encoder         — saves ~1.2 GB
+  3) Gradient checkpointing     — saves ~30-40% activation memory
+  4) fp16 autocast + GradScaler — halves activation memory on T4
+  5) Freeze 95% of parameters   — tiny optimizer states
+  6) Gradient accumulation       — controls peak micro-batch memory
+
+Estimated VRAM usage: ~5-6 GB → batch_size=48 fits comfortably on T4.
+"""
+
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import argparse
-import torch
+import gc
 import random
-from data_loader import get_data_loader, get_styled_data_loader, tokenizer
-from models import EncoderViT, build_factored_mt5_decoder, set_mode, get_trainable_param_groups
+import torch
+from torch.cuda.amp import GradScaler
 
+from data_loader import get_precomputed_data_loader, get_styled_data_loader, tokenizer
+from models import FeatureProjection, build_factored_mt5_decoder, set_mode, get_trainable_param_groups
+from extract_features import extract_and_save
+
+
+# =====================================================================
+#  Helpers
+# =====================================================================
 def split_caption_file(input_file, train_file, val_file, train_ratio=0.8, seed=42):
     if not os.path.exists(input_file):
         print(f"Warning: {input_file} not found, skipping split")
@@ -24,6 +46,7 @@ def split_caption_file(input_file, train_file, val_file, train_ratio=0.8, seed=4
     with open(val_file, 'w', encoding='utf-8') as f:
         f.writelines(val_lines)
     print(f"Split {input_file}: {len(train_lines)} train, {len(val_lines)} val")
+
 
 def create_data_splits(args):
     train_dir = '/kaggle/working/train_split'
@@ -47,25 +70,29 @@ def create_data_splits(args):
         'humorous_val': humorous_val if os.path.exists(humorous_val) else None
     }
 
-def validate_epoch(encoder, decoder, val_loader, val_styled_loader, device, amp_dtype):
-    encoder.eval()
+
+# =====================================================================
+#  Validation
+# =====================================================================
+def validate_epoch(proj, decoder, val_loader, val_styled_loader, device, amp_dtype, scaler):
+    proj.eval()
     decoder.eval()
     factual_loss, factual_samples = 0.0, 0
 
     with torch.no_grad():
         if val_loader:
-            for images, decoder_input_ids, labels, lengths in val_loader:
-                images = images.to(device)
+            for raw_features, decoder_input_ids, labels, lengths in val_loader:
+                raw_features = raw_features.to(device)
                 decoder_input_ids = decoder_input_ids.to(device)
                 labels = labels.to(device)
 
                 with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                    features = encoder(images)
+                    features = proj(raw_features)          # [batch, 1, d_model]
                     set_mode(decoder, "factual")
                     outputs = decoder(decoder_input_ids=decoder_input_ids,
                                        encoder_outputs=(features,), labels=labels)
-                factual_loss += outputs.loss.item() * images.size(0)
-                factual_samples += images.size(0)
+                factual_loss += outputs.loss.item() * raw_features.size(0)
+                factual_samples += raw_features.size(0)
 
             if factual_samples > 0:
                 factual_loss /= factual_samples
@@ -92,39 +119,77 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, device, amp_
 
     return factual_loss if factual_samples > 0 else float('inf')
 
-def eval_outputs(decoder_input_ids, encoder_outputs, decoder, tokenizer, amp_dtype):
+
+def eval_outputs(decoder_input_ids, encoder_outputs, decoder, tok, amp_dtype):
+    """Quick greedy-decode check during training."""
     with torch.no_grad():
         with torch.autocast(device_type='cuda', dtype=amp_dtype):
             set_mode(decoder, "factual")
             out = decoder(decoder_input_ids=decoder_input_ids, encoder_outputs=encoder_outputs)
         indices = torch.argmax(out.logits, dim=-1).cpu().numpy()
         for i in range(min(3, len(indices))):
-            text = tokenizer.decode(indices[i], skip_special_tokens=True)
+            text = tok.decode(indices[i], skip_special_tokens=True)
             print(f"Generated {i+1}: {text}")
 
+
+# =====================================================================
+#  Main
+# =====================================================================
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    use_bf16 = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
-    amp_dtype = torch.bfloat16 if use_bf16 else torch.float32
-    print(f"[DEBUG] bf16 hardware support: {use_bf16} -> using autocast dtype: {amp_dtype}")
+    # ── Mixed precision setup ─────────────────────────────────────────
+    # T4 has native fp16 Tensor Cores.  bf16 may report as "supported"
+    # on newer PyTorch but runs via emulation — fp16 is faster & safer.
+    # GradScaler is required for fp16 to prevent gradient underflow.
+    use_bf16 = (torch.cuda.is_available()
+                and torch.cuda.is_bf16_supported()
+                and torch.cuda.get_device_capability()[0] >= 8)  # Ampere+ only
 
+    if use_bf16:
+        amp_dtype = torch.bfloat16
+        scaler = None  # bf16 doesn't need GradScaler
+        print(f"[INFO] Using bf16 autocast (native hardware support)")
+    else:
+        amp_dtype = torch.float16
+        scaler = GradScaler()
+        print(f"[INFO] Using fp16 autocast + GradScaler (T4 / pre-Ampere GPU)")
+
+    # ── Directories ───────────────────────────────────────────────────
     permanent_save_folder = "stylenet_new_again_models/"
     os.makedirs(permanent_save_folder, exist_ok=True)
     os.makedirs(args.model_path, exist_ok=True)
 
-    print("Creating train/validation splits...")
+    # ── Step 1: Extract ViT features if needed ────────────────────────
+    if not os.path.exists(args.features_path):
+        print("=" * 60)
+        print("STEP 1: Extracting ViT features (runs ONCE, ~10-15 min) …")
+        print("=" * 60)
+        extract_and_save(args.img_path, args.features_path, batch_size=64)
+    else:
+        print(f"[INFO] Precomputed features found: {args.features_path}")
+
+    # ── Step 2: Load precomputed features into CPU memory ─────────────
+    print("[INFO] Loading precomputed features …")
+    features_dict = torch.load(args.features_path, map_location='cpu')
+    vit_dim = next(iter(features_dict.values())).shape[0]  # 768
+    print(f"[INFO] Loaded {len(features_dict)} image features (dim={vit_dim})")
+
+    # ── Step 3: Create data splits & loaders ──────────────────────────
+    print("Creating train/validation splits …")
     split_paths = create_data_splits(args)
 
-    train_loader = get_data_loader(args.img_path, split_paths['factual_train'],
-                                    batch_size=args.caption_batch_size, shuffle=True)
+    train_loader = get_precomputed_data_loader(
+        features_dict, split_paths['factual_train'],
+        batch_size=args.caption_batch_size, shuffle=True)
     train_styled_loader = get_styled_data_loader(
         split_paths['humorous_train'], batch_size=args.language_batch_size,
         shuffle=True) if split_paths['humorous_train'] else None
 
-    val_loader = get_data_loader(args.img_path, split_paths['factual_val'],
-                                  batch_size=args.caption_batch_size, shuffle=False) if split_paths['factual_val'] else None
+    val_loader = get_precomputed_data_loader(
+        features_dict, split_paths['factual_val'],
+        batch_size=args.caption_batch_size, shuffle=False) if split_paths['factual_val'] else None
     val_styled_loader = get_styled_data_loader(
         split_paths['humorous_val'], batch_size=args.language_batch_size,
         shuffle=False) if split_paths['humorous_val'] else None
@@ -132,19 +197,28 @@ def main(args):
     print(f"Train batches: Factual={len(train_loader)}, Humorous={len(train_styled_loader) if train_styled_loader else 0}")
     print(f"Val batches: Factual={len(val_loader) if val_loader else 0}, Humorous={len(val_styled_loader) if val_styled_loader else 0}")
 
-    # Models
-    decoder = build_factored_mt5_decoder(factored_dim=args.factored_dim).to(device)
+    # ── Step 4: Build models ──────────────────────────────────────────
+    decoder = build_factored_mt5_decoder(vocab_size=len(tokenizer), factored_dim=args.factored_dim).to(device)
     decoder.gradient_checkpointing_enable()
-    encoder = EncoderViT(decoder.config.d_model).to(device)
+
+    # FeatureProjection: tiny nn.Linear (vit_dim → d_model), ~2 MB
+    proj = FeatureProjection(vit_dim, decoder.config.d_model).to(device)
 
     cap_params, lang_params = get_trainable_param_groups(decoder)
-    cap_params += list(encoder.proj.parameters())
+    cap_params += list(proj.parameters())  # projection is trainable
 
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
+    # Print memory usage after model setup
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"[INFO] GPU memory — allocated: {alloc:.2f} GB, reserved: {reserved:.2f} GB")
+
     accum_steps = args.accum_steps
 
+    # ── Step 5: Load checkpoint (if exists) ───────────────────────────
     start_epoch = 0
     best_val_loss = float('inf')
     patience_counter = 0
@@ -155,13 +229,25 @@ def main(args):
     print("========== [DEBUG] ==========")
     print(f"permanent_save_folder: {permanent_save_folder}")
     print(f"checkpoint_path: {checkpoint_path}")
-    print("Files in checkpoint folder BEFORE loading:", os.listdir(permanent_save_folder) if os.path.exists(permanent_save_folder) else "Folder doesn't exist")
+    print("Files in checkpoint folder BEFORE loading:",
+          os.listdir(permanent_save_folder) if os.path.exists(permanent_save_folder) else "Folder doesn't exist")
     print("=============================")
 
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        encoder.load_state_dict(checkpoint['encoder_state_dict'])
         decoder.load_state_dict(checkpoint['decoder_state_dict'])
+
+        # Handle both new (proj_state_dict) and old (encoder_state_dict) formats
+        if 'proj_state_dict' in checkpoint:
+            proj.load_state_dict(checkpoint['proj_state_dict'])
+        elif 'encoder_state_dict' in checkpoint:
+            # Old format: extract proj weights from full EncoderViT state dict
+            old_enc = checkpoint['encoder_state_dict']
+            proj_state = {k.replace('proj.', ''): v for k, v in old_enc.items() if 'proj.' in k}
+            if proj_state:
+                proj.proj.load_state_dict(proj_state)
+                print("[DEBUG] Loaded proj weights from old encoder_state_dict")
+
         optimizer_cap.load_state_dict(checkpoint['optimizer_cap_state_dict'])
         optimizer_lang.load_state_dict(checkpoint['optimizer_lang_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
@@ -170,18 +256,33 @@ def main(args):
         print(f"[DEBUG] Loaded checkpoint from epoch {checkpoint['epoch']+1}")
         print(f"[DEBUG] Best factual val loss so far: {best_val_loss:.4f}")
         print(f"[DEBUG] Patience counter: {patience_counter}")
+        del checkpoint
+        gc.collect()
     else:
-        encoder_last_path = os.path.join(permanent_save_folder, "encoder-last.pkl")
+        # Try loading standalone weight files
         decoder_last_path = os.path.join(permanent_save_folder, "decoder-last.pkl")
+        proj_last_path = os.path.join(permanent_save_folder, "proj-last.pkl")
+        encoder_last_path = os.path.join(permanent_save_folder, "encoder-last.pkl")
         loaded_any = False
+
         if os.path.exists(decoder_last_path):
             decoder.load_state_dict(torch.load(decoder_last_path, map_location=device))
             print("[DEBUG] Decoder loaded from saved weight")
             loaded_any = True
-        if os.path.exists(encoder_last_path):
-            encoder.load_state_dict(torch.load(encoder_last_path, map_location=device))
-            print("[DEBUG] Encoder loaded from saved weight")
+        if os.path.exists(proj_last_path):
+            proj.load_state_dict(torch.load(proj_last_path, map_location=device))
+            print("[DEBUG] Projection loaded from saved weight")
             loaded_any = True
+        elif os.path.exists(encoder_last_path):
+            # Backward compat: extract proj from old encoder weights
+            old_enc = torch.load(encoder_last_path, map_location=device)
+            proj_state = {k.replace('proj.', ''): v for k, v in old_enc.items() if 'proj.' in k}
+            if proj_state:
+                proj.proj.load_state_dict(proj_state)
+                print("[DEBUG] Projection loaded from old encoder-last.pkl")
+                loaded_any = True
+            del old_enc
+
         if not loaded_any:
             print("[DEBUG] No checkpoint or pretrained weights found. Training from scratch.")
         else:
@@ -190,37 +291,47 @@ def main(args):
     print(f"[DEBUG] Final start_epoch = {start_epoch}")
     print("=============================")
 
+    # ── Step 6: Training loop ─────────────────────────────────────────
     for epoch in range(start_epoch, args.epoch_num):
         print(f"\n[DEBUG] Training epoch {epoch+1} of {args.epoch_num}")
-        encoder.train()
+        proj.train()
         decoder.train()
 
         factual_train_loss, factual_train_samples = 0.0, 0
         humorous_train_loss, humorous_train_samples = 0.0, 0
 
-        # --- Factual: image + caption ---
+        # --- Factual: precomputed features + caption ---
         optimizer_cap.zero_grad()
-        for i, (images, decoder_input_ids, labels, lengths) in enumerate(train_loader):
-            images = images.to(device)
+        for i, (raw_features, decoder_input_ids, labels, lengths) in enumerate(train_loader):
+            raw_features = raw_features.to(device)
             decoder_input_ids = decoder_input_ids.to(device)
             labels = labels.to(device)
 
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                features = encoder(images)
+                features = proj(raw_features)              # [batch, 1, d_model]
                 set_mode(decoder, "factual")
                 outputs = decoder(decoder_input_ids=decoder_input_ids,
                                    encoder_outputs=(features,), labels=labels)
                 loss = outputs.loss / accum_steps
 
-            loss.backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             if (i + 1) % accum_steps == 0 or i == len(train_loader) - 1:
-                torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
-                optimizer_cap.step()
+                if scaler is not None:
+                    scaler.unscale_(optimizer_cap)
+                    torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
+                    scaler.step(optimizer_cap)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
+                    optimizer_cap.step()
                 optimizer_cap.zero_grad()
 
-            factual_train_loss += loss.item() * accum_steps * images.size(0)
-            factual_train_samples += images.size(0)
+            factual_train_loss += loss.item() * accum_steps * raw_features.size(0)
+            factual_train_samples += raw_features.size(0)
 
             if i % args.log_step_caption == 0 or i == len(train_loader) - 1:
                 print(f"Epoch [{epoch+1}/{args.epoch_num}], CAP, Step [{i}/{len(train_loader)}], Loss: {loss.item()*accum_steps:.4f}")
@@ -243,11 +354,20 @@ def main(args):
                                        encoder_outputs=(dummy_encoder_out,), labels=labels)
                     loss = outputs.loss / accum_steps
 
-                loss.backward()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
                 if (i + 1) % accum_steps == 0 or i == len(train_styled_loader) - 1:
-                    torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-                    optimizer_lang.step()
+                    if scaler is not None:
+                        scaler.unscale_(optimizer_lang)
+                        torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
+                        scaler.step(optimizer_lang)
+                        scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
+                        optimizer_lang.step()
                     optimizer_lang.zero_grad()
 
                 humorous_train_loss += loss.item() * accum_steps * batch_size
@@ -261,21 +381,23 @@ def main(args):
         print(f"\n[EPOCH {epoch+1}] Factual Training Loss:  {avg_factual_loss:.4f}")
         print(f"[EPOCH {epoch+1}] Humorous Training Loss: {avg_humorous_loss:.4f}")
 
+        # ── Validation ────────────────────────────────────────────────
         if (epoch + 1) % 2 == 0 or epoch == args.epoch_num - 1:
-            print(f"[EPOCH {epoch+1}] Running validation...")
-            val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, device, amp_dtype)
+            print(f"[EPOCH {epoch+1}] Running validation …")
+            val_loss = validate_epoch(proj, decoder, val_loader, val_styled_loader, device, amp_dtype, scaler)
             print(f"[EPOCH {epoch+1}] Factual Validation Loss (early stopping): {val_loss:.4f}")
         else:
             print(f"[EPOCH {epoch+1}] Skipping validation this epoch (runs every 2 epochs).")
             val_loss = None
 
+        # ── Early stopping & best model ───────────────────────────────
         if val_loss is not None:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
                 torch.save({
                     'epoch': epoch,
-                    'encoder_state_dict': encoder.state_dict(),
+                    'proj_state_dict': proj.state_dict(),
                     'decoder_state_dict': decoder.state_dict(),
                     'optimizer_cap_state_dict': optimizer_cap.state_dict(),
                     'optimizer_lang_state_dict': optimizer_lang.state_dict(),
@@ -294,13 +416,14 @@ def main(args):
                     print(f"Best factual validation loss was: {best_val_loss:.4f}")
                     break
 
+        # ── Save checkpoint ───────────────────────────────────────────
         torch.save(decoder.state_dict(), os.path.join(permanent_save_folder, 'decoder-last.pkl'))
-        torch.save(encoder.state_dict(), os.path.join(permanent_save_folder, 'encoder-last.pkl'))
+        torch.save(proj.state_dict(), os.path.join(permanent_save_folder, 'proj-last.pkl'))
         torch.save(decoder.state_dict(), os.path.join(args.model_path, 'decoder-last.pkl'))
-        torch.save(encoder.state_dict(), os.path.join(args.model_path, 'encoder-last.pkl'))
+        torch.save(proj.state_dict(), os.path.join(args.model_path, 'proj-last.pkl'))
         torch.save({
             'epoch': epoch,
-            'encoder_state_dict': encoder.state_dict(),
+            'proj_state_dict': proj.state_dict(),
             'decoder_state_dict': decoder.state_dict(),
             'optimizer_cap_state_dict': optimizer_cap.state_dict(),
             'optimizer_lang_state_dict': optimizer_lang.state_dict(),
@@ -313,31 +436,46 @@ def main(args):
 
         print(f"[EPOCH {epoch+1}] Checkpoint saved. Files in folder: {os.listdir(permanent_save_folder)}")
 
+    # ── Load best model for final use ─────────────────────────────────
     if os.path.exists(best_model_path):
-        print(f"\nTraining completed. Loading best model (factual val loss: {best_val_loss:.4f}) for final evaluation...")
+        print(f"\nTraining completed. Loading best model (factual val loss: {best_val_loss:.4f}) for final evaluation …")
         best_checkpoint = torch.load(best_model_path, map_location=device)
-        encoder.load_state_dict(best_checkpoint['encoder_state_dict'])
+        proj.load_state_dict(best_checkpoint['proj_state_dict'])
         decoder.load_state_dict(best_checkpoint['decoder_state_dict'])
         print("Best model loaded successfully!")
     else:
         print("No best model found, using current model weights.")
 
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='StyleNet Bangla (Transformer/mT5 version) - Humorous style')
+    parser = argparse.ArgumentParser(description='StyleNet Bangla (Transformer/mT5) — Precomputed Features')
+
+    # Paths
     parser.add_argument('--model_path', type=str, default='pretrained_models')
     parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images')
+    parser.add_argument('--features_path', type=str, default='/kaggle/working/vit_features.pth',
+                        help='Path to precomputed ViT features. Auto-extracted if missing.')
     parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_caption.txt')
     parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/dataset/data/humorous_generated.txt')
-    parser.add_argument('--caption_batch_size', type=int, default=32)
-    parser.add_argument('--language_batch_size', type=int, default=48)
-    parser.add_argument('--accum_steps', type=int, default=4)
+
+    # Batch sizes — these fit comfortably on T4 with precomputed features
+    parser.add_argument('--caption_batch_size', type=int, default=48)
+    parser.add_argument('--language_batch_size', type=int, default=72)
+    parser.add_argument('--accum_steps', type=int, default=2)
+
+    # Model
     parser.add_argument('--factored_dim', type=int, default=512)
+
+    # Training
     parser.add_argument('--lr_caption', type=float, default=0.00002)
     parser.add_argument('--lr_language', type=float, default=0.00005)
     parser.add_argument('--epoch_num', type=int, default=80)
     parser.add_argument('--patience', type=int, default=7)
     parser.add_argument('--train_split_ratio', type=float, default=0.8)
+
+    # Logging
     parser.add_argument('--log_step_caption', type=int, default=500)
     parser.add_argument('--log_step_language', type=int, default=300)
+
     args = parser.parse_args()
     main(args)
