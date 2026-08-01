@@ -357,9 +357,9 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='StyleNet Bangla with Validation (Transformer decoder)')
     parser.add_argument('--model_path', type=str, default='pretrained_models')
-    parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images')
-    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/dataset/data/factual_caption.txt')
-    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/dataset/data/romantic_data.txt')
+    parser.add_argument('--img_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/Images')
+    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/factual_caption.txt')
+    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/romantic_data.txt')
     parser.add_argument('--caption_batch_size', type=int, default=32)
     parser.add_argument('--language_batch_size', type=int, default=48)
     parser.add_argument('--factored_dim', type=int, default=512)
