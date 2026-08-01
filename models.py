@@ -1,229 +1,228 @@
-"""
-models.py — StyleNet Transformer model definitions.
-
-Components:
-  - FeatureProjection : lightweight nn.Linear for training (precomputed features)
-  - EncoderViT        : full ViT + projection for inference / feature extraction
-  - FactoredFFN       : style-switched adapter injected into mT5 decoder FFN
-  - build_factored_mt5_decoder : patches mT5-base decoder with adapters
-  - set_mode / get_trainable_param_groups : helpers
-"""
-
-import gc
+import sys
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from transformers import ViTModel, MT5ForConditionalGeneration
+from transformers import ViTModel, GPT2LMHeadModel
 
 
-# --------- FeatureProjection (training — precomputed features) ---------
-class FeatureProjection(nn.Module):
-    """Projects pre-extracted ViT CLS features [768] → decoder dim [d_model].
-
-    This tiny layer (~2 MB) replaces the full EncoderViT (~350 MB) during
-    training.  ViT features are precomputed and loaded from disk, so the
-    heavy ViT model never touches the GPU during training.
-    """
-    def __init__(self, vit_dim, decoder_dim):
-        super().__init__()
-        self.proj = nn.Linear(vit_dim, decoder_dim)
-
-    def forward(self, raw_features):
-        """
-        Args:
-            raw_features: [batch, vit_dim]  — pre-extracted ViT CLS tokens
-        Returns:
-            [batch, 1, decoder_dim]  — ready for mT5 cross-attention
-        """
-        return self.proj(raw_features).unsqueeze(1)
-
-
-# --------- EncoderViT (inference & feature extraction) ---------
+# --------- EncoderViT (Transformer version) ---------
 class EncoderViT(nn.Module):
-    """Full encoder: frozen ViT + trainable projection.
-
-    Used for:
-      1) Feature extraction  (extract_raw → raw CLS without projection)
-      2) Inference / sampling (forward → projected features)
-
-    NOT loaded during training — use FeatureProjection instead.
     """
-    def __init__(self, decoder_hidden_size):
+    Frozen ViT-base encoder. Unlike the original, returns the FULL patch
+    sequence (197 tokens: 1 CLS + 196 patches), not just the pooled CLS
+    vector, so the decoder can cross-attend spatially instead of relying
+    on one global vector.
+    """
+    def __init__(self, decoder_hidden_size: int = 768):
         super().__init__()
         self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
-        for p in self.vit.parameters():
-            p.requires_grad = False
-        self.proj = nn.Linear(self.vit.config.hidden_size, decoder_hidden_size)
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        self.vit.eval()
 
-    def forward(self, images):
-        outputs = self.vit(images)
-        features = outputs.last_hidden_state[:, 0, :]   # CLS token
-        features = self.proj(features)                    # [batch, decoder_hidden]
-        return features.unsqueeze(1)                      # [batch, 1, decoder_hidden]
+        # Projects ViT's 768-dim space into the decoder's hidden space.
+        # Sizes happen to match (768 == 768) but kept trainable and explicit
+        # in case you ever swap either backbone.
+        self.A = nn.Linear(self.vit.config.hidden_size, decoder_hidden_size)
+        self.norm = nn.LayerNorm(decoder_hidden_size)
 
     @torch.no_grad()
-    def extract_raw(self, images):
-        """Extract raw ViT CLS features WITHOUT projection (for precomputation)."""
-        outputs = self.vit(images)
-        return outputs.last_hidden_state[:, 0, :]         # [batch, vit_dim=768]
+    def _vit_forward(self, images):
+        return self.vit(images).last_hidden_state  # (B, 197, 768), no grad — frozen
+
+    def forward(self, images):
+        """
+        images: (B, 3, 224, 224)
+        returns: (B, 197, decoder_hidden_size) — patch-level visual features
+        """
+        patch_features = self._vit_forward(images)   # (B, 197, 768)
+        projected = self.A(patch_features)            # (B, 197, decoder_hidden_size)
+        return self.norm(projected)
 
 
-# --------- Factored FFN (transformer analog of Ux Sx Vx) ---------
-class FactoredFFN(nn.Module):
+# --------- FactoredStyleAdapter ---------
+class FactoredStyleAdapter(nn.Module):
     """
-    Mirrors paper eq. (8): Wx = Ux Sx Vx
-    - V: shared (paper's Vx)
-    - S_<style>: style-specific (paper's Sx — S_F, S_R, S_H)
-    - U: shared (paper's Ux) — zero-initialized so the adapter starts as a
-      no-op residual and doesn't perturb pretrained mT5 activations early on.
+    Replaces your per-gate S_fi/S_ff/S_fo/S_fc (or S_ri/S_rf/S_ro/S_rc)
+    matrices with a single low-rank bottleneck on the Transformer hidden
+    state, since there's one hidden stream here instead of four LSTM gates.
+    One instance per style, same "factored_dim" bottleneck concept as your
+    original code.
     """
-    def __init__(self, hidden_dim, factored_dim):
+    def __init__(self, hidden_size: int, factored_dim: int):
         super().__init__()
-        self.V = nn.Linear(hidden_dim, factored_dim)
-        self.S_factual = nn.Linear(factored_dim, factored_dim)
-        self.S_romantic = nn.Linear(factored_dim, factored_dim)
-        self.S_humorous = nn.Linear(factored_dim, factored_dim)
-        self.U = nn.Linear(factored_dim, hidden_dim)
+        self.V_style = nn.Linear(hidden_size, factored_dim, bias=False)
+        self.U_style = nn.Linear(factored_dim, hidden_size, bias=False)
+        self.act = nn.GELU()
+        self.norm = nn.LayerNorm(hidden_size)
 
-        # Zero-init U: adapter output starts at 0, grows gradually during training.
-        # Prevents large-magnitude residual additions on top of pretrained weights.
-        nn.init.zeros_(self.U.weight)
-        nn.init.zeros_(self.U.bias)
+        # Small init so this starts close to identity (residual-friendly),
+        # matching the fact that your original S matrices were also just
+        # linear layers with default init sitting on top of a working LSTM.
+        nn.init.xavier_uniform_(self.V_style.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.U_style.weight, gain=0.1)
 
-    def forward(self, x, mode):
-        h = self.V(x)
-        style_map = {"factual": self.S_factual, "romantic": self.S_romantic, "humorous": self.S_humorous}
-        if mode not in style_map:
-            raise ValueError(f"Unknown mode: {mode}. Only 'factual', 'romantic', 'humorous' supported.")
-        h = style_map[mode](h)
-        return self.U(F.relu(h))
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        z = self.act(self.V_style(hidden_states))   # (B, T, hidden) -> (B, T, factored_dim)
+        delta = self.U_style(z)                       # (B, T, factored_dim) -> (B, T, hidden)
+        return self.norm(hidden_states + delta)
 
 
-def _patch_cross_attn_for_style_mode(block):
-    """Control cross-attention per style mode.
-
-    - factual:   full cross-attention (1.0 × visual signal)
-    - romantic:  scaled cross-attention (0.5 × visual signal) — grounded but styled
-    - humorous:  scaled cross-attention (0.5 × visual signal) — grounded but styled
-
-    During STYLED TRAINING (text-only), dummy zero encoder outputs are passed,
-    so cross-attention produces zeros regardless of scaling.
-
-    During INFERENCE, real image features are passed for ALL modes.
-    The 0.5 scaling ensures styled captions stay grounded to the image
-    without being overwhelmed by visual signal (same idea as the LSTM's
-    0.5 * visual_i trick).
+# --------- TransformerFactoredDecoder ---------
+class TransformerFactoredDecoder(nn.Module):
     """
-    original_forward = block.layer[1].forward
-
-    def new_forward(hidden_states, *args, **kwargs):
-        mode = getattr(block, "current_mode", "factual")
-        result = original_forward(hidden_states, *args, **kwargs)
-
-        if mode == "factual":
-            # Full cross-attention output (unchanged)
-            return result
-        else:
-            # Scale cross-attention residual by 0.5 for styled modes
-            # result[0] is the output hidden_states (after cross-attn + residual)
-            # We scale only the cross-attention contribution, not the full output.
-            # Since the layer does: output = hidden_states + cross_attn(hidden_states),
-            # we approximate: output = hidden_states + 0.5 * cross_attn(hidden_states)
-            # Which is: hidden_states + 0.5 * (result[0] - hidden_states)
-            scaled = hidden_states + 0.5 * (result[0] - hidden_states)
-            return (scaled,) + result[1:]
-
-    block.layer[1].forward = new_forward
-
-
-def _patch_ffn_with_factored_adapter(block, hidden_dim, factored_dim):
-    block.factored_adapter = FactoredFFN(hidden_dim, factored_dim)
-    original_ffn_forward = block.layer[-1].forward
-
-    def new_ffn_forward(hidden_states, *args, **kwargs):
-        out = original_ffn_forward(hidden_states, *args, **kwargs)
-        adapter_out = block.factored_adapter(hidden_states, getattr(block, "current_mode", "factual"))
-        return out + adapter_out
-
-    block.layer[-1].forward = new_ffn_forward
-
-
-def build_factored_mt5_decoder(vocab_size=None, factored_dim=512, pretrained_name='google/mt5-base'):
-    model = MT5ForConditionalGeneration.from_pretrained(pretrained_name)
-    if vocab_size is not None and vocab_size != model.config.vocab_size:
-        model.resize_token_embeddings(vocab_size)
-
-    hidden_dim = model.config.d_model
-    for block in model.decoder.block:
-        block.current_mode = "factual"
-        _patch_ffn_with_factored_adapter(block, hidden_dim, factored_dim)
-        _patch_cross_attn_for_style_mode(block)
-
-    # Delete the mT5 encoder — we use precomputed ViT features instead.
-    # The encoder is ~290M params (~1.2 GB) sitting in VRAM doing nothing.
-    # We always pass encoder_outputs=(features,) directly, so the internal
-    # encoder is never called.
-    del model.encoder
-    gc.collect()
-    torch.cuda.empty_cache()
-    print(f"[INFO] mT5 encoder deleted. Freed ~1.2 GB VRAM.")
-
-    return model
-
-
-def set_mode(model, mode):
-    for block in model.decoder.block:
-        block.current_mode = mode
-
-
-def get_trainable_param_groups(model, cross_attn_blocks=4):
-    """Set up trainable parameter groups.
-
-    Args:
-        model: The patched mT5 decoder model.
-        cross_attn_blocks: Number of *last* decoder blocks whose cross-attention
-            layers are unfrozen.  The original Factored LSTM used only 4 small
-            F_* matrices for visual conditioning — unfreezing cross-attn in the
-            last N blocks is the closest transformer analog without blowing up
-            memory.  Set to 0 to freeze all cross-attn, or len(model.decoder.block)
-            to unfreeze all (not recommended — OOM).
+    Drop-in replacement for FactoredLSTM, backed by flax-community/gpt2-bengali.
+    Preserves your exact mode-dependent behavior:
+      - features=None  -> no visual conditioning at all (text-only training path)
+      - features given -> cross-attention at a mode-dependent strength
+        (1.0 for factual, 0.5 for romantic — your discovered grounding fix)
     """
-    for p in model.parameters():
-        p.requires_grad = False
 
-    cap_params = []
-    lang_params = []
+    VISUAL_SCALE = {
+        "factual": 1.0,
+        "romantic": 0.5,
+        # "humorous": 0.5,   # uncomment when you re-enable humorous mode
+    }
 
-    num_blocks = len(model.decoder.block)
-    cross_attn_start = num_blocks - cross_attn_blocks  # e.g. 12-4 = block 8+
+    def __init__(
+        self,
+        tokenizer,
+        gpt2_name: str = "flax-community/gpt2-bengali",
+        factored_dim: int = 512,
+        num_cross_heads: int = 8,
+    ):
+        super().__init__()
+        self.gpt2 = GPT2LMHeadModel.from_pretrained(gpt2_name)
+        self.hidden_size = self.gpt2.config.n_embd  # 768
 
-    for idx, block in enumerate(model.decoder.block):
-        # Factored adapters (V, U, S_*) — always trainable in every block
-        adapter = block.factored_adapter
-        for p in list(adapter.V.parameters()) + list(adapter.U.parameters()) + list(adapter.S_factual.parameters()):
-            p.requires_grad = True
-            cap_params.append(p)
-        for p in adapter.S_romantic.parameters():
-            p.requires_grad = True
-            lang_params.append(p)
-        for p in adapter.S_humorous.parameters():
-            p.requires_grad = True
-            lang_params.append(p)
+        # --- Ensure the tokenizer has BOS/EOS/PAD, resize embeddings if needed ---
+        added_tokens = 0
+        if tokenizer.pad_token is None:
+            tokenizer.add_special_tokens({"pad_token": "<pad>"})
+            added_tokens += 1
+        if tokenizer.bos_token is None:
+            tokenizer.add_special_tokens({"bos_token": "<bos>"})
+            added_tokens += 1
+        if tokenizer.eos_token is None:
+            tokenizer.add_special_tokens({"eos_token": "<eos>"})
+            added_tokens += 1
+        if added_tokens > 0:
+            self.gpt2.resize_token_embeddings(len(tokenizer))
 
-        # Cross-attention — only unfreeze in the last N blocks
-        if idx >= cross_attn_start:
-            for p in block.layer[1].parameters():
-                p.requires_grad = True
-                cap_params.append(p)
+        self.pad_token_id = tokenizer.pad_token_id
+        self.bos_token_id = tokenizer.bos_token_id
+        self.eos_token_id = tokenizer.eos_token_id
 
-    # model.shared (250K × 768 embedding) stays FROZEN.
-    # Original LSTM had a tiny trainable embedding (vocab × 300), but mT5's
-    # pretrained SentencePiece embeddings already cover Bengali well.
-    # Unfreezing it adds ~1.5 GB of Adam optimizer state for no benefit.
+        # Visual cross-attention: decoder hidden states attend over ViT patches
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_size,
+            num_heads=num_cross_heads,
+            batch_first=True,
+        )
+        self.cross_attn_norm = nn.LayerNorm(self.hidden_size)
 
-    trainable = sum(p.numel() for p in cap_params + lang_params)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"[INFO] Trainable: {trainable:,} / {total:,} params "
-          f"({100*trainable/total:.1f}%) | cross-attn unfrozen in last {cross_attn_blocks} blocks")
+        # One style bottleneck per mode
+        self.style_adapters = nn.ModuleDict({
+            "factual": FactoredStyleAdapter(self.hidden_size, factored_dim),
+            "romantic": FactoredStyleAdapter(self.hidden_size, factored_dim),
+        })
 
-    return cap_params, lang_params
+        self.lm_head = self.gpt2.lm_head  # tied to token embeddings
+
+    def forward(self, captions, features=None, mode="factual"):
+        """
+        captions: (B, T) full BOS...EOS token sequence
+        features: (B, 197, hidden_size) from EncoderViT, or None for text-only
+        mode: "factual" | "romantic"
+
+        returns: logits (B, T-1, vocab_size), aligned to predict captions[:, 1:]
+        """
+        if mode not in self.style_adapters:
+            sys.stderr.write("mode name wrong!\n")
+            raise ValueError(f"Unknown mode: {mode}. Only 'factual' and 'romantic' supported.")
+
+        input_ids = captions[:, :-1]                          # (B, T-1) teacher-forced input
+        attention_mask = (input_ids != self.pad_token_id).long()
+
+        gpt2_out = self.gpt2.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        hidden = gpt2_out.last_hidden_state  # (B, T-1, hidden_size)
+
+        # Visual conditioning — only if features were actually provided.
+        # This is what preserves your exact train/inference asymmetry:
+        # romantic training calls forward with features=None, so this
+        # branch is skipped entirely during styled-mode training.
+        if features is not None:
+            scale = self.VISUAL_SCALE[mode]
+            visual_kv = features * scale                       # (B, 197, hidden_size)
+            attn_out, _ = self.cross_attn(
+                query=hidden, key=visual_kv, value=visual_kv, need_weights=False
+            )
+            hidden = self.cross_attn_norm(hidden + attn_out)   # (B, T-1, hidden_size)
+
+        hidden = self.style_adapters[mode](hidden)              # (B, T-1, hidden_size)
+        logits = self.lm_head(hidden)                            # (B, T-1, vocab_size)
+        return logits
+
+    @torch.no_grad()
+    def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual",
+               repetition_penalty=1.3):
+        """
+        Beam search generation. Same accumulation structure as your original
+        (score, sequence, normalized-length sorting) — just driven by GPT2's
+        parallel hidden states instead of an LSTM's (h_t, c_t) recurrence.
+
+        feature: (1, 197, hidden_size) from EncoderViT for a single image.
+        NOTE: as in your original, ALL modes receive visual features during
+        inference; scaling by VISUAL_SCALE[mode] happens inside forward().
+        """
+        device = feature.device
+        start_id = self.bos_token_id
+        end_id = self.eos_token_id
+
+        candidates = [[0.0, [start_id]]]
+
+        for _ in range(max_len - 1):
+            tmp_candidates = []
+            end_flag = True
+
+            for score, id_seq in candidates:
+                if id_seq[-1] == end_id:
+                    tmp_candidates.append([score, id_seq])
+                    continue
+                end_flag = False
+
+                input_ids = torch.tensor([id_seq], dtype=torch.long, device=device)  # (1, t)
+                logits = self.forward(
+                    torch.cat([input_ids, input_ids[:, -1:]], dim=1),  # pad 1 extra so forward's
+                    features=feature,                                    # internal [:, :-1] slice keeps full seq
+                    mode=mode,
+                )
+                next_token_logits = logits[0, -1, :]  # (vocab_size,) — prediction for next token
+
+                if repetition_penalty != 1.0 and len(id_seq) > 1:
+                    for prev_token_id in set(id_seq):
+                        if next_token_logits[prev_token_id] < 0:
+                            next_token_logits[prev_token_id] *= repetition_penalty
+                        else:
+                            next_token_logits[prev_token_id] /= repetition_penalty
+
+                log_probs = torch.log_softmax(next_token_logits, dim=-1)
+                top_scores, top_indices = torch.topk(log_probs, beam_size)
+
+                for score_val, wid in zip(top_scores, top_indices):
+                    new_score = score + score_val.item()
+                    new_id_seq = id_seq + [int(wid.item())]
+                    tmp_candidates.append([new_score, new_id_seq])
+
+            if end_flag:
+                break
+
+            candidates = sorted(
+                tmp_candidates,
+                key=lambda x: x[0] / len(x[1]),  # normalized log-prob, same as original
+                reverse=True,
+            )[:beam_size]
+
+        return candidates[0][1]
