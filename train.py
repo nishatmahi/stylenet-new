@@ -1,55 +1,44 @@
-"""
-train.py — StyleNet Transformer training with precomputed ViT features.
-
-Memory optimizations for Kaggle T4 (16 GB VRAM):
-  1) Precomputed ViT features  — no ViT on GPU at all (saves ~2.85 GB)
-  2) Delete mT5 encoder         — saves ~1.2 GB
-  3) Gradient checkpointing     — saves ~30-40% activation memory
-  4) fp16 autocast + GradScaler — halves activation memory on T4
-  5) Freeze 95% of parameters   — tiny optimizer states
-  6) Gradient accumulation       — controls peak micro-batch memory
-
-Estimated VRAM usage: ~5-6 GB → batch_size=48 fits comfortably on T4.
-"""
-
 import os
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-
-import argparse
 import gc
+import re
+import argparse
 import random
 import torch
-try:
-    # PyTorch >= 2.1
-    from torch.amp import GradScaler
-except ImportError:
-    # PyTorch < 2.1 fallback
-    from torch.cuda.amp import GradScaler
+import torch.nn as nn
 
-from data_loader import get_precomputed_data_loader, get_styled_data_loader, tokenizer
-from models import FeatureProjection, build_factored_mt5_decoder, set_mode, get_trainable_param_groups
-from extract_features import extract_and_save
+from data_loader import get_data_loader, get_styled_data_loader, tokenizer
+from models import EncoderViT, TransformerFactoredDecoder
+
+# --- Kaggle disk hygiene: keep HF caches off the persistent /kaggle/working quota ---
+os.environ.setdefault("HF_DATASETS_CACHE", "/kaggle/tmp/hf_datasets_cache")
+os.environ.setdefault("TRANSFORMERS_CACHE", "/kaggle/tmp/hf_model_cache")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
-# =====================================================================
-#  Helpers
-# =====================================================================
 def split_caption_file(input_file, train_file, val_file, train_ratio=0.8, seed=42):
     if not os.path.exists(input_file):
         print(f"Warning: {input_file} not found, skipping split")
         return
+
     with open(input_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
+
     random.seed(seed)
     random.shuffle(lines)
+
     split_idx = int(len(lines) * train_ratio)
-    train_lines, val_lines = lines[:split_idx], lines[split_idx:]
+    train_lines = lines[:split_idx]
+    val_lines = lines[split_idx:]
+
     os.makedirs(os.path.dirname(train_file), exist_ok=True)
     os.makedirs(os.path.dirname(val_file), exist_ok=True)
+
     with open(train_file, 'w', encoding='utf-8') as f:
         f.writelines(train_lines)
     with open(val_file, 'w', encoding='utf-8') as f:
         f.writelines(val_lines)
+
     print(f"Split {input_file}: {len(train_lines)} train, {len(val_lines)} val")
 
 
@@ -61,172 +50,152 @@ def create_data_splits(args):
     factual_val = os.path.join(val_dir, 'factual_val.txt')
     split_caption_file(args.factual_caption_path, factual_train, factual_val)
 
-    humorous_train = os.path.join(train_dir, 'humorous_train.txt')
-    humorous_val = os.path.join(val_dir, 'humorous_val.txt')
-    if args.humorous_caption_path and os.path.exists(args.humorous_caption_path):
-        split_caption_file(args.humorous_caption_path, humorous_train, humorous_val)
-    else:
-        print(f"[WARN] humorous_caption_path not found: {args.humorous_caption_path}")
+    romantic_train = os.path.join(train_dir, 'romantic_train.txt')
+    romantic_val = os.path.join(val_dir, 'romantic_val.txt')
+    if args.romantic_caption_path and os.path.exists(args.romantic_caption_path):
+        split_caption_file(args.romantic_caption_path, romantic_train, romantic_val)
 
     return {
         'factual_train': factual_train,
         'factual_val': factual_val,
-        'humorous_train': humorous_train if os.path.exists(humorous_train) else None,
-        'humorous_val': humorous_val if os.path.exists(humorous_val) else None
+        'romantic_train': romantic_train if os.path.exists(romantic_train) else None,
+        'romantic_val': romantic_val if os.path.exists(romantic_val) else None,
     }
 
 
-# =====================================================================
-#  Validation
-# =====================================================================
-def validate_epoch(proj, decoder, val_loader, val_styled_loader, device, amp_dtype, scaler):
-    proj.eval()
+def compute_loss(logits, labels, pad_token_id):
+    """
+    Replaces masked_cross_entropy + the external `lengths` argument.
+    Padding is masked automatically via ignore_index — no separate length
+    bookkeeping needed since GPT2's logits are already shift-aligned inside
+    TransformerFactoredDecoder.forward().
+    """
+    loss_fct = nn.CrossEntropyLoss(ignore_index=pad_token_id)
+    return loss_fct(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+
+
+def validate_epoch(encoder, decoder, val_loader, val_styled_loader, device, pad_token_id):
+    encoder.eval()
     decoder.eval()
+
     factual_loss, factual_samples = 0.0, 0
 
     with torch.no_grad():
         if val_loader:
-            for raw_features, decoder_input_ids, labels, lengths in val_loader:
-                raw_features = raw_features.to(device)
-                decoder_input_ids = decoder_input_ids.to(device)
-                labels = labels.to(device)
+            for images, captions, _ in val_loader:
+                images = images.to(device)
+                captions = captions.long().to(device)
 
-                with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                    features = proj(raw_features)          # [batch, 1, d_model]
-                    set_mode(decoder, "factual")
-                    outputs = decoder(decoder_input_ids=decoder_input_ids,
-                                       encoder_outputs=(features,), labels=labels)
-                factual_loss += outputs.loss.item() * raw_features.size(0)
-                factual_samples += raw_features.size(0)
+                features = encoder(images)
+                logits = decoder(captions, features, mode="factual")
+                loss = compute_loss(logits, captions[:, 1:], pad_token_id)
+
+                factual_loss += loss.item() * captions.size(0)
+                factual_samples += captions.size(0)
 
             if factual_samples > 0:
                 factual_loss /= factual_samples
                 print(f"Validation Factual Loss: {factual_loss:.4f}")
 
         if val_styled_loader:
-            humorous_loss, humorous_samples = 0.0, 0
-            for decoder_input_ids, labels, lengths in val_styled_loader:
-                decoder_input_ids = decoder_input_ids.to(device)
-                labels = labels.to(device)
-                batch_size = decoder_input_ids.size(0)
+            romantic_loss, romantic_samples = 0.0, 0
+            for captions, _ in val_styled_loader:
+                captions = captions.long().to(device)
+                logits = decoder(captions, mode='romantic')  # features=None, text-only — matches training
+                loss = compute_loss(logits, captions[:, 1:], pad_token_id)
 
-                with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                    dummy_encoder_out = torch.zeros(batch_size, 1, decoder.config.d_model, device=device)
-                    set_mode(decoder, "humorous")
-                    outputs = decoder(decoder_input_ids=decoder_input_ids,
-                                       encoder_outputs=(dummy_encoder_out,), labels=labels)
-                humorous_loss += outputs.loss.item() * batch_size
-                humorous_samples += batch_size
+                romantic_loss += loss.item() * captions.size(0)
+                romantic_samples += captions.size(0)
 
-            if humorous_samples > 0:
-                humorous_loss /= humorous_samples
-                print(f"Validation Humorous Loss (monitor only): {humorous_loss:.4f}")
+            if romantic_samples > 0:
+                romantic_loss /= romantic_samples
+                print(f"Validation Romantic Loss (monitor only): {romantic_loss:.4f}")
 
     return factual_loss if factual_samples > 0 else float('inf')
 
 
-def eval_outputs(decoder_input_ids, encoder_outputs, decoder, tok, amp_dtype):
-    """Quick greedy-decode check during training."""
-    with torch.no_grad():
-        with torch.autocast(device_type='cuda', dtype=amp_dtype):
-            set_mode(decoder, "factual")
-            out = decoder(decoder_input_ids=decoder_input_ids, encoder_outputs=encoder_outputs)
-        indices = torch.argmax(out.logits, dim=-1).cpu().numpy()
-        for i in range(min(3, len(indices))):
-            text = tok.decode(indices[i], skip_special_tokens=True)
-            print(f"Generated {i+1}: {text}")
+def eval_outputs(logits, tokenizer):
+    indices = torch.argmax(logits, dim=-1)  # (B, T-1)
+    indices = indices.data.cpu().numpy()
+    for i in range(min(3, len(indices))):
+        text = tokenizer.decode(indices[i], skip_special_tokens=True)
+        print(f"Generated {i+1}: {text}")
 
 
-# =====================================================================
-#  Main
-# =====================================================================
+def save_checkpoint_safely(path, encoder, decoder, optimizer_cap, optimizer_lang, epoch, best_val_loss,
+                            avg_factual_loss, avg_romantic_loss, val_loss, patience_counter):
+    """
+    Atomic overwrite: write to .tmp then os.replace(). Never more than one
+    checkpoint file exists on disk at a time. Frozen ViT weights are
+    excluded — they're re-downloadable and add nothing but disk weight.
+    """
+    tmp_path = path + ".tmp"
+    torch.save({
+        'epoch': epoch,
+        'encoder_state_dict': {k: v for k, v in encoder.state_dict().items() if not k.startswith('vit.')},
+        'decoder_state_dict': decoder.state_dict(),
+        'optimizer_cap_state_dict': optimizer_cap.state_dict(),
+        'optimizer_lang_state_dict': optimizer_lang.state_dict(),
+        'best_val_loss': best_val_loss,
+        'factual_train_loss': avg_factual_loss,
+        'romantic_train_loss': avg_romantic_loss,
+        'val_loss': val_loss,
+        'patience_counter': patience_counter,
+    }, tmp_path)
+    os.replace(tmp_path, path)
+
+
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # ── Mixed precision setup ─────────────────────────────────────────
-    # T4 has native fp16 Tensor Cores.  bf16 may report as "supported"
-    # on newer PyTorch but runs via emulation — fp16 is faster & safer.
-    # GradScaler is required for fp16 to prevent gradient underflow.
-    use_bf16 = (torch.cuda.is_available()
-                and torch.cuda.is_bf16_supported()
-                and torch.cuda.get_device_capability()[0] >= 8)  # Ampere+ only
-
-    if use_bf16:
-        amp_dtype = torch.bfloat16
-        scaler = None  # bf16 doesn't need GradScaler
-        print(f"[INFO] Using bf16 autocast (native hardware support)")
-    else:
-        amp_dtype = torch.float16
-        try:
-            scaler = GradScaler('cuda')     # PyTorch >= 2.1
-        except TypeError:
-            scaler = GradScaler()           # PyTorch < 2.1
-        print(f"[INFO] Using fp16 autocast + GradScaler (T4 / pre-Ampere GPU)")
-
-    # ── Directories ───────────────────────────────────────────────────
-    permanent_save_folder = "stylenet_new_again_models/"
+    permanent_save_folder = "stylenet_transformer_models/"
     os.makedirs(permanent_save_folder, exist_ok=True)
     os.makedirs(args.model_path, exist_ok=True)
 
-    # ── Step 1: Extract ViT features if needed ────────────────────────
-    if not os.path.exists(args.features_path):
-        print("=" * 60)
-        print("STEP 1: Extracting ViT features (runs ONCE, ~10-15 min) …")
-        print("=" * 60)
-        extract_and_save(args.img_path, args.features_path, batch_size=64)
-    else:
-        print(f"[INFO] Precomputed features found: {args.features_path}")
-
-    # ── Step 2: Load precomputed features into CPU memory ─────────────
-    print("[INFO] Loading precomputed features …")
-    features_dict = torch.load(args.features_path, map_location='cpu')
-    vit_dim = next(iter(features_dict.values())).shape[0]  # 768
-    print(f"[INFO] Loaded {len(features_dict)} image features (dim={vit_dim})")
-
-    # ── Step 3: Create data splits & loaders ──────────────────────────
-    print("Creating train/validation splits …")
+    print("Creating train/validation splits...")
     split_paths = create_data_splits(args)
 
-    train_loader = get_precomputed_data_loader(
-        features_dict, split_paths['factual_train'],
+    train_loader = get_data_loader(
+        args.img_path, split_paths['factual_train'],
         batch_size=args.caption_batch_size, shuffle=True)
+
     train_styled_loader = get_styled_data_loader(
-        split_paths['humorous_train'], batch_size=args.language_batch_size,
-        shuffle=True) if split_paths['humorous_train'] else None
+        split_paths['romantic_train'], batch_size=args.language_batch_size,
+        shuffle=True) if split_paths['romantic_train'] else None
 
-    val_loader = get_precomputed_data_loader(
-        features_dict, split_paths['factual_val'],
+    val_loader = get_data_loader(
+        args.img_path, split_paths['factual_val'],
         batch_size=args.caption_batch_size, shuffle=False) if split_paths['factual_val'] else None
+
     val_styled_loader = get_styled_data_loader(
-        split_paths['humorous_val'], batch_size=args.language_batch_size,
-        shuffle=False) if split_paths['humorous_val'] else None
+        split_paths['romantic_val'], batch_size=args.language_batch_size,
+        shuffle=False) if split_paths['romantic_val'] else None
 
-    print(f"Train batches: Factual={len(train_loader)}, Humorous={len(train_styled_loader) if train_styled_loader else 0}")
-    print(f"Val batches: Factual={len(val_loader) if val_loader else 0}, Humorous={len(val_styled_loader) if val_styled_loader else 0}")
+    print(f"Train batches: Factual={len(train_loader)}, "
+          f"Romantic={len(train_styled_loader) if train_styled_loader else 0}")
+    print(f"Val batches: Factual={len(val_loader) if val_loader else 0}, "
+          f"Romantic={len(val_styled_loader) if val_styled_loader else 0}")
 
-    # ── Step 4: Build models ──────────────────────────────────────────
-    decoder = build_factored_mt5_decoder(vocab_size=len(tokenizer), factored_dim=args.factored_dim).to(device)
-    decoder.gradient_checkpointing_enable()
+    # --- Models ---
+    encoder = EncoderViT(decoder_hidden_size=768).to(device)
+    decoder = TransformerFactoredDecoder(
+        tokenizer=tokenizer,
+        gpt2_name="flax-community/gpt2-bengali",
+        factored_dim=args.factored_dim,
+    ).to(device)
 
-    # FeatureProjection: tiny nn.Linear (vit_dim → d_model), ~2 MB
-    proj = FeatureProjection(vit_dim, decoder.config.d_model).to(device)
+    pad_token_id = decoder.pad_token_id
 
-    cap_params, lang_params = get_trainable_param_groups(decoder)
-    cap_params += list(proj.parameters())  # projection is trainable
-
+    # Same optimizer split as your original: cap_params drives factual training
+    # (decoder + encoder's trainable projection), lang_params drives romantic
+    # training (decoder only — encoder.A never sees romantic gradients, same
+    # as before since romantic batches never call encoder()).
+    cap_params = list(decoder.parameters()) + list(encoder.A.parameters())
+    lang_params = list(decoder.parameters())
     optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
     optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
 
-    # Print memory usage after model setup
-    if torch.cuda.is_available():
-        alloc = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"[INFO] GPU memory — allocated: {alloc:.2f} GB, reserved: {reserved:.2f} GB")
-
-    accum_steps = args.accum_steps
-
-    # ── Step 5: Load checkpoint (if exists) ───────────────────────────
     start_epoch = 0
     best_val_loss = float('inf')
     patience_counter = 0
@@ -234,221 +203,115 @@ def main(args):
     checkpoint_path = os.path.join(permanent_save_folder, 'checkpoint-latest.pth')
     best_model_path = os.path.join(permanent_save_folder, 'best_model.pth')
 
-    print("========== [DEBUG] ==========")
-    print(f"permanent_save_folder: {permanent_save_folder}")
-    print(f"checkpoint_path: {checkpoint_path}")
-    print("Files in checkpoint folder BEFORE loading:",
-          os.listdir(permanent_save_folder) if os.path.exists(permanent_save_folder) else "Folder doesn't exist")
-    print("=============================")
-
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
+        encoder.load_state_dict(checkpoint['encoder_state_dict'], strict=False)  # strict=False: vit.* excluded
         decoder.load_state_dict(checkpoint['decoder_state_dict'])
-
-        # Handle both new (proj_state_dict) and old (encoder_state_dict) formats
-        if 'proj_state_dict' in checkpoint:
-            proj.load_state_dict(checkpoint['proj_state_dict'])
-        elif 'encoder_state_dict' in checkpoint:
-            # Old format: extract proj weights from full EncoderViT state dict
-            old_enc = checkpoint['encoder_state_dict']
-            proj_state = {k.replace('proj.', ''): v for k, v in old_enc.items() if 'proj.' in k}
-            if proj_state:
-                proj.proj.load_state_dict(proj_state)
-                print("[DEBUG] Loaded proj weights from old encoder_state_dict")
-
         optimizer_cap.load_state_dict(checkpoint['optimizer_cap_state_dict'])
         optimizer_lang.load_state_dict(checkpoint['optimizer_lang_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         patience_counter = checkpoint.get('patience_counter', 0)
-        print(f"[DEBUG] Loaded checkpoint from epoch {checkpoint['epoch']+1}")
-        print(f"[DEBUG] Best factual val loss so far: {best_val_loss:.4f}")
-        print(f"[DEBUG] Patience counter: {patience_counter}")
-        del checkpoint
-        gc.collect()
+        print(f"[DEBUG] Resumed from epoch {checkpoint['epoch']+1}, best_val_loss={best_val_loss:.4f}")
     else:
-        # Try loading standalone weight files
-        decoder_last_path = os.path.join(permanent_save_folder, "decoder-last.pkl")
-        proj_last_path = os.path.join(permanent_save_folder, "proj-last.pkl")
-        encoder_last_path = os.path.join(permanent_save_folder, "encoder-last.pkl")
-        loaded_any = False
+        print("[DEBUG] No checkpoint found. Training from scratch (GPT2 backbone still pretrained).")
 
-        if os.path.exists(decoder_last_path):
-            decoder.load_state_dict(torch.load(decoder_last_path, map_location=device))
-            print("[DEBUG] Decoder loaded from saved weight")
-            loaded_any = True
-        if os.path.exists(proj_last_path):
-            proj.load_state_dict(torch.load(proj_last_path, map_location=device))
-            print("[DEBUG] Projection loaded from saved weight")
-            loaded_any = True
-        elif os.path.exists(encoder_last_path):
-            # Backward compat: extract proj from old encoder weights
-            old_enc = torch.load(encoder_last_path, map_location=device)
-            proj_state = {k.replace('proj.', ''): v for k, v in old_enc.items() if 'proj.' in k}
-            if proj_state:
-                proj.proj.load_state_dict(proj_state)
-                print("[DEBUG] Projection loaded from old encoder-last.pkl")
-                loaded_any = True
-            del old_enc
-
-        if not loaded_any:
-            print("[DEBUG] No checkpoint or pretrained weights found. Training from scratch.")
-        else:
-            print("[DEBUG] No checkpoint found. Loaded latest pretrained weights only.")
-
-    print(f"[DEBUG] Final start_epoch = {start_epoch}")
-    print("=============================")
-
-    # ── Step 6: Training loop ─────────────────────────────────────────
     for epoch in range(start_epoch, args.epoch_num):
         print(f"\n[DEBUG] Training epoch {epoch+1} of {args.epoch_num}")
-        proj.train()
+        encoder.train()
         decoder.train()
 
         factual_train_loss, factual_train_samples = 0.0, 0
-        humorous_train_loss, humorous_train_samples = 0.0, 0
+        romantic_train_loss, romantic_train_samples = 0.0, 0
 
-        # --- Factual: precomputed features + caption ---
-        optimizer_cap.zero_grad()
-        for i, (raw_features, decoder_input_ids, labels, lengths) in enumerate(train_loader):
-            raw_features = raw_features.to(device)
-            decoder_input_ids = decoder_input_ids.to(device)
-            labels = labels.to(device)
+        logits = None  # for eval_outputs after the loop
+        for i, (images, captions, _) in enumerate(train_loader):
+            images = images.to(device)
+            captions = captions.long().to(device)
 
-            with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                features = proj(raw_features)              # [batch, 1, d_model]
-                set_mode(decoder, "factual")
-                outputs = decoder(decoder_input_ids=decoder_input_ids,
-                                   encoder_outputs=(features,), labels=labels)
-                loss = outputs.loss / accum_steps
+            optimizer_cap.zero_grad(set_to_none=True)
+            features = encoder(images)
+            logits = decoder(captions, features, mode="factual")
+            loss = compute_loss(logits, captions[:, 1:], pad_token_id)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
+            optimizer_cap.step()
 
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            if (i + 1) % accum_steps == 0 or i == len(train_loader) - 1:
-                if scaler is not None:
-                    scaler.unscale_(optimizer_cap)
-                    torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
-                    scaler.step(optimizer_cap)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
-                    optimizer_cap.step()
-                optimizer_cap.zero_grad()
-
-            factual_train_loss += loss.item() * accum_steps * raw_features.size(0)
-            factual_train_samples += raw_features.size(0)
+            factual_train_loss += loss.item() * captions.size(0)
+            factual_train_samples += captions.size(0)
 
             if i % args.log_step_caption == 0 or i == len(train_loader) - 1:
-                print(f"Epoch [{epoch+1}/{args.epoch_num}], CAP, Step [{i}/{len(train_loader)}], Loss: {loss.item()*accum_steps:.4f}")
+                print(f"Epoch [{epoch+1}/{args.epoch_num}], CAP, Step [{i}/{len(train_loader)}], "
+                      f"Loss: {loss.item():.4f}")
 
-        if len(train_loader) > 0:
-            eval_outputs(decoder_input_ids, (features,), decoder, tokenizer, amp_dtype)
+            del images, captions, features, logits, loss
+            if i % 200 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
 
-        # --- Humorous: text only, NO image ---
+        if logits is not None:
+            eval_outputs(logits.detach(), tokenizer)
+
         if train_styled_loader:
-            optimizer_lang.zero_grad()
-            for i, (decoder_input_ids, labels, lengths) in enumerate(train_styled_loader):
-                decoder_input_ids = decoder_input_ids.to(device)
-                labels = labels.to(device)
-                batch_size = decoder_input_ids.size(0)
+            for i, (captions, _) in enumerate(train_styled_loader):
+                captions = captions.long().to(device)
 
-                with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                    dummy_encoder_out = torch.zeros(batch_size, 1, decoder.config.d_model, device=device)
-                    set_mode(decoder, "humorous")
-                    outputs = decoder(decoder_input_ids=decoder_input_ids,
-                                       encoder_outputs=(dummy_encoder_out,), labels=labels)
-                    loss = outputs.loss / accum_steps
+                optimizer_lang.zero_grad(set_to_none=True)
+                logits = decoder(captions, mode='romantic')  # features=None: text-only, matches original
+                loss = compute_loss(logits, captions[:, 1:], pad_token_id)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
+                optimizer_lang.step()
 
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-
-                if (i + 1) % accum_steps == 0 or i == len(train_styled_loader) - 1:
-                    if scaler is not None:
-                        scaler.unscale_(optimizer_lang)
-                        torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-                        scaler.step(optimizer_lang)
-                        scaler.update()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-                        optimizer_lang.step()
-                    optimizer_lang.zero_grad()
-
-                humorous_train_loss += loss.item() * accum_steps * batch_size
-                humorous_train_samples += batch_size
+                romantic_train_loss += loss.item() * captions.size(0)
+                romantic_train_samples += captions.size(0)
 
                 if i % args.log_step_language == 0 or i == len(train_styled_loader) - 1:
-                    print(f"Epoch [{epoch+1}/{args.epoch_num}], HUM, Step [{i}/{len(train_styled_loader)}], Loss: {loss.item()*accum_steps:.4f}")
+                    print(f"Epoch [{epoch+1}/{args.epoch_num}], ROM, Step [{i}/{len(train_styled_loader)}], "
+                          f"Loss: {loss.item():.4f}")
+
+                del captions, logits, loss
+                if i % 200 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
         avg_factual_loss = factual_train_loss / factual_train_samples if factual_train_samples > 0 else 0.0
-        avg_humorous_loss = humorous_train_loss / humorous_train_samples if humorous_train_samples > 0 else 0.0
+        avg_romantic_loss = romantic_train_loss / romantic_train_samples if romantic_train_samples > 0 else 0.0
         print(f"\n[EPOCH {epoch+1}] Factual Training Loss:  {avg_factual_loss:.4f}")
-        print(f"[EPOCH {epoch+1}] Humorous Training Loss: {avg_humorous_loss:.4f}")
+        print(f"[EPOCH {epoch+1}] Romantic Training Loss: {avg_romantic_loss:.4f}")
 
-        # ── Validation ────────────────────────────────────────────────
-        if (epoch + 1) % 2 == 0 or epoch == args.epoch_num - 1:
-            print(f"[EPOCH {epoch+1}] Running validation …")
-            val_loss = validate_epoch(proj, decoder, val_loader, val_styled_loader, device, amp_dtype, scaler)
-            print(f"[EPOCH {epoch+1}] Factual Validation Loss (early stopping): {val_loss:.4f}")
+        print(f"[EPOCH {epoch+1}] Running validation...")
+        val_loss = validate_epoch(encoder, decoder, val_loader, val_styled_loader, device, pad_token_id)
+        print(f"[EPOCH {epoch+1}] Factual Validation Loss (early stopping): {val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            save_checkpoint_safely(best_model_path, encoder, decoder, optimizer_cap, optimizer_lang,
+                                    epoch, best_val_loss, avg_factual_loss, avg_romantic_loss,
+                                    val_loss, patience_counter)
+            print(f"[EPOCH {epoch+1}] New best model saved! Factual val loss: {val_loss:.4f}")
         else:
-            print(f"[EPOCH {epoch+1}] Skipping validation this epoch (runs every 2 epochs).")
-            val_loss = None
+            patience_counter += 1
+            print(f"[EPOCH {epoch+1}] No improvement. Patience: {patience_counter}/{args.patience}")
+            if patience_counter >= args.patience:
+                print(f"[EARLY STOPPING] No improvement for {args.patience} epochs.")
+                print(f"Best factual validation loss was: {best_val_loss:.4f}")
+                break
 
-        # ── Early stopping & best model ───────────────────────────────
-        if val_loss is not None:
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                torch.save({
-                    'epoch': epoch,
-                    'proj_state_dict': proj.state_dict(),
-                    'decoder_state_dict': decoder.state_dict(),
-                    'optimizer_cap_state_dict': optimizer_cap.state_dict(),
-                    'optimizer_lang_state_dict': optimizer_lang.state_dict(),
-                    'best_val_loss': best_val_loss,
-                    'factual_train_loss': avg_factual_loss,
-                    'humorous_train_loss': avg_humorous_loss,
-                    'val_loss': val_loss,
-                    'patience_counter': patience_counter,
-                }, best_model_path)
-                print(f"[EPOCH {epoch+1}] New best model saved! Factual val loss: {val_loss:.4f}")
-            else:
-                patience_counter += 1
-                print(f"[EPOCH {epoch+1}] No improvement. Patience: {patience_counter}/{args.patience}")
-                if patience_counter >= args.patience:
-                    print(f"[EARLY STOPPING] No improvement for {args.patience} epochs. Stopping training.")
-                    print(f"Best factual validation loss was: {best_val_loss:.4f}")
-                    break
+        # Single overwritten "latest" checkpoint — no per-epoch accumulation on disk
+        save_checkpoint_safely(checkpoint_path, encoder, decoder, optimizer_cap, optimizer_lang,
+                                epoch, best_val_loss, avg_factual_loss, avg_romantic_loss,
+                                val_loss, patience_counter)
 
-        # ── Save checkpoint ───────────────────────────────────────────
-        torch.save(decoder.state_dict(), os.path.join(permanent_save_folder, 'decoder-last.pkl'))
-        torch.save(proj.state_dict(), os.path.join(permanent_save_folder, 'proj-last.pkl'))
-        torch.save(decoder.state_dict(), os.path.join(args.model_path, 'decoder-last.pkl'))
-        torch.save(proj.state_dict(), os.path.join(args.model_path, 'proj-last.pkl'))
-        torch.save({
-            'epoch': epoch,
-            'proj_state_dict': proj.state_dict(),
-            'decoder_state_dict': decoder.state_dict(),
-            'optimizer_cap_state_dict': optimizer_cap.state_dict(),
-            'optimizer_lang_state_dict': optimizer_lang.state_dict(),
-            'best_val_loss': best_val_loss,
-            'factual_train_loss': avg_factual_loss,
-            'humorous_train_loss': avg_humorous_loss,
-            'val_loss': val_loss if val_loss is not None else best_val_loss,
-            'patience_counter': patience_counter,
-        }, checkpoint_path)
-
+        gc.collect()
+        torch.cuda.empty_cache()
         print(f"[EPOCH {epoch+1}] Checkpoint saved. Files in folder: {os.listdir(permanent_save_folder)}")
 
-    # ── Load best model for final use ─────────────────────────────────
     if os.path.exists(best_model_path):
-        print(f"\nTraining completed. Loading best model (factual val loss: {best_val_loss:.4f}) for final evaluation …")
+        print(f"\nTraining completed. Loading best model (factual val loss: {best_val_loss:.4f})...")
         best_checkpoint = torch.load(best_model_path, map_location=device)
-        proj.load_state_dict(best_checkpoint['proj_state_dict'])
+        encoder.load_state_dict(best_checkpoint['encoder_state_dict'], strict=False)
         decoder.load_state_dict(best_checkpoint['decoder_state_dict'])
         print("Best model loaded successfully!")
     else:
@@ -456,34 +319,21 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='StyleNet Bangla (Transformer/mT5) — Precomputed Features')
-
-    # Paths
+    parser = argparse.ArgumentParser(description='StyleNet Bangla (Transformer decoder)')
     parser.add_argument('--model_path', type=str, default='pretrained_models')
     parser.add_argument('--img_path', type=str, default='/kaggle/input/dataset/data/Images')
-    parser.add_argument('--features_path', type=str, default='/kaggle/working/vit_features.pth',
-                        help='Path to precomputed ViT features. Auto-extracted if missing.')
-    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/factual_caption.txt')
-    parser.add_argument('--humorous_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/humorous_generated.txt')
-
-    # Batch sizes — these fit comfortably on T4 with precomputed features
-    parser.add_argument('--caption_batch_size', type=int, default=48)
-    parser.add_argument('--language_batch_size', type=int, default=72)
-    parser.add_argument('--accum_steps', type=int, default=2)
-
-    # Model
+    parser.add_argument('--factual_caption_path', type=str,
+                         default='/kaggle/input/dataset/data/factual_caption.txt')
+    parser.add_argument('--romantic_caption_path', type=str,
+                         default='/kaggle/input/dataset/data/romantic_data.txt')
+    parser.add_argument('--caption_batch_size', type=int, default=32)   # lowered from 64: GPT2 backbone is heavier per-step than the old LSTM
+    parser.add_argument('--language_batch_size', type=int, default=48)  # lowered from 96, same reason
     parser.add_argument('--factored_dim', type=int, default=512)
-
-    # Training
     parser.add_argument('--lr_caption', type=float, default=0.00002)
     parser.add_argument('--lr_language', type=float, default=0.00005)
     parser.add_argument('--epoch_num', type=int, default=80)
     parser.add_argument('--patience', type=int, default=7)
-    parser.add_argument('--train_split_ratio', type=float, default=0.8)
-
-    # Logging
-    parser.add_argument('--log_step_caption', type=int, default=500)
-    parser.add_argument('--log_step_language', type=int, default=300)
-
+    parser.add_argument('--log_step_caption', type=int, default=200)
+    parser.add_argument('--log_step_language', type=int, default=100)
     args = parser.parse_args()
     main(args)
