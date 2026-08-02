@@ -6,14 +6,8 @@ from PIL import Image
 from torchvision import transforms
 from transformers import AutoTokenizer
 
-# ---- CHANGED: point at the pretrained Bengali GPT-2 tokenizer instead of
-# the old custom-trained one. This tokenizer already understands Bengali
-# subwords natively — no need for a custom vocab file anymore.
 tokenizer = AutoTokenizer.from_pretrained("flax-community/gpt2-bengali")
 
-# GPT-2 tokenizers typically ship without a pad token. Add one if missing
-# so collate_fn's padding below is well-defined. (models.py also does this
-# defensively — duplicated here so data_loader.py works standalone too.)
 if tokenizer.pad_token is None:
     tokenizer.add_special_tokens({"pad_token": "<pad>"})
 if tokenizer.bos_token is None:
@@ -130,7 +124,7 @@ class FlickrStyle7kBanglaDataset(Dataset):
     def _get_caption(self, caption_file):
         with open(caption_file, 'r', encoding='utf-8') as f:
             caption_list = f.readlines()
-        return [x.strip() for x in caption_list]
+        return [x.strip() for x in caption_list if x.strip()]
 
     def __len__(self):
         return len(self.caption_list)
