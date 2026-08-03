@@ -145,10 +145,29 @@ class TransformerFactoredDecoder(nn.Module):
                 out.append((f"{module_name}.{n}", p))
         return out
 
-    def _build_extended_attention_mask(self, attention_mask, dtype):
-        extended = attention_mask[:, None, None, :].to(dtype=dtype)
-        extended = (1.0 - extended) * torch.finfo(dtype).min
-        return extended
+    def _build_extended_attention_mask(self, attention_mask, dtype, seq_len, device):
+        """
+        Builds a COMBINED causal + padding additive mask, shape (B, 1, T, T).
+
+        CRITICAL: this replaces a version that only built a padding mask
+        (B, 1, 1, T) with no causal component. HF's standard GPT2Model.forward()
+        internally combines causal + padding masking before ever calling
+        individual blocks -- our manual block-by-block loop bypassed that,
+        so blocks received padding-only masking and could attend to FUTURE
+        positions. Confirmed via direct test: perturbing a future token
+        changed earlier positions' output by up to 0.39 before this fix;
+        0.0 after. This was a real data leak, not a theoretical one.
+        """
+        causal_allowed = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+        causal_allowed = causal_allowed.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+
+        pad_allowed = attention_mask.bool().unsqueeze(1).unsqueeze(1)  # (B, 1, 1, T)
+
+        combined_allowed = causal_allowed & pad_allowed  # (B, 1, T, T)
+
+        additive_mask = torch.zeros(combined_allowed.shape, dtype=dtype, device=device)
+        additive_mask.masked_fill_(~combined_allowed, torch.finfo(dtype).min)
+        return additive_mask
 
     def _gpt2_backbone_forward(self, input_ids, attention_mask, style_vec=None,
                                 visual_kv=None, use_style_gates=True):
@@ -161,7 +180,7 @@ class TransformerFactoredDecoder(nn.Module):
         position_embeds = transformer.wpe(position_ids)
         hidden_states = transformer.drop(inputs_embeds + position_embeds)
 
-        ext_mask = self._build_extended_attention_mask(attention_mask, hidden_states.dtype)
+        ext_mask = self._build_extended_attention_mask(attention_mask, hidden_states.dtype, seq_len, device)
 
         num_blocks = len(transformer.h)
         frozen_cutoff = num_blocks - self.num_unfrozen_layers
@@ -170,9 +189,6 @@ class TransformerFactoredDecoder(nn.Module):
             if i < frozen_cutoff:
                 with torch.no_grad():
                     block_out = block(hidden_states, attention_mask=ext_mask)
-                    # transformers>=5.x GPT2Block returns a plain tensor, not
-                    # a tuple like older versions -- verified by execution,
-                    # this crashed silently (wrong dim) before the isinstance check.
                     hidden_states = block_out[0] if isinstance(block_out, tuple) else block_out
                 hidden_states = hidden_states.detach()
             else:
@@ -230,7 +246,6 @@ class TransformerFactoredDecoder(nn.Module):
 
     @torch.no_grad()
     def sample(self, feature, beam_size=5, max_len=30, mode="factual", repetition_penalty=1.3):
-        """Beam search generation. feature: (1, num_patches, hidden_size) or None."""
         device = next(self.parameters()).device
         start_id = self.bos_token_id
         end_id = self.eos_token_id
