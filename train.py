@@ -117,21 +117,15 @@ def eval_outputs(outputs, tokenizer):
         print(f"Generated {i+1}: {text}")
 
 
-def build_param_groups(decoder, encoder, base_lr_pretrained, lr_new, include_encoder_A=True):
-    pretrained_params = list(decoder.t5.parameters())
-
-    new_params = []
-    new_params += list(decoder.style_adapters.parameters())
-    new_params += list(decoder.visual_gate.parameters())
+def build_trainable_params(decoder, encoder, include_encoder_A=True):
+    """T5 backbone is frozen — only collect the small trainable pieces."""
+    params = []
+    params += list(decoder.style_adapters.parameters())
+    params += list(decoder.visual_gate.parameters())
     if include_encoder_A:
-        new_params += list(encoder.A.parameters())
-        new_params += list(encoder.embed_norm.parameters())
-
-    param_groups = [
-        {"params": pretrained_params, "lr": base_lr_pretrained},
-        {"params": new_params, "lr": lr_new},
-    ]
-    return param_groups, pretrained_params + new_params
+        params += list(encoder.A.parameters())
+        params += list(encoder.embed_norm.parameters())
+    return params
 
 
 def main(args):
@@ -175,21 +169,11 @@ def main(args):
 
     criterion = masked_cross_entropy
 
-    cap_param_groups, cap_all_params = build_param_groups(
-        decoder, encoder,
-        base_lr_pretrained=args.lr_caption,
-        lr_new=args.lr_caption_new,
-        include_encoder_A=True,
-    )
-    lang_param_groups, lang_all_params = build_param_groups(
-        decoder, encoder,
-        base_lr_pretrained=args.lr_language,
-        lr_new=args.lr_language_new,
-        include_encoder_A=False,
-    )
+    cap_all_params = build_trainable_params(decoder, encoder, include_encoder_A=True)
+    lang_all_params = build_trainable_params(decoder, encoder, include_encoder_A=False)
 
-    optimizer_cap = torch.optim.Adam(cap_param_groups)
-    optimizer_lang = torch.optim.Adam(lang_param_groups)
+    optimizer_cap = torch.optim.Adam(cap_all_params, lr=args.lr_new)
+    optimizer_lang = torch.optim.Adam(lang_all_params, lr=args.lr_new)
 
     total_cap_steps = len(train_loader) * args.epoch_num
     total_lang_steps = (len(train_styled_loader) if train_styled_loader else 0) * args.epoch_num
@@ -289,7 +273,7 @@ def main(args):
             if i % args.log_step_caption == 0 or i == len(train_loader) - 1:
                 current_lr = optimizer_cap.param_groups[0]['lr']
                 print(f"Epoch [{epoch+1}/{args.epoch_num}], CAP, Step [{i}/{len(train_loader)}], "
-                      f"Loss: {loss.item():.4f}, T5_LR: {current_lr:.2e}")
+                      f"Loss: {loss.item():.4f}, LR: {current_lr:.2e}")
 
         if len(train_loader) > 0:
             eval_outputs(outputs, tokenizer)
@@ -384,21 +368,19 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='StyleNet Bangla (Transformer/BanglaT5) with Validation')
+    parser = argparse.ArgumentParser(description='StyleNet Bangla (Transformer/BanglaT5, frozen backbone)')
     parser.add_argument('--model_path', type=str, default='pretrained_models')
-    parser.add_argument('--vit_cache_dir', type=str, default='/kaggle/working/vit_feature_cache',
-                         help='directory of precomputed .pt ViT feature files (float16) — run the caching script first')
+    parser.add_argument('--vit_cache_dir', type=str, default='/kaggle/working/vit_feature_cache')
     parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/factual_caption.txt')
     parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/romantic_data.txt')
-    parser.add_argument('--caption_batch_size', type=int, default=48)
-    parser.add_argument('--language_batch_size', type=int, default=64)
+    parser.add_argument('--caption_batch_size', type=int, default=32,
+                         help='backbone frozen now — can go higher than the OOM-crashed full-finetune run')
+    parser.add_argument('--language_batch_size', type=int, default=48)
     parser.add_argument('--emb_dim', type=int, default=768)
     parser.add_argument('--t5_ckpt', type=str, default='csebuetnlp/banglat5')
     parser.add_argument('--style_rank', type=int, default=8)
-    parser.add_argument('--lr_caption', type=float, default=0.00001)
-    parser.add_argument('--lr_caption_new', type=float, default=0.0001)
-    parser.add_argument('--lr_language', type=float, default=0.00001)
-    parser.add_argument('--lr_language_new', type=float, default=0.0001)
+    parser.add_argument('--lr_new', type=float, default=0.0001,
+                         help='single LR for all trainable params now that backbone is frozen')
     parser.add_argument('--warmup_steps', type=int, default=500)
     parser.add_argument('--epoch_num', type=int, default=80)
     parser.add_argument('--patience', type=int, default=7)
