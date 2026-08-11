@@ -4,16 +4,17 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
-from transformers import AutoTokenizer
+from transformers import T5Tokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("flax-community/gpt2-bengali")
+# ---- Load BanglaT5's OWN tokenizer — do NOT build/load a separately
+# constructed tokenizer. Token IDs must match what BanglaT5 was pretrained
+# with, or the embedding table lookup is meaningless for most tokens.
+T5_CKPT = "csebuetnlp/banglat5"
+tokenizer = T5Tokenizer.from_pretrained(T5_CKPT, use_fast=False)
 
-if tokenizer.pad_token is None:
-    tokenizer.add_special_tokens({"pad_token": "<pad>"})
 if tokenizer.bos_token is None:
-    tokenizer.add_special_tokens({"bos_token": "<bos>"})
-if tokenizer.eos_token is None:
-    tokenizer.add_special_tokens({"eos_token": "<eos>"})
+    tokenizer.add_special_tokens({"bos_token": "<s>"})
+    # New token gets a fresh row when models.py calls resize_token_embeddings.
 
 
 class Rescale:
@@ -103,6 +104,7 @@ class Flickr7kBanglaDataset(Dataset):
 
     def __getitem__(self, ix):
         img_path, caption = self.imgname_caption_list[ix]
+
         try:
             image = Image.open(img_path)
         except Exception as e:
@@ -124,7 +126,8 @@ class FlickrStyle7kBanglaDataset(Dataset):
     def _get_caption(self, caption_file):
         with open(caption_file, 'r', encoding='utf-8') as f:
             caption_list = f.readlines()
-        return [x.strip() for x in caption_list if x.strip()]
+        caption_list = [x.strip() for x in caption_list]
+        return caption_list
 
     def __len__(self):
         return len(self.caption_list)
@@ -142,8 +145,7 @@ def collate_fn(batch):
         ids = [tokenizer.bos_token_id] + ids + [tokenizer.eos_token_id]
         ids_list.append(torch.tensor(ids, dtype=torch.long))
     max_len = max(len(ids) for ids in ids_list)
-    padded = [torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=torch.long)])
-              for ids in ids_list]
+    padded = [torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=torch.long)]) for ids in ids_list]
     input_ids = torch.stack(padded, 0)
     lengths = torch.tensor([len(ids) for ids in ids_list], dtype=torch.long)
     return images, input_ids, lengths
@@ -156,8 +158,7 @@ def collate_fn_styled(captions):
         ids = [tokenizer.bos_token_id] + ids + [tokenizer.eos_token_id]
         ids_list.append(torch.tensor(ids, dtype=torch.long))
     max_len = max(len(ids) for ids in ids_list)
-    padded = [torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=torch.long)])
-              for ids in ids_list]
+    padded = [torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=torch.long)]) for ids in ids_list]
     input_ids = torch.stack(padded, 0)
     lengths = torch.tensor([len(ids) for ids in ids_list], dtype=torch.long)
     return input_ids, lengths
@@ -165,11 +166,37 @@ def collate_fn_styled(captions):
 
 def get_data_loader(img_dir, caption_file, batch_size, shuffle=False, num_workers=2):
     dataset = Flickr7kBanglaDataset(img_dir, caption_file, transform=image_transform)
-    return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle,
-                       num_workers=num_workers, collate_fn=collate_fn)
+    data_loader = DataLoader(dataset=dataset,
+                              batch_size=batch_size,
+                              shuffle=shuffle,
+                              num_workers=num_workers,
+                              collate_fn=collate_fn)
+    return data_loader
 
 
 def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=2):
     dataset = FlickrStyle7kBanglaDataset(caption_file)
-    return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle,
-                       num_workers=num_workers, collate_fn=collate_fn_styled)
+    data_loader = DataLoader(dataset=dataset,
+                              batch_size=batch_size,
+                              shuffle=shuffle,
+                              num_workers=num_workers,
+                              collate_fn=collate_fn_styled)
+    return data_loader
+
+
+if __name__ == "__main__":
+    img_dir = "/kaggle/input/datasets/kaggleperfect/dataset/data/Images"
+    factual_file = "/kaggle/input/datasets/kaggleperfect/dataset/data/factual_caption.txt"
+    romantic_file = "/kaggle/input/datasets/kaggleperfect/dataset/data/romantic_data.txt"
+
+    data_loader = get_data_loader(img_dir, factual_file, batch_size=3)
+    for i, (images, input_ids, lengths) in enumerate(data_loader):
+        print(f"Batch: {i}", images.shape, input_ids.shape, lengths)
+        if i == 2:
+            break
+
+    styled_loader_romantic = get_styled_data_loader(romantic_file, batch_size=3)
+    for i, (captions, lengths) in enumerate(styled_loader_romantic):
+        print(f"Romantic batch: {i}", captions.shape, lengths)
+        if i == 2:
+            break
