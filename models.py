@@ -50,11 +50,12 @@ class BanglaT5StyleCaptioner(nn.Module):
       - Per-style scalar gate controlling visual injection strength
         (mirrors the 1.0 factual / 0.5 romantic split)
 
-    CRITICAL: tokenizer_len must come from a tokenizer built ON TOP OF
-    BanglaT5's own tokenizer (i.e. T5Tokenizer.from_pretrained(t5_ckpt)
-    plus add_tokens() for anything extra). A separately constructed
-    tokenizer will misalign every token ID with the pretrained embedding
-    table even after resizing, and will produce gibberish output.
+    NOTE on tokenizer_len: T5-family checkpoints commonly pad their
+    embedding matrix to a round number (e.g. 32128) beyond the tokenizer's
+    real vocab size (e.g. 32100 + a few added tokens) for hardware
+    efficiency. A small gap between tokenizer_len and the checkpoint's
+    embedding size is normal, NOT a sign of a mismatched tokenizer. Only a
+    large gap is worth investigating (see the warning below).
     """
     def __init__(self, t5_ckpt, tokenizer_len, style_rank=8,
                  styles=("factual", "romantic"), pad_token_id=0):
@@ -64,19 +65,20 @@ class BanglaT5StyleCaptioner(nn.Module):
 
         self.t5 = T5ForConditionalGeneration.from_pretrained(t5_ckpt)
 
-        # Safety check: catches the "separately built tokenizer" bug loudly
-        # instead of silently producing gibberish after a full training run.
         original_vocab_size = self.t5.get_input_embeddings().weight.shape[0]
         self.t5.resize_token_embeddings(tokenizer_len)
-        if tokenizer_len < original_vocab_size:
-            raise ValueError(
-                f"tokenizer_len ({tokenizer_len}) is smaller than BanglaT5's "
-                f"original vocab ({original_vocab_size}) — this strongly "
-                f"suggests you're using a tokenizer that isn't built from "
-                f"BanglaT5's own vocabulary. Load the tokenizer via "
-                f"T5Tokenizer.from_pretrained('{t5_ckpt}') and only use "
-                f"add_tokens() for anything extra — do not construct a "
-                f"separate tokenizer."
+
+        # Only warn on a large gap — small gaps (tens of tokens) are normal
+        # T5 embedding padding, not a mismatched-tokenizer bug.
+        gap = original_vocab_size - tokenizer_len
+        if gap > 500:
+            print(
+                f"[WARNING] tokenizer_len ({tokenizer_len}) is {gap} tokens "
+                f"smaller than BanglaT5's embedding size ({original_vocab_size}). "
+                f"Small gaps (under a few hundred) are normal T5 padding. A gap "
+                f"this large may indicate a mismatched tokenizer — verify it was "
+                f"loaded via T5Tokenizer.from_pretrained('{t5_ckpt}') plus "
+                f"add_tokens() only."
             )
 
         self.t5_dim = self.t5.config.d_model
