@@ -4,18 +4,17 @@ import torch.nn as nn
 from transformers import ViTModel, T5ForConditionalGeneration
 
 
-# --------- EncoderViT (transformer version) ---------
+# --------- EncoderViT (transformer version, with caching support) ---------
 class EncoderViT(nn.Module):
     """
-    Frozen ViT backbone. Returns the FULL patch sequence (not just CLS),
-    since the T5 decoder's cross-attention needs a sequence of encoder
-    states to attend over, not a single pooled vector.
+    Frozen ViT backbone. Split into extract_raw() (the expensive frozen
+    forward pass — run ONCE per image via the caching script, not every
+    training step) and _project()/forward_from_cache() (the cheap trainable
+    A + embed_norm layers, which must stay live every step since they're
+    being trained).
 
-    embed_norm rescales the projected ViT features to roughly match the
-    scale BanglaT5's own token embeddings live at — without this, the
-    encoder receives out-of-distribution-scale input at initialization,
-    which can inflate starting loss well beyond normal (e.g. >100 instead
-    of the expected ~10-30 range for a ~32K vocab).
+    forward(images) still works end-to-end for cases without caching
+    (e.g. inference on a new image at eval time).
     """
     def __init__(self, emb_dim):
         super(EncoderViT, self).__init__()
@@ -27,22 +26,37 @@ class EncoderViT(nn.Module):
         for param in self.A.parameters():
             param.requires_grad = True
 
-    def forward(self, images):
-        outputs = self.vit(images)
-        features = outputs.last_hidden_state          # [B, N_patches+1, vit_hidden] (includes CLS)
-        features = self.A(features)                   # [B, N_patches+1, emb_dim]
-        features = self.embed_norm(features)           # scale-match to T5 encoder's expected input
+    def extract_raw(self, images):
+        """Frozen ViT forward pass only — no grad needed, safe to run once
+        and cache. Call this from the offline caching script."""
+        with torch.no_grad():
+            outputs = self.vit(images)
+        return outputs.last_hidden_state   # [B, N_patches+1, vit_hidden]
+
+    def _project(self, raw_features):
+        """Trainable projection + norm — cheap, must run every step."""
+        features = self.A(raw_features)
+        features = self.embed_norm(features)
         return features
+
+    def forward_from_cache(self, raw_features):
+        """raw_features: [B, N_patches+1, vit_hidden] loaded from disk cache."""
+        return self._project(raw_features)
+
+    def forward(self, images):
+        """Full path (ViT + projection) — use only when NOT using the cache
+        (e.g. single-image inference on a new, uncached image)."""
+        raw_features = self.extract_raw(images)
+        return self._project(raw_features)
 
 
 class LoRALayer(nn.Module):
-    """Low-rank per-style delta applied on top of shared decoder output.
-    Analogous to S_fi / S_ri style-specific transforms in the LSTM version."""
+    """Low-rank per-style delta applied on top of shared decoder output."""
     def __init__(self, dim, rank):
         super().__init__()
         self.down = nn.Linear(dim, rank, bias=False)
         self.up = nn.Linear(rank, dim, bias=False)
-        nn.init.zeros_(self.up.weight)  # identity at init -> no effect until trained
+        nn.init.zeros_(self.up.weight)
 
     def forward(self, x):
         return x + self.up(self.down(x))
@@ -50,21 +64,6 @@ class LoRALayer(nn.Module):
 
 # --------- BanglaT5StyleCaptioner (replaces FactoredLSTM) ---------
 class BanglaT5StyleCaptioner(nn.Module):
-    """
-    Full pretrained seq2seq (BanglaT5 encoder + decoder).
-      - ViT features fed into the T5 encoder via `inputs_embeds` (bypasses
-        the tokenizer/embedding lookup entirely for the image side)
-      - Per-style LoRA adapters hooked onto every T5 decoder block
-      - Per-style scalar gate controlling visual injection strength
-        (mirrors the 1.0 factual / 0.5 romantic split)
-
-    NOTE on tokenizer_len: T5-family checkpoints commonly pad their
-    embedding matrix to a round number (e.g. 32128) beyond the tokenizer's
-    real vocab size (e.g. 32100 + a few added tokens) for hardware
-    efficiency. A small gap between tokenizer_len and the checkpoint's
-    embedding size is normal, NOT a sign of a mismatched tokenizer. Only a
-    large gap is worth investigating (see the warning below).
-    """
     def __init__(self, t5_ckpt, tokenizer_len, style_rank=8,
                  styles=("factual", "romantic"), pad_token_id=0):
         super().__init__()
@@ -76,23 +75,18 @@ class BanglaT5StyleCaptioner(nn.Module):
         original_vocab_size = self.t5.get_input_embeddings().weight.shape[0]
         self.t5.resize_token_embeddings(tokenizer_len)
 
-        # Only warn on a large gap — small gaps (tens of tokens) are normal
-        # T5 embedding padding, not a mismatched-tokenizer bug.
         gap = original_vocab_size - tokenizer_len
         if gap > 500:
             print(
                 f"[WARNING] tokenizer_len ({tokenizer_len}) is {gap} tokens "
                 f"smaller than BanglaT5's embedding size ({original_vocab_size}). "
                 f"Small gaps (under a few hundred) are normal T5 padding. A gap "
-                f"this large may indicate a mismatched tokenizer — verify it was "
-                f"loaded via T5Tokenizer.from_pretrained('{t5_ckpt}') plus "
-                f"add_tokens() only."
+                f"this large may indicate a mismatched tokenizer."
             )
 
         self.t5_dim = self.t5.config.d_model
         self.n_decoder_layers = self.t5.config.num_decoder_layers
 
-        # Per-style LoRA adapters, one per decoder layer (the S_fi/S_ri set)
         self.style_adapters = nn.ModuleDict({
             style: nn.ModuleList([
                 LoRALayer(self.t5_dim, style_rank) for _ in range(self.n_decoder_layers)
@@ -100,7 +94,6 @@ class BanglaT5StyleCaptioner(nn.Module):
             for style in self.styles
         })
 
-        # Per-style visual gate (1.0 factual / 0.5 romantic scaling)
         init_gate = {"factual": 1.0, "romantic": 0.5}
         self.visual_gate = nn.ParameterDict({
             style: nn.Parameter(torch.tensor(init_gate.get(style, 1.0)))
@@ -111,8 +104,6 @@ class BanglaT5StyleCaptioner(nn.Module):
         self._register_adapter_hooks()
 
     def _register_adapter_hooks(self):
-        """Applies the active style's LoRA delta to each decoder block's
-        output, without modifying T5's internals."""
         def make_hook(layer_idx):
             def hook(module, inputs, output):
                 hidden_states = output[0]
@@ -125,8 +116,6 @@ class BanglaT5StyleCaptioner(nn.Module):
             block.register_forward_hook(make_hook(i))
 
     def _build_encoder_memory(self, features, mode, batch_size, device):
-        """features: [B, N, t5_dim] from EncoderViT, or None for text-only
-        (romantic) training — mirrors the `features=None -> zeros` branch."""
         if features is not None:
             memory = self.visual_gate[mode] * features
             attn_mask = torch.ones(memory.shape[:2], dtype=torch.long, device=device)
@@ -136,15 +125,6 @@ class BanglaT5StyleCaptioner(nn.Module):
         return memory, attn_mask
 
     def forward(self, captions, features=None, mode="factual"):
-        """
-        Args:
-            captions: [B, T] token ids, BOS...EOS
-            features: [B, N, emb_dim] ViT sequence from EncoderViT, or None
-            mode: "factual" or "romantic"
-
-        Returns logits of shape [B, T-1, vocab] — directly comparable to
-        captions[:, 1:], same convention as the original LSTM version.
-        """
         if mode not in self.styles:
             sys.stderr.write("mode name wrong!\n")
             raise ValueError(f"Unknown mode: {mode}. Only {self.styles} supported.")
@@ -155,23 +135,17 @@ class BanglaT5StyleCaptioner(nn.Module):
 
         memory, attn_mask = self._build_encoder_memory(features, mode, batch_size, device)
 
-        decoder_input_ids = captions[:, :-1]   # teacher forcing input (starts at BOS)
+        decoder_input_ids = captions[:, :-1]
         outputs = self.t5(
             inputs_embeds=memory,
             attention_mask=attn_mask,
             decoder_input_ids=decoder_input_ids,
         )
-        return outputs.logits   # [B, T-1, vocab]
+        return outputs.logits
 
     @torch.no_grad()
     def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual",
                repetition_penalty=1.3):
-        """
-        Beam search generation. `feature` is a single image's ViT sequence
-        [1, N, emb_dim]. Same candidate scoring/pruning logic as the
-        original, with decoder_input_ids growing each step instead of
-        (h_t, c_t) recurrence.
-        """
         self._active_style = mode
         device = feature.device
         batch_size = 1
@@ -181,7 +155,7 @@ class BanglaT5StyleCaptioner(nn.Module):
         start_id = tokenizer.bos_token_id
         end_id = tokenizer.eos_token_id
 
-        candidates = [[0.0, [start_id]]]   # [score, id_seq]
+        candidates = [[0.0, [start_id]]]
 
         for _ in range(max_len - 1):
             tmp_candidates = []
