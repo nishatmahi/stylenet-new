@@ -25,10 +25,9 @@ def find_cache_file(cache_dir, img_id):
 
 class Flickr7kBanglaDataset(Dataset):
     """
-    Loads PRECOMPUTED raw ViT features from cache_dir instead of raw images.
-    Run the caching script once before training — this dataset expects
-    cache_dir to already be populated (one .pt file per image, matching the
-    image's basename without extension).
+    Loads PRECOMPUTED raw ViT features (cached as float16 to fit disk
+    quota) from cache_dir instead of raw images. Run the caching script
+    once before training.
     """
     def __init__(self, cache_dir, caption_file):
         self.cache_dir = cache_dir
@@ -74,7 +73,7 @@ class Flickr7kBanglaDataset(Dataset):
 
     def __getitem__(self, ix):
         cache_path, caption = self.imgname_caption_list[ix]
-        raw_features = torch.load(cache_path)   # [N_patches+1, vit_hidden]
+        raw_features = torch.load(cache_path).float()   # cast fp16 cache back to fp32
         return raw_features, caption
 
 
