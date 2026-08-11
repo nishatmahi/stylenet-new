@@ -358,9 +358,9 @@ if __name__ == '__main__':
     parser.add_argument('--vit_cache_dir', type=str, default='/kaggle/working/vit_feature_cache')
     parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/factual_caption.txt')
     parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/romantic_data.txt')
-    parser.add_argument('--caption_batch_size', type=int, default=16,
+    parser.add_argument('--caption_batch_size', type=int, default=48,
                          help='reduced back down since fp32 (no AMP) uses more memory than fp16 would have')
-    parser.add_argument('--language_batch_size', type=int, default=24)
+    parser.add_argument('--language_batch_size', type=int, default=64)
     parser.add_argument('--emb_dim', type=int, default=768)
     parser.add_argument('--t5_ckpt', type=str, default='csebuetnlp/banglat5')
     parser.add_argument('--style_rank', type=int, default=8)
