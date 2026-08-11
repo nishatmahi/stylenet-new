@@ -10,6 +10,12 @@ class EncoderViT(nn.Module):
     Frozen ViT backbone. Returns the FULL patch sequence (not just CLS),
     since the T5 decoder's cross-attention needs a sequence of encoder
     states to attend over, not a single pooled vector.
+
+    embed_norm rescales the projected ViT features to roughly match the
+    scale BanglaT5's own token embeddings live at — without this, the
+    encoder receives out-of-distribution-scale input at initialization,
+    which can inflate starting loss well beyond normal (e.g. >100 instead
+    of the expected ~10-30 range for a ~32K vocab).
     """
     def __init__(self, emb_dim):
         super(EncoderViT, self).__init__()
@@ -17,6 +23,7 @@ class EncoderViT(nn.Module):
         for param in self.vit.parameters():
             param.requires_grad = False
         self.A = nn.Linear(self.vit.config.hidden_size, emb_dim)
+        self.embed_norm = nn.LayerNorm(emb_dim)
         for param in self.A.parameters():
             param.requires_grad = True
 
@@ -24,6 +31,7 @@ class EncoderViT(nn.Module):
         outputs = self.vit(images)
         features = outputs.last_hidden_state          # [B, N_patches+1, vit_hidden] (includes CLS)
         features = self.A(features)                   # [B, N_patches+1, emb_dim]
+        features = self.embed_norm(features)           # scale-match to T5 encoder's expected input
         return features
 
 
