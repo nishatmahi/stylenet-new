@@ -2,53 +2,13 @@ import os
 import re
 import torch
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
-from torchvision import transforms
 from transformers import T5Tokenizer
 
-# ---- Load BanglaT5's OWN tokenizer — do NOT build/load a separately
-# constructed tokenizer. Token IDs must match what BanglaT5 was pretrained
-# with, or the embedding table lookup is meaningless for most tokens.
 T5_CKPT = "csebuetnlp/banglat5"
 tokenizer = T5Tokenizer.from_pretrained(T5_CKPT, use_fast=False)
 
 if tokenizer.bos_token is None:
     tokenizer.add_special_tokens({"bos_token": "<s>"})
-    # New token gets a fresh row when models.py calls resize_token_embeddings.
-
-
-class Rescale:
-    '''Rescale the image to a given size'''
-    def __init__(self, output_size):
-        assert isinstance(output_size, (int, tuple))
-        self.output_size = output_size
-
-    def __call__(self, image):
-        w, h = image.size
-        if isinstance(self.output_size, int):
-            if h > w:
-                new_h, new_w = int(self.output_size * h / w), self.output_size
-            else:
-                new_h, new_w = self.output_size, int(self.output_size * w / h)
-        else:
-            new_h, new_w = self.output_size
-        image = image.resize((new_w, new_h))
-        return image
-
-
-image_transform = transforms.Compose([
-    Rescale((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-])
-
-
-def find_image_with_any_ext(img_folder, img_id):
-    for ext in ['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG']:
-        candidate = os.path.join(img_folder, f"{img_id}.{ext}")
-        if os.path.exists(candidate):
-            return candidate
-    return None
 
 
 def strip_ext(img_id):
@@ -58,12 +18,21 @@ def strip_ext(img_id):
     return img_id
 
 
+def find_cache_file(cache_dir, img_id):
+    candidate = os.path.join(cache_dir, f"{img_id}.pt")
+    return candidate if os.path.exists(candidate) else None
+
+
 class Flickr7kBanglaDataset(Dataset):
-    '''Flickr7k-style dataset for Bangla image-caption'''
-    def __init__(self, img_dir, caption_file, transform=None):
-        self.img_dir = img_dir
+    """
+    Loads PRECOMPUTED raw ViT features from cache_dir instead of raw images.
+    Run the caching script once before training — this dataset expects
+    cache_dir to already be populated (one .pt file per image, matching the
+    image's basename without extension).
+    """
+    def __init__(self, cache_dir, caption_file):
+        self.cache_dir = cache_dir
         self.imgname_caption_list = self._get_imgname_and_caption(caption_file)
-        self.transform = transform if transform else image_transform
 
     def _get_imgname_and_caption(self, caption_file):
         with open(caption_file, 'r', encoding='utf-8') as f:
@@ -81,18 +50,19 @@ class Flickr7kBanglaDataset(Dataset):
 
             img_name, caption = parts[0], parts[1]
             img_id = strip_ext(img_name)
-            img_path = find_image_with_any_ext(self.img_dir, img_id)
+            cache_path = find_cache_file(self.cache_dir, img_id)
 
-            if img_path is None or not os.path.exists(img_path):
+            if cache_path is None:
                 missing += 1
                 continue
 
-            imgname_caption_list.append((img_path, caption))
+            imgname_caption_list.append((cache_path, caption))
 
         if malformed > 0:
             print(f"[WARN] Skipped {malformed} malformed caption lines (no/invalid caption).")
         if missing > 0:
-            print(f"[WARN] Dropped {missing} samples due to missing image files.")
+            print(f"[WARN] Dropped {missing} samples — no cached ViT features found. "
+                  f"Run the caching script first if this number is unexpectedly high.")
 
         if len(imgname_caption_list) == 0:
             raise RuntimeError("[Flickr7kBanglaDataset] No valid samples found after filtering.")
@@ -103,23 +73,13 @@ class Flickr7kBanglaDataset(Dataset):
         return len(self.imgname_caption_list)
 
     def __getitem__(self, ix):
-        img_path, caption = self.imgname_caption_list[ix]
-
-        try:
-            image = Image.open(img_path)
-        except Exception as e:
-            print(f"[ERROR] Could not open image (corrupt?): {img_path}, {e}")
-            image = Image.new("RGB", (224, 224))
-
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        if self.transform is not None:
-            image = self.transform(image)
-        return image, caption
+        cache_path, caption = self.imgname_caption_list[ix]
+        raw_features = torch.load(cache_path)   # [N_patches+1, vit_hidden]
+        return raw_features, caption
 
 
 class FlickrStyle7kBanglaDataset(Dataset):
-    '''Styled caption dataset'''
+    '''Styled caption dataset — unaffected by caching, no images involved.'''
     def __init__(self, caption_file):
         self.caption_list = self._get_caption(caption_file)
 
@@ -137,8 +97,9 @@ class FlickrStyle7kBanglaDataset(Dataset):
 
 
 def collate_fn(batch):
-    images, captions = zip(*batch)
-    images = torch.stack(images, 0)
+    raw_feats, captions = zip(*batch)
+    raw_feats = torch.stack(raw_feats, 0)   # [B, N_patches+1, vit_hidden]
+
     ids_list = []
     for cap in captions:
         ids = tokenizer.encode(cap, add_special_tokens=False)
@@ -148,7 +109,7 @@ def collate_fn(batch):
     padded = [torch.cat([ids, torch.full((max_len - len(ids),), tokenizer.pad_token_id, dtype=torch.long)]) for ids in ids_list]
     input_ids = torch.stack(padded, 0)
     lengths = torch.tensor([len(ids) for ids in ids_list], dtype=torch.long)
-    return images, input_ids, lengths
+    return raw_feats, input_ids, lengths
 
 
 def collate_fn_styled(captions):
@@ -164,39 +125,23 @@ def collate_fn_styled(captions):
     return input_ids, lengths
 
 
-def get_data_loader(img_dir, caption_file, batch_size, shuffle=False, num_workers=2):
-    dataset = Flickr7kBanglaDataset(img_dir, caption_file, transform=image_transform)
+def get_data_loader(cache_dir, caption_file, batch_size, shuffle=False, num_workers=4):
+    dataset = Flickr7kBanglaDataset(cache_dir, caption_file)
     data_loader = DataLoader(dataset=dataset,
                               batch_size=batch_size,
                               shuffle=shuffle,
                               num_workers=num_workers,
+                              pin_memory=True,
                               collate_fn=collate_fn)
     return data_loader
 
 
-def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=2):
+def get_styled_data_loader(caption_file, batch_size, shuffle=False, num_workers=4):
     dataset = FlickrStyle7kBanglaDataset(caption_file)
     data_loader = DataLoader(dataset=dataset,
                               batch_size=batch_size,
                               shuffle=shuffle,
                               num_workers=num_workers,
+                              pin_memory=True,
                               collate_fn=collate_fn_styled)
     return data_loader
-
-
-if __name__ == "__main__":
-    img_dir = "/kaggle/input/datasets/kaggleperfect/dataset/data/Images"
-    factual_file = "/kaggle/input/datasets/kaggleperfect/dataset/data/factual_caption.txt"
-    romantic_file = "/kaggle/input/datasets/kaggleperfect/dataset/data/romantic_data.txt"
-
-    data_loader = get_data_loader(img_dir, factual_file, batch_size=3)
-    for i, (images, input_ids, lengths) in enumerate(data_loader):
-        print(f"Batch: {i}", images.shape, input_ids.shape, lengths)
-        if i == 2:
-            break
-
-    styled_loader_romantic = get_styled_data_loader(romantic_file, batch_size=3)
-    for i, (captions, lengths) in enumerate(styled_loader_romantic):
-        print(f"Romantic batch: {i}", captions.shape, lengths)
-        if i == 2:
-            break
