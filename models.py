@@ -4,18 +4,7 @@ import torch.nn as nn
 from transformers import ViTModel, T5ForConditionalGeneration
 
 
-# --------- EncoderViT (transformer version, with caching support) ---------
 class EncoderViT(nn.Module):
-    """
-    Frozen ViT backbone. Split into extract_raw() (the expensive frozen
-    forward pass — run ONCE per image via the caching script, not every
-    training step) and _project()/forward_from_cache() (the cheap trainable
-    A + embed_norm layers, which must stay live every step since they're
-    being trained).
-
-    forward(images) still works end-to-end for cases without caching
-    (e.g. inference on a new image at eval time).
-    """
     def __init__(self, emb_dim):
         super(EncoderViT, self).__init__()
         self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
@@ -27,31 +16,24 @@ class EncoderViT(nn.Module):
             param.requires_grad = True
 
     def extract_raw(self, images):
-        """Frozen ViT forward pass only — no grad needed, safe to run once
-        and cache. Call this from the offline caching script."""
         with torch.no_grad():
             outputs = self.vit(images)
-        return outputs.last_hidden_state   # [B, N_patches+1, vit_hidden]
+        return outputs.last_hidden_state
 
     def _project(self, raw_features):
-        """Trainable projection + norm — cheap, must run every step."""
         features = self.A(raw_features)
         features = self.embed_norm(features)
         return features
 
     def forward_from_cache(self, raw_features):
-        """raw_features: [B, N_patches+1, vit_hidden] loaded from disk cache."""
         return self._project(raw_features)
 
     def forward(self, images):
-        """Full path (ViT + projection) — use only when NOT using the cache
-        (e.g. single-image inference on a new, uncached image)."""
         raw_features = self.extract_raw(images)
         return self._project(raw_features)
 
 
 class LoRALayer(nn.Module):
-    """Low-rank per-style delta applied on top of shared decoder output."""
     def __init__(self, dim, rank):
         super().__init__()
         self.down = nn.Linear(dim, rank, bias=False)
@@ -62,8 +44,12 @@ class LoRALayer(nn.Module):
         return x + self.up(self.down(x))
 
 
-# --------- BanglaT5StyleCaptioner (replaces FactoredLSTM) ---------
 class BanglaT5StyleCaptioner(nn.Module):
+    """
+    T5 backbone is FROZEN — only LoRA adapters, visual gates, and
+    EncoderViT's A/embed_norm are trainable. Fixes the OOM from full
+    backbone fine-tuning on a 14.5GB GPU.
+    """
     def __init__(self, t5_ckpt, tokenizer_len, style_rank=8,
                  styles=("factual", "romantic"), pad_token_id=0):
         super().__init__()
@@ -79,10 +65,12 @@ class BanglaT5StyleCaptioner(nn.Module):
         if gap > 500:
             print(
                 f"[WARNING] tokenizer_len ({tokenizer_len}) is {gap} tokens "
-                f"smaller than BanglaT5's embedding size ({original_vocab_size}). "
-                f"Small gaps (under a few hundred) are normal T5 padding. A gap "
-                f"this large may indicate a mismatched tokenizer."
+                f"smaller than BanglaT5's embedding size ({original_vocab_size})."
             )
+
+        # Freeze the entire T5 backbone.
+        for param in self.t5.parameters():
+            param.requires_grad = False
 
         self.t5_dim = self.t5.config.d_model
         self.n_decoder_layers = self.t5.config.num_decoder_layers
