@@ -2,7 +2,6 @@ import os
 import argparse
 import torch
 import random
-from torch.cuda.amp import autocast, GradScaler
 from transformers import get_linear_schedule_with_warmup
 from data_loader import get_data_loader, get_styled_data_loader, tokenizer
 from models import EncoderViT, BanglaT5StyleCaptioner
@@ -71,11 +70,10 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, d
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
 
-                with autocast():
-                    features = encoder.forward_from_cache(vit_feats)
-                    outputs = decoder(captions, features, mode="factual")
-                    loss = criterion(outputs.contiguous(),
-                                      captions[:, 1:].contiguous(), lengths - 1)
+                features = encoder.forward_from_cache(vit_feats)
+                outputs = decoder(captions, features, mode="factual")
+                loss = criterion(outputs.contiguous(),
+                                  captions[:, 1:].contiguous(), lengths - 1)
 
                 factual_loss += loss.item() * captions.size(0)
                 factual_samples += captions.size(0)
@@ -92,10 +90,9 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, d
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
 
-                with autocast():
-                    outputs = decoder(captions, features=None, mode='romantic')
-                    loss = criterion(outputs.contiguous(),
-                                      captions[:, 1:].contiguous(), lengths - 1)
+                outputs = decoder(captions, features=None, mode='romantic')
+                loss = criterion(outputs.contiguous(),
+                                  captions[:, 1:].contiguous(), lengths - 1)
 
                 romantic_loss += loss.item() * captions.size(0)
                 romantic_samples += captions.size(0)
@@ -118,7 +115,6 @@ def eval_outputs(outputs, tokenizer):
 
 
 def build_trainable_params(decoder, encoder, include_encoder_A=True):
-    """T5 backbone is frozen — only collect the small trainable pieces."""
     params = []
     params += list(decoder.style_adapters.parameters())
     params += list(decoder.visual_gate.parameters())
@@ -184,9 +180,6 @@ def main(args):
     scheduler_lang = get_linear_schedule_with_warmup(
         optimizer_lang, num_warmup_steps=args.warmup_steps, num_training_steps=max(total_lang_steps, 1)
     )
-
-    scaler_cap = GradScaler()
-    scaler_lang = GradScaler()
 
     start_epoch = 0
     best_val_loss = float('inf')
@@ -254,17 +247,13 @@ def main(args):
             decoder.zero_grad()
             encoder.zero_grad()
 
-            with autocast():
-                features = encoder.forward_from_cache(vit_feats)
-                outputs = decoder(captions, features, mode="factual")
-                loss = criterion(outputs.contiguous(),
-                                  captions[:, 1:].contiguous(), lengths - 1)
-
-            scaler_cap.scale(loss).backward()
-            scaler_cap.unscale_(optimizer_cap)
+            features = encoder.forward_from_cache(vit_feats)
+            outputs = decoder(captions, features, mode="factual")
+            loss = criterion(outputs.contiguous(),
+                              captions[:, 1:].contiguous(), lengths - 1)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(cap_all_params, 1.0)
-            scaler_cap.step(optimizer_cap)
-            scaler_cap.update()
+            optimizer_cap.step()
             scheduler_cap.step()
 
             factual_train_loss += loss.item() * captions.size(0)
@@ -284,16 +273,12 @@ def main(args):
                 lengths = lengths.to(device)
                 decoder.zero_grad()
 
-                with autocast():
-                    outputs = decoder(captions, features=None, mode='romantic')
-                    loss = criterion(outputs.contiguous(),
-                                      captions[:, 1:].contiguous(), lengths - 1)
-
-                scaler_lang.scale(loss).backward()
-                scaler_lang.unscale_(optimizer_lang)
+                outputs = decoder(captions, features=None, mode='romantic')
+                loss = criterion(outputs.contiguous(),
+                                  captions[:, 1:].contiguous(), lengths - 1)
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(lang_all_params, 1.0)
-                scaler_lang.step(optimizer_lang)
-                scaler_lang.update()
+                optimizer_lang.step()
                 scheduler_lang.step()
 
                 romantic_train_loss += loss.item() * captions.size(0)
@@ -368,19 +353,18 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='StyleNet Bangla (Transformer/BanglaT5, frozen backbone)')
+    parser = argparse.ArgumentParser(description='StyleNet Bangla (Transformer/BanglaT5, frozen backbone, fp32)')
     parser.add_argument('--model_path', type=str, default='pretrained_models')
     parser.add_argument('--vit_cache_dir', type=str, default='/kaggle/working/vit_feature_cache')
     parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/factual_caption.txt')
     parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/romantic_data.txt')
-    parser.add_argument('--caption_batch_size', type=int, default=48,
-                         help='backbone frozen now — can go higher than the OOM-crashed full-finetune run')
-    parser.add_argument('--language_batch_size', type=int, default=64)
+    parser.add_argument('--caption_batch_size', type=int, default=16,
+                         help='reduced back down since fp32 (no AMP) uses more memory than fp16 would have')
+    parser.add_argument('--language_batch_size', type=int, default=24)
     parser.add_argument('--emb_dim', type=int, default=768)
     parser.add_argument('--t5_ckpt', type=str, default='csebuetnlp/banglat5')
     parser.add_argument('--style_rank', type=int, default=8)
-    parser.add_argument('--lr_new', type=float, default=0.0001,
-                         help='single LR for all trainable params now that backbone is frozen')
+    parser.add_argument('--lr_new', type=float, default=0.0001)
     parser.add_argument('--warmup_steps', type=int, default=500)
     parser.add_argument('--epoch_num', type=int, default=80)
     parser.add_argument('--patience', type=int, default=7)
