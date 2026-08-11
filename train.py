@@ -2,6 +2,8 @@ import os
 import argparse
 import torch
 import random
+from torch.cuda.amp import autocast, GradScaler
+from transformers import get_linear_schedule_with_warmup
 from data_loader import get_data_loader, get_styled_data_loader, tokenizer
 from models import EncoderViT, BanglaT5StyleCaptioner
 from loss import masked_cross_entropy
@@ -56,10 +58,6 @@ def create_data_splits(args):
 
 
 def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, device):
-    """
-    Early stopping and best model saving are based on factual loss only.
-    Romantic loss is computed and printed for monitoring purposes only.
-    """
     encoder.eval()
     decoder.eval()
 
@@ -68,15 +66,16 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, d
 
     with torch.no_grad():
         if val_loader:
-            for images, captions, lengths in val_loader:
-                images = images.to(device)
+            for vit_feats, captions, lengths in val_loader:
+                vit_feats = vit_feats.to(device)
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
 
-                features = encoder(images)
-                outputs = decoder(captions, features, mode="factual")
-                loss = criterion(outputs.contiguous(),
-                                  captions[:, 1:].contiguous(), lengths - 1)
+                with autocast():
+                    features = encoder.forward_from_cache(vit_feats)
+                    outputs = decoder(captions, features, mode="factual")
+                    loss = criterion(outputs.contiguous(),
+                                      captions[:, 1:].contiguous(), lengths - 1)
 
                 factual_loss += loss.item() * captions.size(0)
                 factual_samples += captions.size(0)
@@ -93,9 +92,10 @@ def validate_epoch(encoder, decoder, val_loader, val_styled_loader, criterion, d
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
 
-                outputs = decoder(captions, features=None, mode='romantic')
-                loss = criterion(outputs.contiguous(),
-                                  captions[:, 1:].contiguous(), lengths - 1)
+                with autocast():
+                    outputs = decoder(captions, features=None, mode='romantic')
+                    loss = criterion(outputs.contiguous(),
+                                      captions[:, 1:].contiguous(), lengths - 1)
 
                 romantic_loss += loss.item() * captions.size(0)
                 romantic_samples += captions.size(0)
@@ -117,6 +117,23 @@ def eval_outputs(outputs, tokenizer):
         print(f"Generated {i+1}: {text}")
 
 
+def build_param_groups(decoder, encoder, base_lr_pretrained, lr_new, include_encoder_A=True):
+    pretrained_params = list(decoder.t5.parameters())
+
+    new_params = []
+    new_params += list(decoder.style_adapters.parameters())
+    new_params += list(decoder.visual_gate.parameters())
+    if include_encoder_A:
+        new_params += list(encoder.A.parameters())
+        new_params += list(encoder.embed_norm.parameters())
+
+    param_groups = [
+        {"params": pretrained_params, "lr": base_lr_pretrained},
+        {"params": new_params, "lr": lr_new},
+    ]
+    return param_groups, pretrained_params + new_params
+
+
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -129,7 +146,7 @@ def main(args):
     split_paths = create_data_splits(args)
 
     train_loader = get_data_loader(
-        args.img_path, split_paths['factual_train'],
+        args.vit_cache_dir, split_paths['factual_train'],
         batch_size=args.caption_batch_size, shuffle=True)
 
     train_styled_loader = get_styled_data_loader(
@@ -137,7 +154,7 @@ def main(args):
         shuffle=True) if split_paths['romantic_train'] else None
 
     val_loader = get_data_loader(
-        args.img_path, split_paths['factual_val'],
+        args.vit_cache_dir, split_paths['factual_val'],
         batch_size=args.caption_batch_size, shuffle=False) if split_paths['factual_val'] else None
 
     val_styled_loader = get_styled_data_loader(
@@ -147,11 +164,6 @@ def main(args):
     print(f"Train batches: Factual={len(train_loader)}, Romantic={len(train_styled_loader) if train_styled_loader else 0}")
     print(f"Val batches: Factual={len(val_loader) if val_loader else 0}, Romantic={len(val_styled_loader) if val_styled_loader else 0}")
 
-    # NOTE: emb_dim must equal BanglaT5's d_model (768 for base) since
-    # EncoderViT's output feeds directly into the T5 encoder as inputs_embeds.
-    # NOTE: args.t5_ckpt must match the checkpoint data_loader.py's tokenizer
-    # was built from (T5_CKPT in data_loader.py) — they have to be the same
-    # pretrained model or the vocab/embedding alignment breaks again.
     encoder = EncoderViT(args.emb_dim).to(device)
     decoder = BanglaT5StyleCaptioner(
         t5_ckpt=args.t5_ckpt,
@@ -162,10 +174,35 @@ def main(args):
     ).to(device)
 
     criterion = masked_cross_entropy
-    cap_params = list(decoder.parameters()) + list(encoder.A.parameters())
-    lang_params = list(decoder.parameters())
-    optimizer_cap = torch.optim.Adam(cap_params, lr=args.lr_caption)
-    optimizer_lang = torch.optim.Adam(lang_params, lr=args.lr_language)
+
+    cap_param_groups, cap_all_params = build_param_groups(
+        decoder, encoder,
+        base_lr_pretrained=args.lr_caption,
+        lr_new=args.lr_caption_new,
+        include_encoder_A=True,
+    )
+    lang_param_groups, lang_all_params = build_param_groups(
+        decoder, encoder,
+        base_lr_pretrained=args.lr_language,
+        lr_new=args.lr_language_new,
+        include_encoder_A=False,
+    )
+
+    optimizer_cap = torch.optim.Adam(cap_param_groups)
+    optimizer_lang = torch.optim.Adam(lang_param_groups)
+
+    total_cap_steps = len(train_loader) * args.epoch_num
+    total_lang_steps = (len(train_styled_loader) if train_styled_loader else 0) * args.epoch_num
+
+    scheduler_cap = get_linear_schedule_with_warmup(
+        optimizer_cap, num_warmup_steps=args.warmup_steps, num_training_steps=total_cap_steps
+    )
+    scheduler_lang = get_linear_schedule_with_warmup(
+        optimizer_lang, num_warmup_steps=args.warmup_steps, num_training_steps=max(total_lang_steps, 1)
+    )
+
+    scaler_cap = GradScaler()
+    scaler_lang = GradScaler()
 
     start_epoch = 0
     best_val_loss = float('inf')
@@ -225,26 +262,34 @@ def main(args):
         romantic_train_loss = 0.0
         romantic_train_samples = 0
 
-        for i, (images, captions, lengths) in enumerate(train_loader):
-            images = images.to(device)
+        for i, (vit_feats, captions, lengths) in enumerate(train_loader):
+            vit_feats = vit_feats.to(device)
             captions = captions.long().to(device)
             lengths = lengths.to(device)
 
             decoder.zero_grad()
             encoder.zero_grad()
-            features = encoder(images)
-            outputs = decoder(captions, features, mode="factual")
-            loss = criterion(outputs.contiguous(),
-                              captions[:, 1:].contiguous(), lengths - 1)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(cap_params, 1.0)
-            optimizer_cap.step()
+
+            with autocast():
+                features = encoder.forward_from_cache(vit_feats)
+                outputs = decoder(captions, features, mode="factual")
+                loss = criterion(outputs.contiguous(),
+                                  captions[:, 1:].contiguous(), lengths - 1)
+
+            scaler_cap.scale(loss).backward()
+            scaler_cap.unscale_(optimizer_cap)
+            torch.nn.utils.clip_grad_norm_(cap_all_params, 1.0)
+            scaler_cap.step(optimizer_cap)
+            scaler_cap.update()
+            scheduler_cap.step()
 
             factual_train_loss += loss.item() * captions.size(0)
             factual_train_samples += captions.size(0)
 
             if i % args.log_step_caption == 0 or i == len(train_loader) - 1:
-                print(f"Epoch [{epoch+1}/{args.epoch_num}], CAP, Step [{i}/{len(train_loader)}], Loss: {loss.item():.4f}")
+                current_lr = optimizer_cap.param_groups[0]['lr']
+                print(f"Epoch [{epoch+1}/{args.epoch_num}], CAP, Step [{i}/{len(train_loader)}], "
+                      f"Loss: {loss.item():.4f}, T5_LR: {current_lr:.2e}")
 
         if len(train_loader) > 0:
             eval_outputs(outputs, tokenizer)
@@ -254,12 +299,18 @@ def main(args):
                 captions = captions.long().to(device)
                 lengths = lengths.to(device)
                 decoder.zero_grad()
-                outputs = decoder(captions, features=None, mode='romantic')
-                loss = criterion(outputs.contiguous(),
-                                  captions[:, 1:].contiguous(), lengths - 1)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(lang_params, 1.0)
-                optimizer_lang.step()
+
+                with autocast():
+                    outputs = decoder(captions, features=None, mode='romantic')
+                    loss = criterion(outputs.contiguous(),
+                                      captions[:, 1:].contiguous(), lengths - 1)
+
+                scaler_lang.scale(loss).backward()
+                scaler_lang.unscale_(optimizer_lang)
+                torch.nn.utils.clip_grad_norm_(lang_all_params, 1.0)
+                scaler_lang.step(optimizer_lang)
+                scaler_lang.update()
+                scheduler_lang.step()
 
                 romantic_train_loss += loss.item() * captions.size(0)
                 romantic_train_samples += captions.size(0)
@@ -333,36 +384,27 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='StyleNet Bangla (Transformer/BanglaT5) with Validation: Generating Attractive Visual Captions with Styles')
-    parser.add_argument('--model_path', type=str, default='pretrained_models',
-                         help='path for saving trained models')
-    parser.add_argument('--img_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/Images',
-                         help='path for train images directory')
-    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/factual_caption.txt',
-                         help='path for factual caption file')
-    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/romantic_data.txt',
-                         help='path for romantic caption file')
+    parser = argparse.ArgumentParser(description='StyleNet Bangla (Transformer/BanglaT5) with Validation')
+    parser.add_argument('--model_path', type=str, default='pretrained_models')
+    parser.add_argument('--vit_cache_dir', type=str, default='/kaggle/working/vit_feature_cache',
+                         help='directory of precomputed .pt ViT feature files — run the caching script first')
+    parser.add_argument('--factual_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/factual_caption.txt')
+    parser.add_argument('--romantic_caption_path', type=str, default='/kaggle/input/datasets/kaggleperfect/dataset/data/romantic_data.txt')
     parser.add_argument('--caption_batch_size', type=int, default=48,
-                         help='mini batch size for caption model training')
+                         help='increased from 16 — no more raw image loading/ViT forward per step frees up memory')
     parser.add_argument('--language_batch_size', type=int, default=64,
-                         help='mini batch size for language model training')
-    parser.add_argument('--emb_dim', type=int, default=768,
-                         help='must equal BanglaT5 d_model (768 for banglat5 base)')
-    parser.add_argument('--t5_ckpt', type=str, default='csebuetnlp/banglat5',
-                         help='pretrained BanglaT5 checkpoint; must match the checkpoint data_loader.py tokenizer is built from')
-    parser.add_argument('--style_rank', type=int, default=8,
-                         help='rank of per-style LoRA adapters')
-    parser.add_argument('--lr_caption', type=float, default=0.00002,
-                         help='learning rate for caption model training')
-    parser.add_argument('--lr_language', type=float, default=0.00005,
-                         help='learning rate for language model training')
-    parser.add_argument('--epoch_num', type=int, default=80,
-                         help='number of epochs to train')
-    parser.add_argument('--patience', type=int, default=7,
-                         help='patience for early stopping')
-    parser.add_argument('--log_step_caption', type=int, default=200,
-                         help='steps for print log while train caption model')
-    parser.add_argument('--log_step_language', type=int, default=100,
-                         help='steps for print log while train language model')
+                         help='increased from 24')
+    parser.add_argument('--emb_dim', type=int, default=768)
+    parser.add_argument('--t5_ckpt', type=str, default='csebuetnlp/banglat5')
+    parser.add_argument('--style_rank', type=int, default=8)
+    parser.add_argument('--lr_caption', type=float, default=0.00001)
+    parser.add_argument('--lr_caption_new', type=float, default=0.0001)
+    parser.add_argument('--lr_language', type=float, default=0.00001)
+    parser.add_argument('--lr_language_new', type=float, default=0.0001)
+    parser.add_argument('--warmup_steps', type=int, default=500)
+    parser.add_argument('--epoch_num', type=int, default=80)
+    parser.add_argument('--patience', type=int, default=7)
+    parser.add_argument('--log_step_caption', type=int, default=200)
+    parser.add_argument('--log_step_language', type=int, default=100)
     args = parser.parse_args()
     main(args)
