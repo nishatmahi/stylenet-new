@@ -2,65 +2,63 @@ import os
 import torch
 from PIL import Image
 from torchvision import transforms
-from models import EncoderViT, TransformerFactoredDecoder
-from data_loader import Rescale, tokenizer  # SAME tokenizer instance used in training —
-                                              # do not reconstruct a separate one, token
-                                              # ids must match exactly what the model's
-                                              # embeddings/lm_head were trained against.
+from models import EncoderViT, BanglaT5StyleCaptioner
+from data_loader import tokenizer  # SAME tokenizer instance used in training
 
 # ============================================================
-# FILL THESE IN — must match your actual training run exactly
+# FILL THESE IN — must match your actual training run
 # ============================================================
-FACTORED_DIM = 512  # must match --factored_dim used in train.py (default is 512;
-                     # only change this if you passed a different value at train time)
-SAMPLE_IMG_DIR = "/kaggle/input/dataset/data/Images"  # folder of images you want to caption
-CHECKPOINT_PATH = "/kaggle/working/stylenet_transformer_models/best_model.pth"
+STYLE_RANK = 8  # must match --style_rank used in train.py (default 8)
+T5_CKPT = "csebuetnlp/banglat5"  # must match --t5_ckpt used in train.py
+SAMPLE_IMG_DIR = "/kaggle/input/datasets/kaggleperfect/dataset/data/Images"
+CHECKPOINT_PATH = "/kaggle/working/stylenet_new_again_models/best_model.pth"
 # ============================================================
-
 
 def load_sample_images(img_dir, transform):
     img_names = sorted(os.listdir(img_dir))
     img_list = []
     for img_name in img_names:
         img_path = os.path.join(img_dir, img_name)
-        print("Loading image from:", img_path)
         image = Image.open(img_path).convert("RGB")
         if transform:
             image = transform(image)
         img_list.append(image)
     return img_names, img_list
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- Build models exactly as in train.py ---
-encoder = EncoderViT(decoder_hidden_size=768).to(device)
-decoder = TransformerFactoredDecoder(
-    tokenizer=tokenizer,
-    gpt2_name="flax-community/gpt2-bengali",
-    factored_dim=FACTORED_DIM,
+encoder = EncoderViT(emb_dim=768).to(device)
+decoder = BanglaT5StyleCaptioner(
+    t5_ckpt=T5_CKPT,
+    tokenizer_len=len(tokenizer),
+    style_rank=STYLE_RANK,
+    styles=("factual", "romantic"),
+    pad_token_id=tokenizer.pad_token_id,
 ).to(device)
 
-# --- Load from the checkpoint dict train.py actually produces ---
 checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
-
-# strict=False: the checkpoint intentionally excludes frozen vit.*/gpt2.*
-# weights (see save_checkpoint_safely in train.py) since those are
-# re-populated by from_pretrained() automatically above. This is expected,
-# not a sign of a corrupted or partial checkpoint.
-encoder.load_state_dict(checkpoint['encoder_state_dict'], strict=False)
-decoder.load_state_dict(checkpoint['decoder_state_dict'], strict=False)
-
+encoder.load_state_dict(checkpoint['encoder_state_dict'])
+decoder.load_state_dict(checkpoint['decoder_state_dict'])
 print(f"[DEBUG] Loaded checkpoint from epoch {checkpoint['epoch'] + 1}, "
       f"best_val_loss={checkpoint.get('best_val_loss', 'N/A')}")
-print(f"[DEBUG] cross_attn_gate at load time: {decoder.cross_attn_gate.item():.6f}")
 
 encoder.eval()
 decoder.eval()
 
-# --- Same image transform pipeline as data_loader.py ---
+class Rescale:
+    def __init__(self, output_size):
+        self.output_size = output_size
+    def __call__(self, image):
+        w, h = image.size
+        if h > w:
+            new_h, new_w = int(self.output_size * h / w), self.output_size
+        else:
+            new_h, new_w = self.output_size, int(self.output_size * w / h)
+        return image.resize((new_w, new_h))
+
 transform = transforms.Compose([
-    Rescale((224, 224)),
+    Rescale(224),
+    transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
 ])
@@ -68,12 +66,10 @@ transform = transforms.Compose([
 img_names, img_list = load_sample_images(SAMPLE_IMG_DIR, transform)
 
 with torch.no_grad():
-    idx = 4  # whichever image you want
+    idx = 4
     image = img_list[idx].unsqueeze(0).to(device)
-
-    features = encoder(image)  # (1, 197, 768) — full patch sequence, not a pooled vector
+    features = encoder(image)   # (1, N_patches+1, 768) — full patch sequence
     print("Image features shape:", features.shape)
-    print("First 10 values of CLS patch embedding:", features[0, 0, :10].cpu().numpy())
 
     output = decoder.sample(
         features,
