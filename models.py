@@ -2,6 +2,7 @@ import sys
 import torch
 import torch.nn as nn
 from transformers import ViTModel, T5ForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutput
 
 
 class EncoderViT(nn.Module):
@@ -47,8 +48,7 @@ class LoRALayer(nn.Module):
 class BanglaT5StyleCaptioner(nn.Module):
     """
     T5 backbone is FROZEN — only LoRA adapters, visual gates, and
-    EncoderViT's A/embed_norm are trainable. Fixes the OOM from full
-    backbone fine-tuning on a 14.5GB GPU.
+    EncoderViT's A/embed_norm are trainable.
     """
     def __init__(self, t5_ckpt, tokenizer_len, style_rank=8,
                  styles=("factual", "romantic"), pad_token_id=0):
@@ -68,7 +68,6 @@ class BanglaT5StyleCaptioner(nn.Module):
                 f"smaller than BanglaT5's embedding size ({original_vocab_size})."
             )
 
-        # Freeze the entire T5 backbone.
         for param in self.t5.parameters():
             param.requires_grad = False
 
@@ -134,6 +133,8 @@ class BanglaT5StyleCaptioner(nn.Module):
     @torch.no_grad()
     def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual",
                repetition_penalty=1.3):
+        """Slow, uncached, hand-rolled beam search. Kept for reference —
+        use generate_fast() for actual inference."""
         self._active_style = mode
         device = feature.device
         batch_size = 1
@@ -191,3 +192,31 @@ class BanglaT5StyleCaptioner(nn.Module):
             )[:beam_size]
 
         return candidates[0][1]
+
+    @torch.no_grad()
+    def generate_fast(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual",
+                       repetition_penalty=1.3):
+        """
+        Fast beam search via HF's built-in generate() — KV-cached and
+        beam-batched. Use this for all real inference; sample() above is
+        slow (one uncached full forward pass per beam per step).
+        """
+        self._active_style = mode
+        device = feature.device
+        batch_size = feature.size(0)
+
+        memory, attn_mask = self._build_encoder_memory(feature, mode, batch_size, device)
+        encoder_outputs = BaseModelOutput(last_hidden_state=memory)
+
+        output_ids = self.t5.generate(
+            encoder_outputs=encoder_outputs,
+            attention_mask=attn_mask,
+            num_beams=beam_size,
+            max_length=max_len,
+            repetition_penalty=repetition_penalty,
+            decoder_start_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            early_stopping=True,
+        )
+        return output_ids[0].tolist()
