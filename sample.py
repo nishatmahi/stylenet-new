@@ -11,7 +11,7 @@ from data_loader import tokenizer
 T5_CKPT       = "csebuetnlp/banglat5"
 STYLE_RANK    = 8                       # must match --style_rank in train.py
 CHECKPOINT    = "/kaggle/working/stylenet_new_again_models/best_model.pth"
-IMG_DIR       = config.simg_path
+IMG_DIR       = "/kaggle/input/datasets/kaggleperfect/sample-data/sample/sample_images"
 VIT_CACHE_DIR = "/kaggle/working/vit_feature_cache"
 
 MODES     = ["factual", "romantic"]
