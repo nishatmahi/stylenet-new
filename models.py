@@ -1,222 +1,153 @@
-import sys
 import torch
 import torch.nn as nn
-from transformers import ViTModel, T5ForConditionalGeneration
+from transformers import T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 
 
-class EncoderViT(nn.Module):
-    def __init__(self, emb_dim):
-        super(EncoderViT, self).__init__()
-        self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
-        for param in self.vit.parameters():
-            param.requires_grad = False
-        self.A = nn.Linear(self.vit.config.hidden_size, emb_dim)
-        self.embed_norm = nn.LayerNorm(emb_dim)
-        for param in self.A.parameters():
-            param.requires_grad = True
-
-    def extract_raw(self, images):
-        with torch.no_grad():
-            outputs = self.vit(images)
-        return outputs.last_hidden_state
-
-    def _project(self, raw_features):
-        features = self.A(raw_features)
-        features = self.embed_norm(features)
-        return features
-
-    def forward_from_cache(self, raw_features):
-        return self._project(raw_features)
-
-    def forward(self, images):
-        raw_features = self.extract_raw(images)
-        return self._project(raw_features)
-
-
-class LoRALayer(nn.Module):
-    def __init__(self, dim, rank):
+class VisualProjector(nn.Module):
+    """Cached ViT patch tokens -> T5 d_model. The paper's matrix A."""
+    def __init__(self, vit_hidden, d_model):
         super().__init__()
-        self.down = nn.Linear(dim, rank, bias=False)
-        self.up = nn.Linear(rank, dim, bias=False)
-        nn.init.zeros_(self.up.weight)
+        self.A = nn.Linear(vit_hidden, d_model)
+        self.ln = nn.LayerNorm(d_model)
+
+    def forward(self, raw_features):
+        return self.ln(self.A(raw_features))
+
+
+class FactoredStyleFFN(nn.Module):
+    """
+    StyleNet's W = U * S_style * V (paper eq. 8), applied to a decoder FFN:
+
+        y = base_ffn(x) + U( S_style( V(x) ) )
+
+    {U} and {V} shared across styles; {S} style-specific — exactly the split
+    in paper sec 3.2. U zero-init and every S identity-init means the branch
+    is an exact no-op at step 0, so the style path perturbs the grounded
+    captioner instead of replacing it. Rewriting the FFN as U*S*V outright
+    would discard BanglaT5's pretrained weights.
+    """
+    def __init__(self, base_ffn, d_model, factored_dim, styles):
+        super().__init__()
+        self.base = base_ffn
+        self.V = nn.Linear(d_model, factored_dim, bias=False)
+        self.U = nn.Linear(factored_dim, d_model, bias=False)
+        self.S = nn.ModuleDict({s: nn.Linear(factored_dim, factored_dim, bias=False)
+                                for s in styles})
+
+        nn.init.normal_(self.V.weight, std=0.02)
+        nn.init.zeros_(self.U.weight)
+        for lin in self.S.values():
+            nn.init.eye_(lin.weight)
+
+        self.mode = "factual"
 
     def forward(self, x):
-        return x + self.up(self.down(x))
+        return self.base(x) + self.U(self.S[self.mode](self.V(x)))
 
 
 class BanglaT5StyleCaptioner(nn.Module):
-    """
-    T5 backbone is FROZEN — only LoRA adapters, visual gates, and
-    EncoderViT's A/embed_norm are trainable.
-    """
-    def __init__(self, t5_ckpt, tokenizer_len, style_rank=8,
-                 styles=("factual", "romantic"), pad_token_id=0):
+    def __init__(self, t5_ckpt="csebuetnlp/banglat5", vit_hidden=768,
+                 factored_dim=512, styles=("factual", "romantic"),
+                 memory_len=197, gradient_checkpointing=True):
         super().__init__()
-        self.styles = list(styles)
-        self.pad_token_id = pad_token_id
-
         self.t5 = T5ForConditionalGeneration.from_pretrained(t5_ckpt)
+        self.config = self.t5.config
+        self.d_model = self.config.d_model
+        self.styles = list(styles)
+        self.memory_len = memory_len
 
-        original_vocab_size = self.t5.get_input_embeddings().weight.shape[0]
-        self.t5.resize_token_embeddings(tokenizer_len)
+        # No resize_token_embeddings: tokenizer len (32100) < embedding rows
+        # (32128); the spare rows are never indexed.
 
-        gap = original_vocab_size - tokenizer_len
-        if gap > 500:
-            print(
-                f"[WARNING] tokenizer_len ({tokenizer_len}) is {gap} tokens "
-                f"smaller than BanglaT5's embedding size ({original_vocab_size})."
-            )
+        self.projector = VisualProjector(vit_hidden, self.d_model)
 
-        for param in self.t5.parameters():
-            param.requires_grad = False
+        # The T5 text encoder is unreachable once encoder_outputs is supplied.
+        # Dropping its blocks frees ~1.2GB, which pays for unfreezing the
+        # decoder. Shared embeddings live on self.t5.shared and are kept.
+        self.t5.encoder.block = nn.ModuleList()
+        for p in self.t5.encoder.parameters():
+            p.requires_grad = False
 
-        self.t5_dim = self.t5.config.d_model
-        self.n_decoder_layers = self.t5.config.num_decoder_layers
+        self._adapters = []
+        for block in self.t5.decoder.block:
+            ff = block.layer[-1]
+            ff.DenseReluDense = FactoredStyleFFN(
+                ff.DenseReluDense, self.d_model, factored_dim, self.styles)
+            self._adapters.append(ff.DenseReluDense)
 
-        self.style_adapters = nn.ModuleDict({
-            style: nn.ModuleList([
-                LoRALayer(self.t5_dim, style_rank) for _ in range(self.n_decoder_layers)
-            ])
-            for style in self.styles
-        })
+        if gradient_checkpointing:
+            self.t5.gradient_checkpointing_enable()
+            self.t5.config.use_cache = False
 
-        init_gate = {"factual": 1.0, "romantic": 0.5}
-        self.visual_gate = nn.ParameterDict({
-            style: nn.Parameter(torch.tensor(init_gate.get(style, 1.0)))
-            for style in self.styles
-        })
-
-        self._active_style = "factual"
-        self._register_adapter_hooks()
-
-    def _register_adapter_hooks(self):
-        def make_hook(layer_idx):
-            def hook(module, inputs, output):
-                hidden_states = output[0]
-                adapter = self.style_adapters[self._active_style][layer_idx]
-                hidden_states = adapter(hidden_states)
-                return (hidden_states,) + output[1:]
-            return hook
-
-        for i, block in enumerate(self.t5.decoder.block):
-            block.register_forward_hook(make_hook(i))
-
-    def _build_encoder_memory(self, features, mode, batch_size, device):
-        if features is not None:
-            memory = self.visual_gate[mode] * features
-            attn_mask = torch.ones(memory.shape[:2], dtype=torch.long, device=device)
-        else:
-            memory = torch.zeros(batch_size, 1, self.t5_dim, device=device)
-            attn_mask = torch.ones(batch_size, 1, dtype=torch.long, device=device)
-        return memory, attn_mask
-
-    def forward(self, captions, features=None, mode="factual"):
+    def set_mode(self, mode):
         if mode not in self.styles:
-            sys.stderr.write("mode name wrong!\n")
-            raise ValueError(f"Unknown mode: {mode}. Only {self.styles} supported.")
+            raise ValueError(f"Unknown mode: {mode}. Available: {self.styles}")
+        for a in self._adapters:
+            a.mode = mode
 
-        self._active_style = mode
-        batch_size = captions.size(0)
-        device = captions.device
+    def _memory(self, raw_features, batch_size, device, dtype):
+        """raw_features=None -> RANDOM NOISE memory, not zeros.
 
-        memory, attn_mask = self._build_encoder_memory(features, mode, batch_size, device)
+        Paper sec 3.3: the decoder starts from a visual vector with paired
+        images and "a random noise vector otherwise". This matters: zero
+        memory makes T5 cross-attention output exactly zero (no biases), so
+        the style stage would train S_style in a regime where the image
+        pathway is dead, and inference with a real image would be a condition
+        S_style never saw. Noise keeps the pathway live and uninformative.
+        Scale is ~N(0,1) to match the LayerNorm'd projector output.
+        """
+        if raw_features is None:
+            mem = torch.randn(batch_size, self.memory_len, self.d_model,
+                              device=device, dtype=dtype)
+        else:
+            mem = self.projector(raw_features.to(dtype))
+        mask = torch.ones(mem.size(0), mem.size(1), dtype=torch.long, device=device)
+        return mem, mask
 
-        decoder_input_ids = captions[:, :-1]
-        outputs = self.t5(
-            inputs_embeds=memory,
-            attention_mask=attn_mask,
-            decoder_input_ids=decoder_input_ids,
+    def forward(self, labels, raw_features=None, mode="factual"):
+        """labels: [B, L] with -100 on pad. Returns (loss, logits)."""
+        self.set_mode(mode)
+        dtype = self.projector.A.weight.dtype
+        mem, mask = self._memory(raw_features, labels.size(0), labels.device, dtype)
+        out = self.t5(
+            encoder_outputs=BaseModelOutput(last_hidden_state=mem),
+            attention_mask=mask,
+            labels=labels,
         )
-        return outputs.logits
+        return out.loss, out.logits
 
     @torch.no_grad()
-    def sample(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual",
-               repetition_penalty=1.3):
-        """Slow, uncached, hand-rolled beam search. Kept for reference —
-        use generate_fast() for actual inference."""
-        self._active_style = mode
-        device = feature.device
-        batch_size = 1
-
-        memory, attn_mask = self._build_encoder_memory(feature, mode, batch_size, device)
-
-        start_id = tokenizer.bos_token_id
-        end_id = tokenizer.eos_token_id
-
-        candidates = [[0.0, [start_id]]]
-
-        for _ in range(max_len - 1):
-            tmp_candidates = []
-            end_flag = True
-
-            for score, id_seq in candidates:
-                if id_seq[-1] == end_id:
-                    tmp_candidates.append([score, id_seq])
-                    continue
-
-                end_flag = False
-                decoder_input_ids = torch.tensor([id_seq], dtype=torch.long, device=device)
-
-                outputs = self.t5(
-                    inputs_embeds=memory,
-                    attention_mask=attn_mask,
-                    decoder_input_ids=decoder_input_ids,
-                )
-                logits = outputs.logits[0, -1, :]
-
-                if repetition_penalty != 1.0 and len(id_seq) > 1:
-                    for prev_token_id in set(id_seq):
-                        if logits[prev_token_id] < 0:
-                            logits[prev_token_id] *= repetition_penalty
-                        else:
-                            logits[prev_token_id] /= repetition_penalty
-
-                log_probs = torch.log_softmax(logits, dim=-1)
-                top_log_probs, top_ids = torch.sort(log_probs, descending=True)
-                top_log_probs = top_log_probs[:beam_size]
-                top_ids = top_ids[:beam_size]
-
-                for score_val, wid in zip(top_log_probs, top_ids):
-                    new_score = score + score_val.item()
-                    new_id_seq = id_seq + [int(wid.item())]
-                    tmp_candidates.append([new_score, new_id_seq])
-
-            if end_flag:
-                break
-
-            candidates = sorted(
-                tmp_candidates,
-                key=lambda x: x[0] / len(x[1]),
-                reverse=True,
-            )[:beam_size]
-
-        return candidates[0][1]
-
-    @torch.no_grad()
-    def generate_fast(self, feature, tokenizer, beam_size=5, max_len=30, mode="factual",
-                       repetition_penalty=1.3):
-        """
-        Fast beam search via HF's built-in generate() — KV-cached and
-        beam-batched. Use this for all real inference; sample() above is
-        slow (one uncached full forward pass per beam per step).
-        """
-        self._active_style = mode
-        device = feature.device
-        batch_size = feature.size(0)
-
-        memory, attn_mask = self._build_encoder_memory(feature, mode, batch_size, device)
-        encoder_outputs = BaseModelOutput(last_hidden_state=memory)
-
-        output_ids = self.t5.generate(
-            encoder_outputs=encoder_outputs,
-            attention_mask=attn_mask,
-            num_beams=beam_size,
-            max_length=max_len,
+    def generate_caption(self, raw_features=None, mode="factual", batch_size=1,
+                         num_beams=5, max_new_tokens=40, repetition_penalty=1.2,
+                         no_repeat_ngram_size=3, length_penalty=1.0):
+        self.set_mode(mode)
+        device = next(self.parameters()).device
+        dtype = self.projector.A.weight.dtype
+        bs = raw_features.size(0) if raw_features is not None else batch_size
+        mem, mask = self._memory(raw_features, bs, device, dtype)
+        return self.t5.generate(
+            encoder_outputs=BaseModelOutput(last_hidden_state=mem),
+            attention_mask=mask,
+            num_beams=num_beams,
+            max_new_tokens=max_new_tokens,
             repetition_penalty=repetition_penalty,
-            decoder_start_token_id=tokenizer.bos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            length_penalty=length_penalty,
             early_stopping=True,
+            use_cache=True,
         )
-        return output_ids[0].tolist()
+
+
+def load_vit_for_inference(vit_name="google/vit-base-patch16-224-in21k", device="cuda"):
+    """Only for images missing from the feature cache."""
+    from transformers import ViTModel
+    vit = ViTModel.from_pretrained(vit_name).to(device).eval()
+    for p in vit.parameters():
+        p.requires_grad = False
+
+    @torch.no_grad()
+    def extract(images):
+        return vit(pixel_values=images.to(device)).last_hidden_state
+
+    return extract
