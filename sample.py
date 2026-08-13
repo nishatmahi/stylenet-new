@@ -2,52 +2,32 @@ import os
 import torch
 from PIL import Image
 from torchvision import transforms
-from models import EncoderViT, BanglaT5StyleCaptioner
-from data_loader import tokenizer  # SAME tokenizer instance used in training
+
+from config import config
+from models import BanglaT5StyleCaptioner, load_vit_for_inference
+from data_loader import tokenizer, strip_ext
 
 # ============================================================
-# FILL THESE IN — must match your actual training run
-# ============================================================
-STYLE_RANK = 8  # must match --style_rank used in train.py (default 8)
-T5_CKPT = "csebuetnlp/banglat5"  # must match --t5_ckpt used in train.py
-SAMPLE_IMG_DIR = "/kaggle/input/datasets/kaggleperfect/dataset/data/Images"
-CHECKPOINT_PATH = "/kaggle/working/stylenet_new_again_models/best_model.pth"
-# ============================================================
+T5_CKPT        = "csebuetnlp/banglat5"
+FACTORED_DIM   = 256                     # must match --factored_dim in train.py
+CHECKPOINT     = "/kaggle/working/stylenet_t5_models/best_model.pth"
+IMG_DIR        = config.simg_path        # sample folder, same as LSTM sample.py
+VIT_CACHE_DIR  = "/kaggle/working/vit_feature_cache"
 
-def load_sample_images(img_dir, transform):
-    img_names = sorted(os.listdir(img_dir))
-    img_list = []
-    for img_name in img_names:
-        img_path = os.path.join(img_dir, img_name)
-        image = Image.open(img_path).convert("RGB")
-        if transform:
-            image = transform(image)
-        img_list.append(image)
-    return img_names, img_list
+MODES       = ["factual", "romantic"]
+BEAM_SIZE   = 5
+MAX_NEW     = 40
+# ============================================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-encoder = EncoderViT(emb_dim=768).to(device)
-decoder = BanglaT5StyleCaptioner(
-    t5_ckpt=T5_CKPT,
-    tokenizer_len=len(tokenizer),
-    style_rank=STYLE_RANK,
-    styles=("factual", "romantic"),
-    pad_token_id=tokenizer.pad_token_id,
-).to(device)
-
-checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
-encoder.load_state_dict(checkpoint['encoder_state_dict'])
-decoder.load_state_dict(checkpoint['decoder_state_dict'])
-print(f"[DEBUG] Loaded checkpoint from epoch {checkpoint['epoch'] + 1}, "
-      f"best_val_loss={checkpoint.get('best_val_loss', 'N/A')}")
-
-encoder.eval()
-decoder.eval()
 
 class Rescale:
+    """Matches the caching script exactly: int output_size, aspect-preserving,
+    short side scaled to 224, then CenterCrop."""
     def __init__(self, output_size):
         self.output_size = output_size
+
     def __call__(self, image):
         w, h = image.size
         if h > w:
@@ -56,6 +36,7 @@ class Rescale:
             new_h, new_w = self.output_size, int(self.output_size * w / h)
         return image.resize((new_w, new_h))
 
+
 transform = transforms.Compose([
     Rescale(224),
     transforms.CenterCrop(224),
@@ -63,20 +44,77 @@ transform = transforms.Compose([
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
 ])
 
-img_names, img_list = load_sample_images(SAMPLE_IMG_DIR, transform)
 
-with torch.no_grad():
-    idx = 4
-    image = img_list[idx].unsqueeze(0).to(device)
-    features = encoder(image)   # (1, N_patches+1, 768) — full patch sequence
-    print("Image features shape:", features.shape)
+def get_features(img_name, vit_extract):
+    """Cache hit -> load fp16 tensor from disk. Miss -> run ViT once."""
+    cache_path = os.path.join(VIT_CACHE_DIR, f"{strip_ext(img_name)}.pt")
 
-    output = decoder.sample(
-        features,
-        tokenizer=tokenizer,
-        beam_size=5,
-        max_len=30,
-        mode="romantic",
+    if os.path.exists(cache_path):
+        feats = torch.load(cache_path, map_location='cpu')
+        return feats.unsqueeze(0).to(device), "cache"
+
+    if vit_extract is None:
+        raise RuntimeError(f"No cached features for {img_name} and ViT not loaded.")
+
+    image = Image.open(os.path.join(IMG_DIR, img_name)).convert("RGB")
+    image = transform(image).unsqueeze(0)
+    return vit_extract(image), "vit"
+
+
+def main():
+    names = sorted(
+        n for n in os.listdir(IMG_DIR)
+        if n.lower().endswith(('.jpg', '.jpeg', '.png'))
     )
-    caption = tokenizer.decode(output, skip_special_tokens=True)
-    print(img_names[idx], "| Predicted Caption:", caption)
+    print(f"Captioning {len(names)} image(s) from {IMG_DIR}: {names}")
+
+    need_vit = any(
+        not os.path.exists(os.path.join(VIT_CACHE_DIR, f"{strip_ext(n)}.pt"))
+        for n in names
+    )
+    vit_extract = load_vit_for_inference(device=device) if need_vit else None
+    print("[INFO] ViT loaded for uncached images." if need_vit
+          else "[INFO] All features cached — ViT not loaded.")
+
+    model = BanglaT5StyleCaptioner(
+        t5_ckpt=T5_CKPT,
+        vit_hidden=768,
+        factored_dim=FACTORED_DIM,
+        styles=("factual", "romantic"),
+        drop_text_encoder=True,
+        gradient_checkpointing=False,     # keep use_cache=True for generation
+    ).to(device)
+
+    ckpt = torch.load(CHECKPOINT, map_location=device)
+    state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+    missing, unexpected = model.load_state_dict(state, strict=False)
+
+    real_missing = [k for k in missing if not k.startswith("t5.encoder.")]
+    if real_missing:
+        print(f"[WARN] {len(real_missing)} missing keys, e.g. {real_missing[:5]}")
+    if unexpected:
+        print(f"[WARN] {len(unexpected)} unexpected keys, e.g. {unexpected[:5]}")
+
+    print(f"[DEBUG] Loaded epoch {ckpt.get('epoch', -1) + 1}, "
+          f"best_val_loss={ckpt.get('best_val_loss', 'N/A')}")
+
+    model.eval()
+    model.t5.config.use_cache = True
+
+    with torch.no_grad():
+        for name in names:
+            feats, src = get_features(name, vit_extract)
+            print(f"\n{name}  (features from {src}, shape {tuple(feats.shape)})")
+            for mode in MODES:
+                ids = model.generate_caption(
+                    raw_features=feats,
+                    mode=mode,
+                    num_beams=BEAM_SIZE,
+                    max_new_tokens=MAX_NEW,
+                )
+                caption = tokenizer.decode(ids[0], skip_special_tokens=True)
+                print(f"  [{mode}] {caption}")
+
+
+if __name__ == "__main__":
+    main()
