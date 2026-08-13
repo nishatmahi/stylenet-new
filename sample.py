@@ -9,7 +9,7 @@ from data_loader import tokenizer, strip_ext
 # ============================================================
 T5_CKPT       = "csebuetnlp/banglat5"
 CHECKPOINT    = "/kaggle/working/stylenet_t5_models/best_model.pth"
-IMG_DIR       = "/kaggle/working/sample_images"   # SET THIS to a small folder
+IMG_DIR       = "/kaggle/input/datasets/kaggleperfect/sample-data/sample/sample_images"   # SET THIS to a small folder
 VIT_CACHE_DIR = "/kaggle/working/vit_feature_cache"
 
 MAX_IMAGES = 20      # safety cap — never walks a 35k-image directory
