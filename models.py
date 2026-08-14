@@ -17,54 +17,48 @@ class VisualProjector(nn.Module):
 
 class FactoredStyleFFN(nn.Module):
     """
-    StyleNet's W = U * S_style * V (paper eq. 8), applied to a decoder FFN:
+    StyleNet's style factor placed INLINE in the decoder FFN:
 
-        y = base_ffn(x) + U( S_style( V(x) ) )
+        y = base_ffn( S_style(x) )
 
-    {U} and {V} shared across styles; {S} style-specific — exactly the split
-    in paper sec 3.2. U zero-init and every S identity-init means the branch
-    is an exact no-op at step 0, so the style path perturbs the grounded
-    captioner instead of replacing it. Rewriting the FFN as U*S*V outright
-    would discard BanglaT5's pretrained weights.
+    Paper eq. 8 is W_x = U * S * V — a factorization of the input weight
+    matrix, not a side branch. Every bit of signal passes through S. The
+    pretrained FFN projection plays the shared U*V; S_style is the only
+    style-specific parameter, per paper sec 3.2.
+
+    S is identity-initialized, so at step 0 this is an exact no-op and the
+    pretrained FFN is untouched, while S still receives full-strength
+    gradient. An additive branch base(x) + U(S(V(x))) with zero-init shared
+    U gives S EXACTLY zero gradient during the style stage, because
+    dL/dS = U^T . grad . V(x)^T and U is frozen at zero there.
     """
-    def __init__(self, base_ffn, d_model, factored_dim, styles):
+    def __init__(self, base_ffn, d_model, styles):
         super().__init__()
         self.base = base_ffn
-        self.V = nn.Linear(d_model, factored_dim, bias=False)
-        self.U = nn.Linear(factored_dim, d_model, bias=False)
-        self.S = nn.ModuleDict({s: nn.Linear(factored_dim, factored_dim, bias=False)
+        self.S = nn.ModuleDict({s: nn.Linear(d_model, d_model, bias=False)
                                 for s in styles})
-
-        nn.init.normal_(self.V.weight, std=0.02)
-        nn.init.zeros_(self.U.weight)
         for lin in self.S.values():
             nn.init.eye_(lin.weight)
-
         self.mode = "factual"
 
     def forward(self, x):
-        return self.base(x) + self.U(self.S[self.mode](self.V(x)))
+        return self.base(self.S[self.mode](x))
 
 
 class BanglaT5StyleCaptioner(nn.Module):
     def __init__(self, t5_ckpt="csebuetnlp/banglat5", vit_hidden=768,
-                 factored_dim=512, styles=("factual", "romantic"),
-                 memory_len=197, gradient_checkpointing=True):
+                 styles=("factual", "romantic"), gradient_checkpointing=False):
         super().__init__()
         self.t5 = T5ForConditionalGeneration.from_pretrained(t5_ckpt)
         self.config = self.t5.config
         self.d_model = self.config.d_model
         self.styles = list(styles)
-        self.memory_len = memory_len
-
-        # No resize_token_embeddings: tokenizer len (32100) < embedding rows
-        # (32128); the spare rows are never indexed.
 
         self.projector = VisualProjector(vit_hidden, self.d_model)
+        self.register_buffer("null_memory", torch.zeros(1, 1, self.d_model))
 
-        # The T5 text encoder is unreachable once encoder_outputs is supplied.
-        # Dropping its blocks frees ~1.2GB, which pays for unfreezing the
-        # decoder. Shared embeddings live on self.t5.shared and are kept.
+        # Text encoder is unreachable once encoder_outputs is supplied.
+        # Dropping its blocks frees ~1.2GB. Shared embeddings stay on t5.shared.
         self.t5.encoder.block = nn.ModuleList()
         for p in self.t5.encoder.parameters():
             p.requires_grad = False
@@ -73,7 +67,7 @@ class BanglaT5StyleCaptioner(nn.Module):
         for block in self.t5.decoder.block:
             ff = block.layer[-1]
             ff.DenseReluDense = FactoredStyleFFN(
-                ff.DenseReluDense, self.d_model, factored_dim, self.styles)
+                ff.DenseReluDense, self.d_model, self.styles)
             self._adapters.append(ff.DenseReluDense)
 
         if gradient_checkpointing:
@@ -87,26 +81,18 @@ class BanglaT5StyleCaptioner(nn.Module):
             a.mode = mode
 
     def _memory(self, raw_features, batch_size, device, dtype):
-        """raw_features=None -> RANDOM NOISE memory, not zeros.
-
-        Paper sec 3.3: the decoder starts from a visual vector with paired
-        images and "a random noise vector otherwise". This matters: zero
-        memory makes T5 cross-attention output exactly zero (no biases), so
-        the style stage would train S_style in a regime where the image
-        pathway is dead, and inference with a real image would be a condition
-        S_style never saw. Noise keeps the pathway live and uninformative.
-        Scale is ~N(0,1) to match the LayerNorm'd projector output.
-        """
+        """raw_features=None -> ZERO memory. T5Attention has bias=False
+        everywhere, so K=V=0 makes cross-attention output exactly zero and the
+        residual stream passes through unchanged — an exact skip. The decoder
+        then acts as a pure LM, which is StyleNet's second task."""
         if raw_features is None:
-            mem = torch.randn(batch_size, self.memory_len, self.d_model,
-                              device=device, dtype=dtype)
+            mem = self.null_memory.expand(batch_size, 1, -1).to(dtype)
         else:
             mem = self.projector(raw_features.to(dtype))
         mask = torch.ones(mem.size(0), mem.size(1), dtype=torch.long, device=device)
         return mem, mask
 
     def forward(self, labels, raw_features=None, mode="factual"):
-        """labels: [B, L] with -100 on pad. Returns (loss, logits)."""
         self.set_mode(mode)
         dtype = self.projector.A.weight.dtype
         mem, mask = self._memory(raw_features, labels.size(0), labels.device, dtype)
@@ -139,8 +125,22 @@ class BanglaT5StyleCaptioner(nn.Module):
         )
 
 
+def load_compatible(model, state_dict, verbose=True):
+    """Load only keys present with matching shape."""
+    own = model.state_dict()
+    ok, skipped = {}, []
+    for k, v in state_dict.items():
+        if k in own and own[k].shape == v.shape:
+            ok[k] = v
+        else:
+            skipped.append(k)
+    model.load_state_dict(ok, strict=False)
+    if verbose:
+        print(f"[LOAD] restored {len(ok)}/{len(own)} tensors, skipped {len(skipped)}")
+    return len(ok)
+
+
 def load_vit_for_inference(vit_name="google/vit-base-patch16-224-in21k", device="cuda"):
-    """Only for images missing from the feature cache."""
     from transformers import ViTModel
     vit = ViTModel.from_pretrained(vit_name).to(device).eval()
     for p in vit.parameters():
