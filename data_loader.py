@@ -29,7 +29,7 @@ def encode_captions(captions):
 
 
 class FactualDataset(Dataset):
-    """Image-caption pairs. Reads precomputed fp16 ViT features from cache_dir."""
+    """Image-caption pairs from precomputed fp16 ViT features."""
     def __init__(self, cache_dir, caption_file):
         self.cache_dir = cache_dir
         self.items = self._load(caption_file)
@@ -38,7 +38,7 @@ class FactualDataset(Dataset):
         with open(caption_file, 'r', encoding='utf-8') as f:
             lines = [ln.strip() for ln in f if ln.strip()]
 
-        items, seen_imgs = [], set()
+        items, imgs = [], set()
         r = re.compile(r'#\d*')
         missing, malformed = 0, 0
 
@@ -47,24 +47,22 @@ class FactualDataset(Dataset):
             if len(parts) < 2:
                 malformed += 1
                 continue
-
             img_id = strip_ext(parts[0])
             if not os.path.exists(os.path.join(self.cache_dir, f"{img_id}.pt")):
                 missing += 1
                 continue
-
             items.append((img_id, parts[1]))
-            seen_imgs.add(img_id)
+            imgs.add(img_id)
 
         if malformed:
-            print(f"[WARN] {caption_file}: skipped {malformed} malformed lines.")
+            print(f"[WARN] {caption_file}: {malformed} malformed lines skipped.")
         if missing:
-            print(f"[WARN] {caption_file}: dropped {missing} lines, no cached features.")
+            print(f"[WARN] {caption_file}: {missing} lines dropped, no cached features.")
         if not items:
             raise RuntimeError(f"[FactualDataset] No valid samples in {caption_file}.")
 
         print(f"[INFO] {os.path.basename(caption_file)}: {len(items)} captions, "
-              f"{len(seen_imgs)} unique images.")
+              f"{len(imgs)} images.")
         return items
 
     def __len__(self):
@@ -73,18 +71,18 @@ class FactualDataset(Dataset):
     def __getitem__(self, ix):
         img_id, caption = self.items[ix]
         raw = torch.load(os.path.join(self.cache_dir, f"{img_id}.pt"),
-                         map_location='cpu')          # fp16 [197, 768]
+                         map_location='cpu')
         return raw, caption
 
 
 class StyledTextDataset(Dataset):
-    """Unpaired stylized text. No images — the StyleNet premise."""
+    """Monolingual stylized text. No images — the StyleNet premise."""
     def __init__(self, caption_file):
         with open(caption_file, 'r', encoding='utf-8') as f:
             self.captions = [x.strip() for x in f if x.strip()]
         if not self.captions:
             raise RuntimeError(f"[StyledTextDataset] {caption_file} is empty.")
-        print(f"[INFO] {os.path.basename(caption_file)}: {len(self.captions)} styled lines.")
+        print(f"[INFO] {os.path.basename(caption_file)}: {len(self.captions)} lines.")
 
     def __len__(self):
         return len(self.captions)
