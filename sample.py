@@ -3,16 +3,16 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
-from models import BanglaT5StyleCaptioner, load_vit_for_inference
+from models import BanglaT5StyleCaptioner, load_compatible, load_vit_for_inference
 from data_loader import tokenizer, strip_ext
 
 # ============================================================
 T5_CKPT       = "csebuetnlp/banglat5"
 CHECKPOINT    = "/kaggle/working/stylenet_t5_models/best_model.pth"
-IMG_DIR       = "/kaggle/input/datasets/kaggleperfect/sample-data/sample/sample_images"   # SET THIS to a small folder
+IMG_DIR       = "/kaggle/input/datasets/kaggleperfect/sample-data/sample/sample_images"
 VIT_CACHE_DIR = "/kaggle/working/vit_feature_cache"
 
-MAX_IMAGES = 20      # safety cap — never walks a 35k-image directory
+MAX_IMAGES = 20
 MODES      = ["factual", "romantic"]
 BEAM_SIZE  = 5
 MAX_NEW    = 40
@@ -22,7 +22,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class Rescale:
-    """Matches the caching script: int output_size, aspect-preserving."""
     def __init__(self, output_size):
         self.output_size = output_size
 
@@ -62,18 +61,11 @@ def main():
 
     ckpt = torch.load(CHECKPOINT, map_location=device)
     model = BanglaT5StyleCaptioner(
-        t5_ckpt=T5_CKPT,
-        vit_hidden=768,
-        factored_dim=ckpt.get('factored_dim', 512),
+        t5_ckpt=T5_CKPT, vit_hidden=768,
         styles=tuple(ckpt.get('styles', ["factual", "romantic"])),
-        memory_len=ckpt.get('memory_len', 197),
         gradient_checkpointing=False,
     ).to(device)
-
-    missing, _ = model.load_state_dict(ckpt['model_state_dict'], strict=False)
-    real_missing = [k for k in missing if not k.startswith("t5.encoder.")]
-    if real_missing:
-        print(f"[WARN] {len(real_missing)} missing keys, e.g. {real_missing[:5]}")
+    load_compatible(model, ckpt['model_state_dict'])
     print(f"[DEBUG] epoch {ckpt.get('epoch', -1)+1}, "
           f"best_val_loss={ckpt.get('best_val_loss', 'N/A')}")
 
