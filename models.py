@@ -15,34 +15,39 @@ class VisualProjector(nn.Module):
         return self.ln(self.A(raw_features))
 
 
-class FactoredStyleFFN(nn.Module):
+class StyleEmbedding(nn.Module):
     """
-    StyleNet's style factor placed INLINE in the decoder FFN:
+    StyleNet's style factor on the word-embedding path:
 
-        y = base_ffn( S_style(x) )
+        x_t -> S_style( B(x_t) )
 
-    Paper eq. 8 is W_x = U * S * V — a factorization of the input weight
-    matrix, not a side branch. Every bit of signal passes through S. The
-    pretrained FFN projection plays the shared U*V; S_style is the only
-    style-specific parameter, per paper sec 3.2.
+    Paper eq. 9-12 apply S_x to V_x . x_t, where x_t is the word embedding.
+    The visual vector only initializes h_0 and never passes through S, so S's
+    input distribution is IDENTICAL in the captioning task and the style LM
+    task. What S learns with no image therefore transfers to inference with one.
 
-    S is identity-initialized, so at step 0 this is an exact no-op and the
-    pretrained FFN is untouched, while S still receives full-strength
-    gradient. An additive branch base(x) + U(S(V(x))) with zero-init shared
-    U gives S EXACTLY zero gradient during the style stage, because
-    dL/dS = U^T . grad . V(x)^T and U is frozen at zero there.
+    Placing S inside the decoder FFN breaks that: there its input is the
+    post-cross-attention residual stream, whose distribution depends on whether
+    memory is present. S fits the zero-memory regime it trains in and misfires
+    at generation — low style-stage loss and incoherent captions at once.
+
+    S is identity-initialized: exact no-op at step 0, full gradient.
     """
-    def __init__(self, base_ffn, d_model, styles):
+    def __init__(self, base_embed, d_model, styles):
         super().__init__()
-        self.base = base_ffn
+        self.emb = base_embed
         self.S = nn.ModuleDict({s: nn.Linear(d_model, d_model, bias=False)
                                 for s in styles})
         for lin in self.S.values():
             nn.init.eye_(lin.weight)
         self.mode = "factual"
 
-    def forward(self, x):
-        return self.base(self.S[self.mode](x))
+    def forward(self, input_ids):
+        return self.S[self.mode](self.emb(input_ids))
+
+    @property
+    def weight(self):                      # some HF code paths probe this
+        return self.emb.weight
 
 
 class BanglaT5StyleCaptioner(nn.Module):
@@ -58,17 +63,17 @@ class BanglaT5StyleCaptioner(nn.Module):
         self.register_buffer("null_memory", torch.zeros(1, 1, self.d_model))
 
         # Text encoder is unreachable once encoder_outputs is supplied.
-        # Dropping its blocks frees ~1.2GB. Shared embeddings stay on t5.shared.
+        # Dropping its blocks frees ~1.2GB. Shared embeddings stay on t5.shared
+        # and lm_head is a separate tensor in this checkpoint, so wrapping the
+        # decoder's embedding lookup does not disturb the output head.
         self.t5.encoder.block = nn.ModuleList()
         for p in self.t5.encoder.parameters():
             p.requires_grad = False
 
-        self._adapters = []
-        for block in self.t5.decoder.block:
-            ff = block.layer[-1]
-            ff.DenseReluDense = FactoredStyleFFN(
-                ff.DenseReluDense, self.d_model, self.styles)
-            self._adapters.append(ff.DenseReluDense)
+        self.style_embed = StyleEmbedding(
+            self.t5.decoder.embed_tokens, self.d_model, self.styles)
+        self.t5.decoder.embed_tokens = self.style_embed
+        self._adapters = [self.style_embed]
 
         if gradient_checkpointing:
             self.t5.gradient_checkpointing_enable()
@@ -83,8 +88,8 @@ class BanglaT5StyleCaptioner(nn.Module):
     def _memory(self, raw_features, batch_size, device, dtype):
         """raw_features=None -> ZERO memory. T5Attention has bias=False
         everywhere, so K=V=0 makes cross-attention output exactly zero and the
-        residual stream passes through unchanged — an exact skip. The decoder
-        then acts as a pure LM, which is StyleNet's second task."""
+        residual stream passes through unchanged. The decoder is then a pure
+        LM, which is StyleNet's second task."""
         if raw_features is None:
             mem = self.null_memory.expand(batch_size, 1, -1).to(dtype)
         else:
