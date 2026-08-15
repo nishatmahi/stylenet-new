@@ -14,7 +14,7 @@ def is_style_param(name, style=None):
 
 
 def set_stage(model, stage, style=None):
-    """Task 1 (captioning): A, embeddings, decoder, base FFN, S_factual.
+    """Task 1 (captioning): A, embeddings, decoder, S_factual.
     Task 2 (style LM): ONLY S_style. Paper sec 3.3."""
     if stage == "factual":
         for n, p in model.named_parameters():
@@ -33,7 +33,7 @@ def set_stage(model, stage, style=None):
 
 
 def build_optimizers(model, args, styles):
-    fast_keys = ("DenseReluDense.S", "projector.")
+    fast_keys = ("style_embed.S", "embed_tokens.S", "projector.")
     slow, fast = [], []
     for n, p in model.named_parameters():
         if n.startswith("t5.encoder."):
@@ -281,7 +281,7 @@ def main(args):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(
-        description='StyleNet Bangla — BanglaT5, inline style factor, monolingual style corpus')
+        description='StyleNet Bangla — BanglaT5, style factor on word embeddings, monolingual style corpus')
     p.add_argument('--split_dir', type=str, default='/kaggle/working/splits')
     p.add_argument('--save_dir', type=str, default='/kaggle/working/stylenet_t5_models')
     p.add_argument('--vit_cache_dir', type=str, default='/kaggle/working/vit_feature_cache')
