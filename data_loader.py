@@ -100,7 +100,7 @@ def collate_styled(captions):
     return encode_captions(captions)
 
 
-def get_data_loader(cache_dir, caption_file, batch_size, shuffle=False, num_workers=8):
+def get_data_loader(cache_dir, caption_file, batch_size, shuffle=False, num_workers=4):
     return DataLoader(FactualDataset(cache_dir, caption_file),
                       batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers, pin_memory=True,
