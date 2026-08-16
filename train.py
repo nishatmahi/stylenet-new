@@ -33,7 +33,7 @@ def set_stage(model, stage, style=None):
 
 
 def build_optimizers(model, args, styles):
-    fast_keys = ("style_embed.S", "embed_tokens.S", "projector.")
+    fast_keys = ("DenseReluDense.S", "projector.")
     slow, fast = [], []
     for n, p in model.named_parameters():
         if n.startswith("t5.encoder."):
@@ -281,11 +281,12 @@ def main(args):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(
-        description='StyleNet Bangla — BanglaT5, style factor on word embeddings, monolingual style corpus')
+        description='StyleNet Bangla — BanglaT5, inline style factor, CLS memory, monolingual style corpus')
     p.add_argument('--split_dir', type=str, default='/kaggle/working/splits')
     p.add_argument('--save_dir', type=str, default='/kaggle/working/stylenet_t5_models')
     p.add_argument('--vit_cache_dir', type=str, default='/kaggle/working/vit_feature_cache')
-    p.add_argument('--styles', type=str, default='romantic')
+    p.add_argument('--styles', type=str, default='romantic',
+                   help='style corpora to train; factual always runs')
     p.add_argument('--t5_ckpt', type=str, default='csebuetnlp/banglat5')
     p.add_argument('--vit_hidden', type=int, default=768)
     p.add_argument('--caption_batch_size', type=int, default=16)
