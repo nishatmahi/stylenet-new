@@ -20,8 +20,10 @@ def strip_ext(img_id):
 
 
 def encode_captions(captions):
-    """Raw strings -> labels with -100 on padding. T5Tokenizer appends </s>."""
-    enc = tokenizer(list(captions), max_length=MAX_LEN, truncation=True,
+    """Raw strings -> labels with -100 on padding. T5Tokenizer appends </s>.
+    Danda U+09F7 is mapped to U+0964, which the tokenizer round-trips."""
+    texts = [c.replace("\u09f7", "\u0964") for c in captions]
+    enc = tokenizer(texts, max_length=MAX_LEN, truncation=True,
                     padding=True, return_tensors="pt")
     labels = enc.input_ids.clone()
     labels[labels == tokenizer.pad_token_id] = -100
