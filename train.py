@@ -1,4 +1,5 @@
 import os
+import random
 import argparse
 import torch
 from torch.optim.lr_scheduler import LambdaLR
@@ -62,6 +63,51 @@ def build_optimizers(model, args, styles):
     return optimizer_fac, optimizer_style
 
 
+def warm_start_styles(model, styles):
+    """Copy trained S_factual into every S_style.
+
+    S_factual has seen ~9.8k steps/epoch and encodes 'transform the FFN input
+    so the decoder writes a caption conditioned on image memory'. S_style gets
+    ~1.4k steps/epoch from identity init, so it has to learn sentence
+    construction AND style at once — which is why it emitted repeated nouns.
+    Starting from S_factual means the style stage only has to learn the style
+    delta. Initialization only: S_style still trains exclusively on the
+    monolingual corpus, so the unpaired premise is unchanged.
+    """
+    with torch.no_grad():
+        for ad in model._adapters:
+            src = ad.S["factual"].weight
+            for s in styles:
+                ad.S[s].weight.copy_(src)
+    print(f"[INIT] warm-started {styles} from trained S_factual")
+
+
+def build_cls_pool(cache_dir, items, pool_size, device, seed=0):
+    """Pool of real CLS vectors from TRAIN images, for the style stage.
+
+    Paper sec 3.3: the decoder starts from a visual vector with a paired image
+    and 'a random noise vector otherwise' — random, not zero. Zero memory makes
+    cross-attention output exactly 0, so S_style trains with the image pathway
+    dead and then meets a constant image vector at generation with no learned
+    way to move past it. That is the repetition.
+
+    Each romantic line is paired with an ARBITRARY unrelated image, redrawn
+    every step, so no content can leak: a dog vector against a sentence about
+    workers teaches nothing about dogs. Only the memory distribution is kept
+    realistic. The corpus remains monolingual.
+    """
+    ids = sorted({it[0] for it in items})
+    random.Random(seed).shuffle(ids)
+    ids = ids[:pool_size]
+    pool = torch.stack([
+        torch.load(os.path.join(cache_dir, f"{i}.pt"), map_location='cpu')[0]
+        for i in ids
+    ]).to(device)
+    print(f"[INFO] CLS pool for style stage: {tuple(pool.shape)} "
+          f"from {len(ids)} unrelated train images")
+    return pool
+
+
 def optim_step(loss, optimizer, model, scheduler=None):
     loss.backward()
     torch.nn.utils.clip_grad_norm_(
@@ -93,12 +139,16 @@ def run_factual_epoch(model, loader, optimizer, scheduler, device, args, epoch):
     return (total / ntok_all if ntok_all else 0.0), last_feats
 
 
-def run_style_epoch(model, loader, optimizer, device, args, epoch, style):
+def run_style_epoch(model, loader, optimizer, device, args, epoch, style, cls_pool):
     total, ntok_all = 0.0, 0
     for i, labels in enumerate(loader):
         labels = labels.to(device, non_blocking=True)
+
+        idx = torch.randint(0, cls_pool.size(0), (labels.size(0),), device=device)
+        feats = cls_pool[idx].unsqueeze(1)          # random unrelated image [B,1,768]
+
         optimizer.zero_grad(set_to_none=True)
-        loss, _ = model(labels, raw_features=None, mode=style)
+        loss, _ = model(labels, raw_features=feats, mode=style)
         optim_step(loss, optimizer, model)
 
         ntok = (labels != -100).sum().item()
@@ -113,6 +163,8 @@ def run_style_epoch(model, loader, optimizer, device, args, epoch, style):
 
 @torch.no_grad()
 def validate(model, val_loader, val_styled, device):
+    """Style validation keeps zero memory so the number stays comparable
+    with earlier runs."""
     model.eval()
     fac, ntok = 0.0, 0
     for raw_feats, labels in val_loader:
@@ -143,8 +195,21 @@ def validate(model, val_loader, val_styled, device):
 def show_samples(model, raw_feats, styles, n=3):
     model.eval()
     feats = raw_feats[:n]
+
+    s_f = model._adapters[0].S["factual"].weight
+    eye = torch.eye(s_f.size(0), device=s_f.device)
+    for s in styles:
+        if s == "factual":
+            continue
+        s_s = model._adapters[0].S[s].weight
+        print(f"  ||S_factual - S_{s}|| = {(s_f - s_s).norm().item():.4f}   "
+              f"||S_factual - I|| = {(s_f - eye).norm().item():.4f}")
+
     for mode in styles:
-        ids = model.generate_caption(raw_features=feats, mode=mode, num_beams=5)
+        ids = model.generate_caption(
+            raw_features=feats, mode=mode, num_beams=5,
+            repetition_penalty=1.2 if mode == "factual" else 1.5,
+            no_repeat_ngram_size=3 if mode == "factual" else 2)
         for i, txt in enumerate(tokenizer.batch_decode(ids, skip_special_tokens=True)):
             print(f"  [{mode}] {i+1}: {txt}")
     model.train()
@@ -184,6 +249,9 @@ def main(args):
     print(f"Steps/epoch: factual={len(train_loader)}, " +
           ", ".join(f"{s}={len(l)}" for s, l in train_styled.items()))
 
+    cls_pool = build_cls_pool(args.vit_cache_dir, train_loader.dataset.items,
+                              args.cls_pool_size, device)
+
     model = BanglaT5StyleCaptioner(
         t5_ckpt=args.t5_ckpt,
         vit_hidden=args.vit_hidden,
@@ -217,6 +285,14 @@ def main(args):
     else:
         print("[DEBUG] Training from scratch.")
 
+    # Warm start AFTER loading, so it copies the TRAINED S_factual.
+    # Pass this flag once; on later resumes leave it off or you overwrite
+    # whatever the style matrices have learned.
+    if args.init_style_from_factual and active:
+        warm_start_styles(model, active)
+        _, optimizer_style = build_optimizers(model, args, active)   # fresh Adam state
+        patience = 0
+
     for epoch in range(start_epoch, args.epoch_num):
         print(f"\n[DEBUG] Training epoch {epoch+1} of {args.epoch_num}")
         model.train()
@@ -229,7 +305,8 @@ def main(args):
         for s in active:
             set_stage(model, "style", style=s)
             avg_style[s] = run_style_epoch(
-                model, train_styled[s], optimizer_style[s], device, args, epoch, s)
+                model, train_styled[s], optimizer_style[s], device, args,
+                epoch, s, cls_pool)
 
         print(f"\n[EPOCH {epoch+1}] Factual Training Loss:  {avg_fac:.4f}")
         for s, v in avg_style.items():
@@ -281,7 +358,8 @@ def main(args):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(
-        description='StyleNet Bangla — BanglaT5, inline style factor, CLS memory, monolingual style corpus')
+        description='StyleNet Bangla — BanglaT5, inline style factor, CLS memory, '
+                    'style factors warm-started from factual')
     p.add_argument('--split_dir', type=str, default='/kaggle/working/splits')
     p.add_argument('--save_dir', type=str, default='/kaggle/working/stylenet_t5_models')
     p.add_argument('--vit_cache_dir', type=str, default='/kaggle/working/vit_feature_cache')
@@ -300,5 +378,8 @@ if __name__ == '__main__':
     p.add_argument('--gradient_checkpointing', type=int, default=0)
     p.add_argument('--adam8bit', type=int, default=0)
     p.add_argument('--log_step', type=int, default=500)
+    p.add_argument('--init_style_from_factual', type=int, default=0,
+                   help='copy trained S_factual into S_style; pass ONCE')
+    p.add_argument('--cls_pool_size', type=int, default=4000)
     args = p.parse_args()
     main(args)
