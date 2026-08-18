@@ -1,385 +1,237 @@
 import os
-import random
 import argparse
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
-from data_loader import get_data_loader, get_styled_data_loader, tokenizer
-from models import BanglaT5StyleCaptioner, load_compatible
+from data_loader import (factual_loader, style_loader, infinite,
+                         tokenizer)
+from models import StyleNetT5, load_compatible
 
 
-def is_style_param(name, style=None):
-    if ".S." not in name:
-        return False
-    return True if style is None else f".S.{style}." in name
-
-
-def set_stage(model, stage, style=None):
-    """Task 1 (captioning): A, embeddings, decoder, S_factual.
-    Task 2 (style LM): ONLY S_style. Paper sec 3.3."""
-    if stage == "factual":
-        for n, p in model.named_parameters():
-            if n.startswith("t5.encoder."):
-                p.requires_grad = False
-            elif is_style_param(n):
-                p.requires_grad = is_style_param(n, "factual")
-            else:
-                p.requires_grad = True
-    else:
-        for p in model.parameters():
-            p.requires_grad = False
-        for n, p in model.named_parameters():
-            if is_style_param(n, style):
-                p.requires_grad = True
-
-
-def build_optimizers(model, args, styles):
-    fast_keys = ("DenseReluDense.S", "projector.")
-    slow, fast = [], []
+def build_optimizer(model, args):
+    proj, rest = [], []
     for n, p in model.named_parameters():
-        if n.startswith("t5.encoder."):
-            continue
-        if is_style_param(n) and not is_style_param(n, "factual"):
-            continue
-        (fast if any(k in n for k in fast_keys) else slow).append(p)
+        (proj if n.startswith("projector.") or n.startswith("style.")
+         else rest).append(p)
 
     Opt = torch.optim.AdamW
     if args.adam8bit:
         import bitsandbytes as bnb
         Opt = bnb.optim.AdamW8bit
 
-    optimizer_fac = Opt([
-        {'params': slow, 'lr': args.lr_caption},
-        {'params': fast, 'lr': args.lr_adapter},
+    opt = Opt([
+        {'params': rest, 'lr': args.lr},
+        {'params': proj, 'lr': args.lr_proj},
     ], weight_decay=0.01)
 
-    optimizer_style = {}
-    for s in styles:
-        ps = [p for n, p in model.named_parameters() if is_style_param(n, s)]
-        optimizer_style[s] = Opt(ps, lr=args.lr_style, weight_decay=0.0)
-        print(f"  S_{s}: {sum(p.numel() for p in ps)/1e6:.2f}M trainable")
-
-    print(f"  captioning stage: {sum(p.numel() for p in slow+fast)/1e6:.1f}M trainable")
-    return optimizer_fac, optimizer_style
+    print(f"  language model: {sum(p.numel() for p in rest)/1e6:.1f}M")
+    print(f"  projector + style vectors: {sum(p.numel() for p in proj)/1e6:.1f}M")
+    return opt
 
 
-def warm_start_styles(model, styles):
-    """Copy trained S_factual into every S_style.
-
-    S_factual has seen ~9.8k steps/epoch and encodes 'transform the FFN input
-    so the decoder writes a caption conditioned on image memory'. S_style gets
-    ~1.4k steps/epoch from identity init, so it has to learn sentence
-    construction AND style at once — which is why it emitted repeated nouns.
-    Starting from S_factual means the style stage only has to learn the style
-    delta. Initialization only: S_style still trains exclusively on the
-    monolingual corpus, so the unpaired premise is unchanged.
-    """
-    with torch.no_grad():
-        for ad in model._adapters:
-            src = ad.S["factual"].weight
-            for s in styles:
-                ad.S[s].weight.copy_(src)
-    print(f"[INIT] warm-started {styles} from trained S_factual")
-
-
-def build_cls_pool(cache_dir, items, pool_size, device, seed=0):
-    """Pool of real CLS vectors from TRAIN images, for the style stage.
-
-    Paper sec 3.3: the decoder starts from a visual vector with a paired image
-    and 'a random noise vector otherwise' — random, not zero. Zero memory makes
-    cross-attention output exactly 0, so S_style trains with the image pathway
-    dead and then meets a constant image vector at generation with no learned
-    way to move past it. That is the repetition.
-
-    Each romantic line is paired with an ARBITRARY unrelated image, redrawn
-    every step, so no content can leak: a dog vector against a sentence about
-    workers teaches nothing about dogs. Only the memory distribution is kept
-    realistic. The corpus remains monolingual.
-    """
-    ids = sorted({it[0] for it in items})
-    random.Random(seed).shuffle(ids)
-    ids = ids[:pool_size]
-    pool = torch.stack([
-        torch.load(os.path.join(cache_dir, f"{i}.pt"), map_location='cpu')[0]
-        for i in ids
-    ]).to(device)
-    print(f"[INFO] CLS pool for style stage: {tuple(pool.shape)} "
-          f"from {len(ids)} unrelated train images")
-    return pool
-
-
-def optim_step(loss, optimizer, model, scheduler=None):
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(
-        [p for p in model.parameters() if p.requires_grad], 1.0)
-    optimizer.step()
-    if scheduler is not None:
-        scheduler.step()
-
-
-def run_factual_epoch(model, loader, optimizer, scheduler, device, args, epoch):
-    total, ntok_all, last_feats = 0.0, 0, None
-    for i, (raw_feats, labels) in enumerate(loader):
-        raw_feats = raw_feats.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        last_feats = raw_feats
-
-        optimizer.zero_grad(set_to_none=True)
-        loss, _ = model(labels, raw_features=raw_feats, mode="factual")
-        optim_step(loss, optimizer, model, scheduler)
-
-        ntok = (labels != -100).sum().item()
-        total += loss.item() * ntok
-        ntok_all += ntok
-
-        if i % args.log_step == 0 or i == len(loader) - 1:
-            print(f"Epoch [{epoch+1}/{args.epoch_num}], CAP, "
-                  f"Step [{i}/{len(loader)}], Loss: {loss.item():.4f}, "
-                  f"LR: {optimizer.param_groups[0]['lr']:.2e}", flush=True)
-    return (total / ntok_all if ntok_all else 0.0), last_feats
-
-
-def run_style_epoch(model, loader, optimizer, device, args, epoch, style, cls_pool):
-    total, ntok_all = 0.0, 0
-    for i, labels in enumerate(loader):
-        labels = labels.to(device, non_blocking=True)
-
-        idx = torch.randint(0, cls_pool.size(0), (labels.size(0),), device=device)
-        feats = cls_pool[idx].unsqueeze(1)          # random unrelated image [B,1,768]
-
-        optimizer.zero_grad(set_to_none=True)
-        loss, _ = model(labels, raw_features=feats, mode=style)
-        optim_step(loss, optimizer, model)
-
-        ntok = (labels != -100).sum().item()
-        total += loss.item() * ntok
-        ntok_all += ntok
-
-        if i % args.log_step == 0 or i == len(loader) - 1:
-            print(f"Epoch [{epoch+1}/{args.epoch_num}], {style.upper()[:3]}, "
-                  f"Step [{i}/{len(loader)}], Loss: {loss.item():.4f}", flush=True)
-    return total / ntok_all if ntok_all else 0.0
-
-
-@torch.no_grad()
-def validate(model, val_loader, val_styled, device):
-    """Style validation keeps zero memory so the number stays comparable
-    with earlier runs."""
-    model.eval()
-    fac, ntok = 0.0, 0
-    for raw_feats, labels in val_loader:
-        raw_feats = raw_feats.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        loss, _ = model(labels, raw_features=raw_feats, mode="factual")
-        n = (labels != -100).sum().item()
-        fac += loss.item() * n
-        ntok += n
-    fac = fac / ntok if ntok else float('inf')
-    print(f"Validation Factual Loss: {fac:.4f}")
-
-    for style, loader in val_styled.items():
-        s, sn = 0.0, 0
-        for labels in loader:
-            labels = labels.to(device, non_blocking=True)
-            loss, _ = model(labels, raw_features=None, mode=style)
-            n = (labels != -100).sum().item()
-            s += loss.item() * n
-            sn += n
-        if sn:
-            print(f"Validation {style.capitalize()} Loss: {s/sn:.4f}")
+def run_epoch(model, fac_loader, style_iters, opt, sched, device, args, epoch):
+    """One backward pass per step covering captioning, V2L alignment, and text
+    style injection together. FS-StyleCap's w/o MultiTask ablation — training
+    these sequentially — gives CIDEr 2.45 against 66.26 for simultaneous. The
+    alternating two-stage loop is exactly what produced identical captions on
+    every image before."""
     model.train()
-    return fac
+    tot = {'cap': 0.0, 'v2l': 0.0, 'txt': 0.0}
+    n = 0
+
+    for i, (feats, cap_ids, cap_mask, cap_labels) in enumerate(fac_loader):
+        feats = feats.to(device, non_blocking=True)
+        cap_ids = cap_ids.to(device, non_blocking=True)
+        cap_mask = cap_mask.to(device, non_blocking=True)
+        cap_labels = cap_labels.to(device, non_blocking=True)
+
+        opt.zero_grad(set_to_none=True)
+
+        l_cap, img_content = model.caption_loss(feats, cap_labels)
+        l_v2l = model.v2l_loss(img_content, cap_ids, cap_mask)
+
+        l_txt = 0.0
+        for style, it in style_iters.items():
+            c_ids, c_mask, labels = next(it)
+            l_txt = l_txt + model.text_style_loss(
+                c_ids.to(device), c_mask.to(device), labels.to(device), style)
+        l_txt = l_txt / len(style_iters)
+
+        loss = l_cap + args.w_v2l * l_v2l + args.w_txt * l_txt
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        sched.step()
+
+        tot['cap'] += l_cap.item()
+        tot['v2l'] += l_v2l.item()
+        tot['txt'] += float(l_txt)
+        n += 1
+
+        if i % args.log_step == 0 or i == len(fac_loader) - 1:
+            print(f"Epoch [{epoch+1}/{args.epochs}] Step [{i}/{len(fac_loader)}] "
+                  f"cap {l_cap.item():.3f}  v2l {l_v2l.item():.3f}  "
+                  f"txt {float(l_txt):.3f}  lr {opt.param_groups[0]['lr']:.2e}",
+                  flush=True)
+
+    return {k: v / max(n, 1) for k, v in tot.items()}
 
 
 @torch.no_grad()
-def show_samples(model, raw_feats, styles, n=3):
+def validate(model, fac_loader, style_loaders, device):
     model.eval()
-    feats = raw_feats[:n]
+    cap_sum = n = 0.0
+    for feats, ids, mask, labels in fac_loader:
+        loss, _ = model.caption_loss(feats.to(device), labels.to(device))
+        cap_sum += loss.item()
+        n += 1
+    cap = cap_sum / max(n, 1)
+    print(f"  val caption loss: {cap:.4f}")
 
-    s_f = model._adapters[0].S["factual"].weight
-    eye = torch.eye(s_f.size(0), device=s_f.device)
+    for style, loader in style_loaders.items():
+        s = m = 0.0
+        for c_ids, c_mask, labels in loader:
+            s += model.text_style_loss(c_ids.to(device), c_mask.to(device),
+                                       labels.to(device), style).item()
+            m += 1
+        print(f"  val {style} text loss: {s/max(m,1):.4f}")
+
+    model.train()
+    return cap
+
+
+@torch.no_grad()
+def show_samples(model, feats, styles, lams, n=3):
+    model.eval()
+    f = feats[:n]
+    for i in range(f.size(0)):
+        print(f"  --- sample {i+1} ---")
+        for style in styles:
+            for lam in ([0.0] if style == "factual" else lams):
+                ids = model.generate(f[i:i+1], target=style, lam=lam, num_beams=5)
+                txt = tokenizer.decode(ids[0], skip_special_tokens=True)
+                tag = style if style == "factual" else f"{style} λ={lam}"
+                print(f"    [{tag}] {txt}")
     for s in styles:
-        if s == "factual":
-            continue
-        s_s = model._adapters[0].S[s].weight
-        print(f"  ||S_factual - S_{s}|| = {(s_f - s_s).norm().item():.4f}   "
-              f"||S_factual - I|| = {(s_f - eye).norm().item():.4f}")
-
-    for mode in styles:
-        ids = model.generate_caption(
-            raw_features=feats, mode=mode, num_beams=5,
-            repetition_penalty=1.2 if mode == "factual" else 1.5,
-            no_repeat_ngram_size=3 if mode == "factual" else 2)
-        for i, txt in enumerate(tokenizer.batch_decode(ids, skip_special_tokens=True)):
-            print(f"  [{mode}] {i+1}: {txt}")
+        print(f"    ||s_{s}|| = {model.style[s].norm().item():.4f}")
     model.train()
 
 
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
-    save_folder = args.save_dir
-    os.makedirs(save_folder, exist_ok=True)
+    print(f"device: {device}")
+    os.makedirs(args.save_dir, exist_ok=True)
 
     sd = args.split_dir
-    fac_train = os.path.join(sd, 'factual_train.txt')
-    fac_val = os.path.join(sd, 'factual_val.txt')
-    if not os.path.exists(fac_train):
-        raise RuntimeError(f"{fac_train} missing. Run prepare_splits.py first.")
+    styles = [s.strip() for s in args.styles.split(',') if s.strip()]
+    all_styles = ["factual"] + styles
+    print(f"styles: {all_styles}")
 
-    wanted = [s.strip() for s in args.styles.split(',') if s.strip()]
-    active = [s for s in wanted
-              if os.path.exists(os.path.join(sd, f'{s}_train.txt'))]
-    all_modes = ["factual"] + active
-    print(f"Active modes: {all_modes}")
+    train_fac = factual_loader(args.cache_dir,
+                               os.path.join(sd, 'factual_train.txt'),
+                               args.batch_size, shuffle=True)
+    val_fac = factual_loader(args.cache_dir,
+                             os.path.join(sd, 'factual_val.txt'),
+                             args.batch_size, shuffle=False)
 
-    train_loader = get_data_loader(args.vit_cache_dir, fac_train,
-                                   args.caption_batch_size, shuffle=True)
-    val_loader = get_data_loader(args.vit_cache_dir, fac_val,
-                                 args.caption_batch_size, shuffle=False)
+    # 'factual' on the text side uses the factual captions as bare text, so
+    # s_factual is trained the same way the stylized vectors are.
+    text_file = {"factual": "factualtext"}
+    train_style_loaders, val_style_loaders = {}, {}
+    for s in all_styles:
+        stem = text_file.get(s, s)
+        train_style_loaders[s] = style_loader(
+            os.path.join(sd, f'{stem}_train.txt'), args.style_batch_size)
+        val_style_loaders[s] = style_loader(
+            os.path.join(sd, f'{stem}_val.txt'), args.style_batch_size,
+            shuffle=False)
+    style_iters = {s: infinite(l) for s, l in train_style_loaders.items()}
 
-    train_styled, val_styled = {}, {}
-    for s in active:
-        train_styled[s] = get_styled_data_loader(
-            os.path.join(sd, f'{s}_train.txt'), args.style_batch_size, shuffle=True)
-        val_styled[s] = get_styled_data_loader(
-            os.path.join(sd, f'{s}_val.txt'), args.style_batch_size, shuffle=False)
+    print(f"steps/epoch: {len(train_fac)}")
 
-    print(f"Steps/epoch: factual={len(train_loader)}, " +
-          ", ".join(f"{s}={len(l)}" for s, l in train_styled.items()))
+    model = StyleNetT5(t5_ckpt=args.t5_ckpt, clip_dim=args.clip_dim,
+                       styles=tuple(all_styles),
+                       gradient_checkpointing=bool(args.grad_ckpt)).to(device)
 
-    cls_pool = build_cls_pool(args.vit_cache_dir, train_loader.dataset.items,
-                              args.cls_pool_size, device)
+    opt = build_optimizer(model, args)
+    sched = LambdaLR(opt, lambda s: min(1.0, (s + 1) / max(1, args.warmup)))
 
-    model = BanglaT5StyleCaptioner(
-        t5_ckpt=args.t5_ckpt,
-        vit_hidden=args.vit_hidden,
-        styles=tuple(all_modes),
-        gradient_checkpointing=bool(args.gradient_checkpointing),
-    ).to(device)
-
-    optimizer_fac, optimizer_style = build_optimizers(model, args, active)
-    scheduler = LambdaLR(optimizer_fac,
-                         lambda step: min(1.0, (step + 1) / max(1, args.warmup_steps)))
-
-    start_epoch, best_val, patience = 0, float('inf'), 0
-    ckpt_path = os.path.join(save_folder, 'checkpoint-latest.pth')
-    best_path = os.path.join(save_folder, 'best_model.pth')
+    start, best, patience = 0, float('inf'), 0
+    ckpt_path = os.path.join(args.save_dir, 'checkpoint-latest.pth')
+    best_path = os.path.join(args.save_dir, 'best_model.pth')
 
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device)
-        load_compatible(model, ck['model_state_dict'])
+        load_compatible(model, ck['model'])
         try:
-            optimizer_fac.load_state_dict(ck['optimizer_fac_state_dict'])
-            scheduler.load_state_dict(ck['scheduler_state_dict'])
-            for s, st in ck.get('optimizer_style_state_dict', {}).items():
-                if s in optimizer_style:
-                    optimizer_style[s].load_state_dict(st)
+            opt.load_state_dict(ck['opt'])
+            sched.load_state_dict(ck['sched'])
         except Exception as e:
-            print(f"[WARN] optimizer state not reusable ({e}); fresh optimizers.")
-        start_epoch = ck['epoch'] + 1
-        best_val = ck.get('best_val_loss', float('inf'))
-        patience = ck.get('patience_counter', 0)
-        print(f"[DEBUG] Resumed from epoch {ck['epoch']+1}, best val {best_val:.4f}")
-    else:
-        print("[DEBUG] Training from scratch.")
+            print(f"[WARN] optimizer state unusable ({e}); starting fresh")
+        start = ck['epoch'] + 1
+        best = ck.get('best', float('inf'))
+        patience = ck.get('patience', 0)
+        print(f"[resume] from epoch {ck['epoch']+1}, best {best:.4f}")
 
-    # Warm start AFTER loading, so it copies the TRAINED S_factual.
-    # Pass this flag once; on later resumes leave it off or you overwrite
-    # whatever the style matrices have learned.
-    if args.init_style_from_factual and active:
-        warm_start_styles(model, active)
-        _, optimizer_style = build_optimizers(model, args, active)   # fresh Adam state
-        patience = 0
+    last_feats = None
+    for epoch in range(start, args.epochs):
+        print(f"\n=== epoch {epoch+1}/{args.epochs} ===")
+        avg = run_epoch(model, train_fac, style_iters, opt, sched,
+                        device, args, epoch)
+        print(f"[EPOCH {epoch+1}] cap {avg['cap']:.4f}  "
+              f"v2l {avg['v2l']:.4f}  txt {avg['txt']:.4f}")
 
-    for epoch in range(start_epoch, args.epoch_num):
-        print(f"\n[DEBUG] Training epoch {epoch+1} of {args.epoch_num}")
-        model.train()
+        if last_feats is None:
+            last_feats = next(iter(val_fac))[0][:3].to(device)
+        print(f"[EPOCH {epoch+1}] samples:")
+        show_samples(model, last_feats, all_styles,
+                     [float(x) for x in args.lams.split(',')])
 
-        set_stage(model, "factual")
-        avg_fac, last_feats = run_factual_epoch(
-            model, train_loader, optimizer_fac, scheduler, device, args, epoch)
+        print(f"[EPOCH {epoch+1}] validation:")
+        val = validate(model, val_fac, val_style_loaders, device)
 
-        avg_style = {}
-        for s in active:
-            set_stage(model, "style", style=s)
-            avg_style[s] = run_style_epoch(
-                model, train_styled[s], optimizer_style[s], device, args,
-                epoch, s, cls_pool)
+        state = {'epoch': epoch, 'model': model.state_dict(),
+                 'opt': opt.state_dict(), 'sched': sched.state_dict(),
+                 'best': best, 'patience': patience, 'styles': all_styles}
 
-        print(f"\n[EPOCH {epoch+1}] Factual Training Loss:  {avg_fac:.4f}")
-        for s, v in avg_style.items():
-            print(f"[EPOCH {epoch+1}] {s.capitalize()} Training Loss: {v:.4f}")
-
-        if last_feats is not None:
-            print(f"[EPOCH {epoch+1}] Samples:")
-            show_samples(model, last_feats, all_modes)
-
-        print(f"[EPOCH {epoch+1}] Running validation...")
-        val_loss = validate(model, val_loader, val_styled, device)
-        print(f"[EPOCH {epoch+1}] Factual Validation Loss (early stopping): {val_loss:.4f}")
-
-        state = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_fac_state_dict': optimizer_fac.state_dict(),
-            'optimizer_style_state_dict': {s: o.state_dict() for s, o in optimizer_style.items()},
-            'scheduler_state_dict': scheduler.state_dict(),
-            'best_val_loss': best_val,
-            'factual_train_loss': avg_fac,
-            'style_train_loss': avg_style,
-            'val_loss': val_loss,
-            'patience_counter': patience,
-            'styles': all_modes,
-        }
-
-        if val_loss < best_val:
-            best_val = val_loss
-            patience = 0
-            state['best_val_loss'] = best_val
-            state['patience_counter'] = patience
+        if val < best:
+            best, patience = val, 0
+            state['best'], state['patience'] = best, patience
             torch.save(state, best_path)
-            print(f"[EPOCH {epoch+1}] New best model saved! val {val_loss:.4f}")
+            print(f"[EPOCH {epoch+1}] new best {val:.4f}")
         else:
             patience += 1
-            state['patience_counter'] = patience
-            print(f"[EPOCH {epoch+1}] No improvement. Patience: {patience}/{args.patience}")
+            state['patience'] = patience
+            print(f"[EPOCH {epoch+1}] no improvement {patience}/{args.patience}")
 
         torch.save(state, ckpt_path)
-        print(f"[EPOCH {epoch+1}] Checkpoint saved.")
-
         if patience >= args.patience:
-            print(f"[EARLY STOPPING] Best val: {best_val:.4f}")
+            print(f"[early stop] best {best:.4f}")
             break
 
-    print(f"\nTraining finished. Best val {best_val:.4f}")
+    print(f"\nfinished. best val caption loss {best:.4f}")
 
 
 if __name__ == '__main__':
-    p = argparse.ArgumentParser(
-        description='StyleNet Bangla — BanglaT5, inline style factor, CLS memory, '
-                    'style factors warm-started from factual')
-    p.add_argument('--split_dir', type=str, default='/kaggle/working/splits')
-    p.add_argument('--save_dir', type=str, default='/kaggle/working/stylenet_t5_models')
-    p.add_argument('--vit_cache_dir', type=str, default='/kaggle/working/vit_feature_cache')
-    p.add_argument('--styles', type=str, default='romantic',
-                   help='style corpora to train; factual always runs')
-    p.add_argument('--t5_ckpt', type=str, default='csebuetnlp/banglat5')
-    p.add_argument('--vit_hidden', type=int, default=768)
-    p.add_argument('--caption_batch_size', type=int, default=16)
-    p.add_argument('--style_batch_size', type=int, default=24)
-    p.add_argument('--lr_caption', type=float, default=1e-4)
-    p.add_argument('--lr_adapter', type=float, default=5e-4)
-    p.add_argument('--lr_style', type=float, default=5e-4)
-    p.add_argument('--warmup_steps', type=int, default=1000)
-    p.add_argument('--epoch_num', type=int, default=30)
-    p.add_argument('--patience', type=int, default=5)
-    p.add_argument('--gradient_checkpointing', type=int, default=0)
+    p = argparse.ArgumentParser()
+    p.add_argument('--split_dir', default='/kaggle/working/splits')
+    p.add_argument('--cache_dir', default='/kaggle/working/clip_feature_cache')
+    p.add_argument('--save_dir', default='/kaggle/working/stylenet_clip')
+    p.add_argument('--t5_ckpt', default='csebuetnlp/banglat5')
+    p.add_argument('--clip_dim', type=int, default=768)
+    p.add_argument('--styles', default='romantic,humorous')
+    p.add_argument('--batch_size', type=int, default=12)
+    p.add_argument('--style_batch_size', type=int, default=12)
+    p.add_argument('--lr', type=float, default=5e-4)
+    p.add_argument('--lr_proj', type=float, default=1e-3)
+    p.add_argument('--w_v2l', type=float, default=1.0)
+    p.add_argument('--w_txt', type=float, default=1.0)
+    p.add_argument('--warmup', type=int, default=1000)
+    p.add_argument('--epochs', type=int, default=20)
+    p.add_argument('--patience', type=int, default=4)
+    p.add_argument('--grad_ckpt', type=int, default=1)
     p.add_argument('--adam8bit', type=int, default=0)
     p.add_argument('--log_step', type=int, default=500)
-    p.add_argument('--init_style_from_factual', type=int, default=0,
-                   help='copy trained S_factual into S_style; pass ONCE')
-    p.add_argument('--cls_pool_size', type=int, default=4000)
+    p.add_argument('--lams', default='1.0,3.0')
     args = p.parse_args()
     main(args)
