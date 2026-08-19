@@ -1,10 +1,10 @@
+%%writefile train.py
 import os
 import argparse
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
-from data_loader import (factual_loader, style_loader, infinite,
-                         tokenizer)
+from data_loader import factual_loader, style_loader, infinite, tokenizer
 from models import StyleNetT5, load_compatible
 
 
@@ -30,11 +30,9 @@ def build_optimizer(model, args):
 
 
 def run_epoch(model, fac_loader, style_iters, opt, sched, device, args, epoch):
-    """One backward pass per step covering captioning, V2L alignment, and text
+    """One backward pass per step covering captioning, V2L alignment and text
     style injection together. FS-StyleCap's w/o MultiTask ablation — training
-    these sequentially — gives CIDEr 2.45 against 66.26 for simultaneous. The
-    alternating two-stage loop is exactly what produced identical captions on
-    every image before."""
+    these sequentially — gives CIDEr 2.45 against 66.26 for simultaneous."""
     model.train()
     tot = {'cap': 0.0, 'v2l': 0.0, 'txt': 0.0}
     n = 0
@@ -101,14 +99,14 @@ def validate(model, fac_loader, style_loaders, device):
 
 
 @torch.no_grad()
-def show_samples(model, feats, styles, lams, n=3):
+def show_samples(model, feats, styles, lams):
     model.eval()
-    f = feats[:n]
-    for i in range(f.size(0)):
+    for i in range(feats.size(0)):
         print(f"  --- sample {i+1} ---")
         for style in styles:
             for lam in ([0.0] if style == "factual" else lams):
-                ids = model.generate(f[i:i+1], target=style, lam=lam, num_beams=5)
+                ids = model.generate(feats[i:i+1], target=style, lam=lam,
+                                     num_beams=5)
                 txt = tokenizer.decode(ids[0], skip_special_tokens=True)
                 tag = style if style == "factual" else f"{style} λ={lam}"
                 print(f"    [{tag}] {txt}")
@@ -136,10 +134,10 @@ def main(args):
 
     # 'factual' on the text side uses the factual captions as bare text, so
     # s_factual is trained the same way the stylized vectors are.
-    text_file = {"factual": "factualtext"}
+    text_stem = {"factual": "factualtext"}
     train_style_loaders, val_style_loaders = {}, {}
     for s in all_styles:
-        stem = text_file.get(s, s)
+        stem = text_stem.get(s, s)
         train_style_loaders[s] = style_loader(
             os.path.join(sd, f'{stem}_train.txt'), args.style_batch_size)
         val_style_loaders[s] = style_loader(
@@ -173,7 +171,9 @@ def main(args):
         patience = ck.get('patience', 0)
         print(f"[resume] from epoch {ck['epoch']+1}, best {best:.4f}")
 
+    lams = [float(x) for x in args.lams.split(',')]
     last_feats = None
+
     for epoch in range(start, args.epochs):
         print(f"\n=== epoch {epoch+1}/{args.epochs} ===")
         avg = run_epoch(model, train_fac, style_iters, opt, sched,
@@ -182,10 +182,13 @@ def main(args):
               f"v2l {avg['v2l']:.4f}  txt {avg['txt']:.4f}")
 
         if last_feats is None:
-            last_feats = next(iter(val_fac))[0][:3].to(device)
+            # factual_val.txt stores 5 captions per image consecutively, so
+            # [:3] was the SAME image three times. Stride 5 = 3 distinct images.
+            batch_feats = next(iter(val_fac))[0]
+            last_feats = batch_feats[::5][:3].to(device)
+
         print(f"[EPOCH {epoch+1}] samples:")
-        show_samples(model, last_feats, all_styles,
-                     [float(x) for x in args.lams.split(',')])
+        show_samples(model, last_feats, all_styles, lams)
 
         print(f"[EPOCH {epoch+1}] validation:")
         val = validate(model, val_fac, val_style_loaders, device)
@@ -220,8 +223,8 @@ if __name__ == '__main__':
     p.add_argument('--t5_ckpt', default='csebuetnlp/banglat5')
     p.add_argument('--clip_dim', type=int, default=768)
     p.add_argument('--styles', default='romantic,humorous')
-    p.add_argument('--batch_size', type=int, default=12)
-    p.add_argument('--style_batch_size', type=int, default=12)
+    p.add_argument('--batch_size', type=int, default=24)
+    p.add_argument('--style_batch_size', type=int, default=24)
     p.add_argument('--lr', type=float, default=5e-4)
     p.add_argument('--lr_proj', type=float, default=1e-3)
     p.add_argument('--w_v2l', type=float, default=1.0)
@@ -232,6 +235,6 @@ if __name__ == '__main__':
     p.add_argument('--grad_ckpt', type=int, default=1)
     p.add_argument('--adam8bit', type=int, default=0)
     p.add_argument('--log_step', type=int, default=500)
-    p.add_argument('--lams', default='1.0,3.0')
+    p.add_argument('--lams', default='1.5,2.5')
     args = p.parse_args()
     main(args)
