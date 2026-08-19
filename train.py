@@ -221,9 +221,15 @@ if __name__ == '__main__':
     p.add_argument('--save_dir', default='/kaggle/working/stylenet_clip')
     p.add_argument('--t5_ckpt', default='csebuetnlp/banglat5')
     p.add_argument('--clip_dim', type=int, default=768)
-    p.add_argument('--styles', default='romantic,humorous')
-    p.add_argument('--batch_size', type=int, default=24)
-    p.add_argument('--style_batch_size', type=int, default=24)
+
+    # StyleNet sec 5.1.1: combining romantic and humorous in training gave no
+    # improvement, and the paper reports StyleNet(R) and StyleNet(H) as
+    # separate models. Two styles also cost an extra encoder+decoder pass per
+    # step. Train romantic to convergence, then rerun with 'humorous'.
+    p.add_argument('--styles', default='romantic')
+
+    p.add_argument('--batch_size', type=int, default=16)
+    p.add_argument('--style_batch_size', type=int, default=16)
     p.add_argument('--lr', type=float, default=5e-4)
     p.add_argument('--lr_proj', type=float, default=1e-3)
     p.add_argument('--w_v2l', type=float, default=1.0)
@@ -231,7 +237,12 @@ if __name__ == '__main__':
     p.add_argument('--warmup', type=int, default=1000)
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--patience', type=int, default=4)
-    p.add_argument('--grad_ckpt', type=int, default=1)
+
+    # CLIP features are 50 tokens, not 197, so activation memory is far lower
+    # than when this defaulted to 1. Recomputing every forward during backward
+    # cost ~30-40% for memory that is no longer scarce.
+    p.add_argument('--grad_ckpt', type=int, default=0)
+
     p.add_argument('--adam8bit', type=int, default=0)
     p.add_argument('--log_step', type=int, default=500)
     p.add_argument('--lams', default='1.5,2.5')
