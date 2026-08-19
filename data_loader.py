@@ -1,4 +1,3 @@
-%%writefile data_loader.py
 import os
 import re
 import random
