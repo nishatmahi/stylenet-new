@@ -1,3 +1,4 @@
+%%writefile data_loader.py
 import os
 import re
 import random
@@ -7,7 +8,13 @@ from transformers import T5Tokenizer
 
 T5_CKPT = "csebuetnlp/banglat5"
 MAX_LEN = 48
-DROP_P  = 0.2      # token-drop rate for the denoising task
+
+# At 0.2 the decoder reconstructs the sentence by copying the surviving words
+# and never needs the style vector — txt loss collapsed to 0.55 and s_style
+# was starved of gradient. Higher noise forces the decoder to consult the
+# style vector for what the corruption removed, which is the whole point of
+# the denoising task.
+DROP_P  = 0.5
 
 tokenizer = T5Tokenizer.from_pretrained(T5_CKPT, use_fast=False)
 
@@ -34,7 +41,7 @@ def to_labels(input_ids):
 
 class FactualDataset(Dataset):
     """CLIP features + the paired factual caption. The caption is returned as
-    text too, because the V2L loss needs to encode it on the text side."""
+    text as well, because the V2L loss encodes it on the text side."""
     def __init__(self, cache_dir, caption_file):
         self.cache_dir = cache_dir
         self.items = self._load(caption_file)
@@ -86,10 +93,9 @@ def collate_factual(batch):
 
 
 class StyleTextDataset(Dataset):
-    """Monolingual stylized text. Returns (corrupted, clean) for the denoising
-    reconstruction task: the encoder sees a corrupted sentence and the decoder
-    must restore it, so it has to rely on the style vector for what the noise
-    removed. This is what forces the style vector to carry style."""
+    """Monolingual stylized text. Returns (corrupted, clean): the encoder sees
+    a corrupted sentence and the decoder must restore the original, so it has
+    to rely on the style vector for what the noise removed."""
     def __init__(self, caption_file, drop_p=DROP_P, seed=0):
         with open(caption_file, encoding='utf-8') as f:
             self.lines = [x.strip() for x in f if x.strip()]
