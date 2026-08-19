@@ -1,4 +1,3 @@
-%%writefile sample.py
 import os
 import re
 import torch
