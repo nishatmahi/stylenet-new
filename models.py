@@ -20,32 +20,77 @@ class VisualProjection(nn.Module):
         return self.ln(self.tr(self.inp(feats)))
 
 
+class StyleModulator(nn.Module):
+    """Per-position style application with a hard magnitude bound.
+
+    MSSRNet (KDD 2023): a fixed-sized vector "applies the same style
+    information to all words forming coarse-grained control". TED
+    (Neurocomputing 2023) reports the consequence as "suboptimal preservation
+    of non-stylistic semantic content" — swimmers becoming a boat. Adding one
+    vector identically to every position has a single degree of freedom, so
+    style strength and content damage are the same knob.
+
+    A sigmoid gate computed per position and per dimension lets the model
+    learn WHERE style applies, separating those two.
+
+    The delta is then renormalized so its per-position norm never exceeds
+    alpha * ||content|| at that position. This is a structural guarantee, not
+    a monitored hope: the modulator trains partly on text-only data while
+    sitting on the image path, and the bound means the worst it can do is
+    perturb content by a bounded fraction — it cannot overwrite it.
+
+    proj is zero-initialized, so at step 0 this is an exact no-op.
+    """
+    def __init__(self, d_model, alpha=0.5):
+        super().__init__()
+        self.alpha = alpha
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.gate = nn.Linear(2 * d_model, d_model)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.gate.bias)
+
+    def _delta(self, content, s):
+        s_exp = s.unsqueeze(0).unsqueeze(0).expand_as(content)
+        g = torch.sigmoid(self.gate(torch.cat([content, s_exp], dim=-1)))
+        return g * self.proj(s_exp), g
+
+    def forward(self, content, s):
+        delta, _ = self._delta(content, s)
+        cn = content.norm(dim=-1, keepdim=True)
+        dn = delta.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        scale = torch.clamp(self.alpha * cn / dn, max=1.0)
+        return content + delta * scale
+
+    @torch.no_grad()
+    def report(self, content, s):
+        """Gate spread and the realized delta-to-content ratio.
+        gate std ~0 means it degenerated back to a global vector."""
+        delta, g = self._delta(content, s)
+        cn = content.norm(dim=-1, keepdim=True)
+        dn = delta.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        scale = torch.clamp(self.alpha * cn / dn, max=1.0)
+        ratio = ((delta * scale).norm(dim=-1) / cn.squeeze(-1).clamp(min=1e-6))
+        return g.mean().item(), g.std().item(), ratio.mean().item()
+
+
 class StyleNetT5(nn.Module):
     """
-    StyleNet's alternating multi-task training procedure combined with
-    FS-StyleCap's shared-encoder additive fusion, using one learned vector per
-    named style rather than a few-shot style extractor.
+    StyleNet's alternating multi-task procedure, FS-StyleCap's shared-encoder
+    fusion, and MSSRNet's per-position style application.
 
-    This is NOT StyleNet's W = U*S*V factorization: a factored matrix inside a
-    T5 decoder FFN sits downstream of cross-attention and cannot transfer from
-    text-only training. An additive vector keeps the style path and the image
-    path separate, which is the property FactoredLSTM has by construction.
-
-    Stated limitation: an additive vector shifts the mean of the content
-    representations but cannot reweight their structure the way a factored
-    matrix can. It is a blunter instrument.
+    Not StyleNet's W = U*S*V: a factored matrix inside a T5 decoder FFN sits
+    downstream of cross-attention and cannot transfer from text-only training.
     """
     def __init__(self, t5_ckpt="csebuetnlp/banglat5", clip_dim=768,
-                 styles=("factual", "romantic"), gradient_checkpointing=False):
+                 styles=("factual", "romantic"), alpha=0.5):
         super().__init__()
         self.t5 = T5ForConditionalGeneration.from_pretrained(t5_ckpt)
         self.d_model = self.t5.config.d_model
         self.styles = list(styles)
 
         self.projector = VisualProjection(clip_dim, self.d_model)
+        self.modulator = StyleModulator(self.d_model, alpha=alpha)
 
-        # Small random init, not zeros: only direction matters, since
-        # magnitude is set at fusion time.
         self.style = nn.ParameterDict({
             s: nn.Parameter(torch.randn(self.d_model) * 0.02)
             for s in self.styles
@@ -66,26 +111,16 @@ class StyleNetT5(nn.Module):
     # ---------- style vector ----------
     @staticmethod
     def _masked_scale(content, mask):
-        """Mean per-position norm over REAL positions only.
-
-        text_style_loss passes padded, variable-length sentences. Padded slots
-        are masked out of attention but still carry hidden states, so an
-        unmasked mean drifts with how much padding a batch contains — which
-        defeats the point of matching style magnitude to content magnitude.
-        """
+        """Mean per-position norm over REAL positions only. Padded slots are
+        masked out of attention but still carry hidden states, so an unmasked
+        mean drifts with how much padding a batch contains."""
         m = mask.unsqueeze(-1).to(content.dtype)
         norms = content.norm(dim=-1, keepdim=True) * m
         return (norms.sum() / m.sum().clamp(min=1e-6)).detach()
 
     def _style_at(self, target, lam, scale):
-        """Unit-normalize each style vector, rescale to content magnitude,
-        then interpolate: s = s_src + lam * (s_tgt - s_src).
-
-        Without the rescale ||s|| was 0.33 against per-position content norms
-        in the tens — a ~1% perturbation, so lam=1 read as factual and lam=3
-        was needed for any visible effect. FS-StyleCap avoids this because its
-        style vector is a mean-pooled encoder output, already at content scale.
-        """
+        """s = s_src + lam * (s_tgt - s_src), both rescaled to content
+        magnitude so lam operates on a comparable scale."""
         def at_scale(v):
             return v / (v.norm() + 1e-6) * scale
 
@@ -96,7 +131,7 @@ class StyleNetT5(nn.Module):
 
     def _fuse(self, content, mask, target, lam):
         s = self._style_at(target, lam, self._masked_scale(content, mask))
-        return content + s.unsqueeze(0).unsqueeze(0)
+        return self.modulator(content, s)
 
     def _decode(self, content, mask, labels, target, lam=1.0):
         mem = self._fuse(content, mask, target, lam)
@@ -111,13 +146,8 @@ class StyleNetT5(nn.Module):
         return loss, content
 
     def v2l_loss(self, img_content, text_ids, text_mask):
-        """L2-normalize both pooled vectors before the MSE.
-
-        Unnormalized this read 0.001 at every step from the first — the vectors
-        are small, so squared error and gradient are negligible and the loss
-        was effectively switched off. FS-StyleCap's w/o L_V2L ablation drops
-        CIDEr 66.26 -> 54.75, so it is not optional.
-        """
+        """L2-normalize both pooled vectors before the MSE. Unnormalized this
+        read 0.001 at every step and was effectively switched off."""
         text_content, _ = self.encode_text(text_ids, text_mask)
         img_pool = F.normalize(img_content.mean(dim=1), dim=-1)
         m = text_mask.unsqueeze(-1).to(text_content.dtype)
@@ -126,29 +156,32 @@ class StyleNetT5(nn.Module):
         return F.mse_loss(img_pool, txt_pool)
 
     def text_style_loss(self, corrupt_ids, corrupt_mask, labels, style, lam=1.0):
-        """lam is SAMPLED during training so the model sees the whole
-        interpolation path, not just its two endpoints.
-
-        With lam fixed at 1.0 the forward pass only ever computes s_factual and
-        s_romantic — two points in a 768-d space. Generation at lam=1.5 or 2.0
-        is then extrapolation into untrained territory, which is why no single
-        lam gave both grounding and style: lam=1 was the one known point and
-        everything above was a guess that landed in the corpus mode.
-        """
+        """lam is sampled during training so the interpolation path is trained,
+        not just its two endpoints."""
         content, mask = self.encode_text(corrupt_ids, corrupt_mask)
         return self._decode(content, mask, labels, style, lam=lam)
 
     # ---------- diagnostics ----------
     @torch.no_grad()
-    def scales(self, feats):
-        """Content vs style magnitude at fusion time. Should be the same order;
-        before the rescale they differed ~50x."""
-        content, mask = self.encode_image(feats)
-        c = self._masked_scale(content, mask).item()
-        out = {"content": c}
+    def style_geometry(self):
+        """If cos(fac,style) ~ 1 the directions coincide, s_tgt - s_src is
+        near zero, and lam does nothing at any value."""
+        f = self.style["factual"]
+        f = f / (f.norm() + 1e-6)
+        out = {}
         for s in self.styles:
-            out[s] = self._style_at(s, 1.0, c).norm().item()
+            if s == "factual":
+                continue
+            v = self.style[s] / (self.style[s].norm() + 1e-6)
+            out[f"cos(fac,{s})"] = torch.dot(f, v).item()
+            out[f"gap(fac,{s})"] = (v - f).norm().item()
         return out
+
+    @torch.no_grad()
+    def gate_report(self, feats, target="romantic", lam=1.0):
+        content, mask = self.encode_image(feats)
+        s = self._style_at(target, lam, self._masked_scale(content, mask))
+        return self.modulator.report(content, s)
 
     # ---------- inference ----------
     @torch.no_grad()
