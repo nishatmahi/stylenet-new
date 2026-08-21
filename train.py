@@ -10,7 +10,7 @@ from models import StyleNetT5, load_compatible
 def build_optimizers(model, args):
     proj, rest = [], []
     for n, p in model.named_parameters():
-        if n.startswith("style."):
+        if n.startswith("style.") or n.startswith("modulator."):
             continue
         (proj if n.startswith("projector.") else rest).append(p)
 
@@ -24,33 +24,29 @@ def build_optimizers(model, args):
         {'params': proj, 'lr': args.lr_proj},
     ], weight_decay=0.01)
 
-    # StyleNet uses 0.0005 for the language stage against 0.0002 for
-    # captioning — a 2.5x ratio. s_style is only 768 numbers.
     opt_style = Opt([model.style[s] for s in model.styles],
                     lr=args.lr_style, weight_decay=0.0)
+
+    # The modulator gets its OWN optimizer and is stepped in BOTH passes.
+    # It must learn where style applies, which needs stylized data (style
+    # pass), but it sits on the image path, so it also needs image-grounded
+    # gradient (caption pass) or it drifts into text-only behaviour. One
+    # optimizer keeps a single consistent moment estimate across both.
+    opt_mod = Opt(model.modulator.parameters(),
+                  lr=args.lr_style, weight_decay=0.0)
 
     print(f"  language model: {sum(p.numel() for p in rest)/1e6:.1f}M")
     print(f"  projector: {sum(p.numel() for p in proj)/1e6:.1f}M")
     print(f"  style vectors: {sum(model.style[s].numel() for s in model.styles)}")
-    return opt_cap, opt_style
+    print(f"  modulator: {sum(p.numel() for p in model.modulator.parameters())/1e6:.2f}M")
+    return opt_cap, opt_style, opt_mod
 
 
-def run_caption_pass(model, loader, opt, sched, device, args, epoch):
-    """Task 1 — image captioning.
-
-    Style params are FROZEN here. _fuse reads style['factual'] on every
-    forward, but opt_cap excludes style.* from its param_groups, so
-    opt.zero_grad() never clears style['factual'].grad while backward keeps
-    adding to it. That stale gradient then entered clip_grad_norm_ over all
-    model.parameters(), inflating the total norm and throttling every other
-    update more and more as the epoch ran. Freezing removes it from the graph.
-    s_factual still trains — in the style pass, on factualtext_train.txt.
-
-    Gradients accumulate so the effective batch is batch_size * accum_steps,
-    matching the batch the paper's lr 5e-4 was chosen for. At batch 16 without
-    accumulation each sample got 8x the intended update and validation rose
-    every epoch while training loss fell.
-    """
+def run_caption_pass(model, loader, opt, opt_mod, sched, device, args, epoch):
+    """Task 1 — image captioning. Modulator trains here too, on image content
+    with s_factual, which is what keeps it image-grounded. Style VECTORS stay
+    frozen: opt_cap excludes them, so their .grad would never be cleared and
+    would inflate clip_grad_norm_ across the epoch."""
     model.train()
     for p in model.parameters():
         p.requires_grad = True
@@ -60,7 +56,9 @@ def run_caption_pass(model, loader, opt, sched, device, args, epoch):
     tot = {'cap': 0.0, 'v2l': 0.0}
     n = 0
     opt.zero_grad(set_to_none=True)
+    opt_mod.zero_grad(set_to_none=True)
     opt_params = [p for g in opt.param_groups for p in g['params']]
+    mod_params = list(model.modulator.parameters())
 
     for i, (feats, cap_ids, cap_mask, cap_labels) in enumerate(loader):
         feats = feats.to(device, non_blocking=True)
@@ -75,9 +73,12 @@ def run_caption_pass(model, loader, opt, sched, device, args, epoch):
 
         if (i + 1) % args.accum_steps == 0:
             torch.nn.utils.clip_grad_norm_(opt_params, 1.0)
+            torch.nn.utils.clip_grad_norm_(mod_params, 1.0)
             opt.step()
+            opt_mod.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
+            opt_mod.zero_grad(set_to_none=True)
 
         tot['cap'] += l_cap.item()
         tot['v2l'] += l_v2l.item()
@@ -91,42 +92,54 @@ def run_caption_pass(model, loader, opt, sched, device, args, epoch):
     return {k: v / max(n, 1) for k, v in tot.items()}
 
 
-def run_style_pass(model, loader, opt_style, device, args, epoch, style):
+def run_style_pass(model, loader, opt_style, opt_mod, device, args, epoch, style):
     """Task 2 — text style injection on the monolingual corpus.
 
-    ONLY s_style is unfrozen. This is the counterpart of StyleNet excluding
-    encoder.A from lang_params: the image reaches the decoder through
-    projector -> t5.encoder -> cross-attention, and this pass trains on text
-    with no images, so any gradient allowed into those weights teaches the
-    decoder to generate without consulting memory. An earlier version left the
-    decoder unfrozen here and the model emitted one identical caption for
-    every test image.
+    Only s_style and the modulator are unfrozen. The encoder, decoder and
+    projector stay frozen: this pass trains on text with no images, so any
+    gradient into those weights teaches the decoder to generate without
+    consulting memory — the counterpart of StyleNet excluding encoder.A.
 
-    lam is sampled per step so the interpolation path is trained, not just
-    its endpoints.
+    The modulator is on the image path, but two things contain that: its delta
+    is hard-bounded to alpha * ||content|| per position, and it also receives
+    image-grounded gradient in the caption pass.
+
+    Steps are capped so s_factual and s_style get equal updates —
+    factualtext_train.txt has 156k lines against romantic's 32k, and since
+    romantic is an offset FROM factual, the origin was moving 4.8x faster than
+    the target.
     """
     model.train()
     for p in model.parameters():
         p.requires_grad = False
     model.style[style].requires_grad = True
+    for p in model.modulator.parameters():
+        p.requires_grad = True
+
+    params = [model.style[style]] + list(model.modulator.parameters())
+    max_steps = args.max_style_steps if args.max_style_steps > 0 else len(loader)
 
     tot, n = 0.0, 0
     for i, (c_ids, c_mask, labels) in enumerate(loader):
+        if i >= max_steps:
+            break
         lam = float(torch.empty(1).uniform_(args.lam_min, args.lam_max).item())
 
         opt_style.zero_grad(set_to_none=True)
+        opt_mod.zero_grad(set_to_none=True)
         loss = model.text_style_loss(c_ids.to(device), c_mask.to(device),
                                      labels.to(device), style, lam=lam)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([model.style[style]], 1.0)
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt_style.step()
+        opt_mod.step()
 
         tot += loss.item()
         n += 1
 
-        if i % args.log_step == 0 or i == len(loader) - 1:
+        if i % args.log_step == 0 or i == min(max_steps, len(loader)) - 1:
             print(f"Epoch [{epoch+1}/{args.epochs}] {style.upper()[:3]} "
-                  f"[{i}/{len(loader)}] loss {loss.item():.3f} "
+                  f"[{i}/{max_steps}] loss {loss.item():.3f} "
                   f"lam {lam:.2f}", flush=True)
 
     for p in model.parameters():
@@ -160,8 +173,16 @@ def validate(model, fac_loader, style_loaders, device):
 @torch.no_grad()
 def show_samples(model, feats, styles, lams):
     model.eval()
-    sc = model.scales(feats)
-    print("    scales: " + "  ".join(f"{k}={v:.2f}" for k, v in sc.items()))
+    print("    geometry: " + "  ".join(f"{k}={v:.3f}"
+                                       for k, v in model.style_geometry().items()))
+    for s in styles:
+        if s == "factual":
+            continue
+        gm, gs, ratio = model.gate_report(feats, target=s, lam=1.0)
+        print(f"    gate[{s}]: mean={gm:.3f} std={gs:.3f} "
+              f"delta/content={ratio:.3f}  "
+              f"(std ~0 = degenerated to a global vector)")
+
     for i in range(feats.size(0)):
         print(f"  --- sample {i+1} ---")
         for style in styles:
@@ -201,13 +222,13 @@ def main(args):
             os.path.join(sd, f'{stem}_val.txt'), args.style_batch_size,
             shuffle=False)
 
-    print(f"steps/epoch: cap={len(train_fac)}, " +
-          ", ".join(f"{s}={len(l)}" for s, l in train_style_loaders.items()))
+    print(f"steps/epoch: cap={len(train_fac)}, style capped at "
+          f"{args.max_style_steps}")
 
     model = StyleNetT5(t5_ckpt=args.t5_ckpt, clip_dim=args.clip_dim,
-                       styles=tuple(all_styles)).to(device)
+                       styles=tuple(all_styles), alpha=args.alpha).to(device)
 
-    opt_cap, opt_style = build_optimizers(model, args)
+    opt_cap, opt_style, opt_mod = build_optimizers(model, args)
     sched = LambdaLR(opt_cap, lambda s: min(1.0, (s + 1) / max(1, args.warmup)))
 
     start, best, patience = 0, float('inf'), 0
@@ -220,6 +241,7 @@ def main(args):
         try:
             opt_cap.load_state_dict(ck['opt_cap'])
             opt_style.load_state_dict(ck['opt_style'])
+            opt_mod.load_state_dict(ck['opt_mod'])
             sched.load_state_dict(ck['sched'])
         except Exception as e:
             print(f"[WARN] optimizer state unusable ({e}); starting fresh")
@@ -235,14 +257,13 @@ def main(args):
         print(f"\n=== epoch {epoch+1}/{args.epochs} ===")
         train_fac.dataset.set_epoch(epoch)
 
-        # StyleNet's loop: captioning pass, then a style pass on the resulting
-        # weights, alternating each epoch, starting with captioning.
-        cap_avg = run_caption_pass(model, train_fac, opt_cap, sched,
+        cap_avg = run_caption_pass(model, train_fac, opt_cap, opt_mod, sched,
                                    device, args, epoch)
         style_avg = {}
         for s in all_styles:
             style_avg[s] = run_style_pass(model, train_style_loaders[s],
-                                          opt_style, device, args, epoch, s)
+                                          opt_style, opt_mod, device, args,
+                                          epoch, s)
 
         print(f"[EPOCH {epoch+1}] cap {cap_avg['cap']:.4f}  "
               f"v2l {cap_avg['v2l']:.4f}  " +
@@ -259,6 +280,7 @@ def main(args):
         state = {'epoch': epoch, 'model': model.state_dict(),
                  'opt_cap': opt_cap.state_dict(),
                  'opt_style': opt_style.state_dict(),
+                 'opt_mod': opt_mod.state_dict(),
                  'sched': sched.state_dict(),
                  'best': best, 'patience': patience, 'styles': all_styles}
 
@@ -290,8 +312,6 @@ if __name__ == '__main__':
     p.add_argument('--styles', default='romantic')
     p.add_argument('--batch_size', type=int, default=16)
     p.add_argument('--style_batch_size', type=int, default=32)
-
-    # effective batch = batch_size * accum_steps = 128, the paper's batch
     p.add_argument('--accum_steps', type=int, default=8)
 
     p.add_argument('--lr', type=float, default=5e-4)
@@ -299,10 +319,13 @@ if __name__ == '__main__':
     p.add_argument('--lr_style', type=float, default=1e-3)
     p.add_argument('--w_v2l', type=float, default=1.0)
 
-    # lam is sampled from [lam_min, lam_max] during the style pass so the
-    # interpolation path is trained rather than only evaluated
+    # hard cap on style perturbation: ||delta|| <= alpha * ||content||
+    # per position, so content cannot be overwritten
+    p.add_argument('--alpha', type=float, default=0.5)
+
     p.add_argument('--lam_min', type=float, default=0.5)
     p.add_argument('--lam_max', type=float, default=2.5)
+    p.add_argument('--max_style_steps', type=int, default=1024)
 
     p.add_argument('--warmup', type=int, default=200)
     p.add_argument('--epochs', type=int, default=20)
