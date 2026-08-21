@@ -8,11 +8,10 @@ from transformers import T5Tokenizer
 T5_CKPT = "csebuetnlp/banglat5"
 MAX_LEN = 48
 
-# At 0.2 the decoder reconstructs the sentence by copying the surviving words
-# and never needs the style vector — txt loss collapsed to 0.55 and s_style
-# was starved of gradient. Higher noise forces the decoder to consult the
-# style vector for what the corruption removed, which is the whole point of
-# the denoising task.
+# At 0.2 the decoder reconstructs by copying the surviving words and never
+# consults the style vector — txt loss collapsed to 0.55 and s_style was
+# starved of gradient. Higher noise forces it to use the style vector for
+# what the corruption removed.
 DROP_P  = 0.5
 
 tokenizer = T5Tokenizer.from_pretrained(T5_CKPT, use_fast=False)
@@ -39,17 +38,22 @@ def to_labels(input_ids):
 
 
 class FactualDataset(Dataset):
-    """CLIP features + the paired factual caption. The caption is returned as
-    text as well, because the V2L loss encodes it on the text side."""
+    """One sample per unique image per epoch; which of that image's ~5 captions
+    is used rotates with the epoch. All captions are still seen across
+    training, but the same feature file isn't re-read 5x within one epoch.
+
+    The caption is returned as text too, because V2L encodes it on the text
+    side."""
     def __init__(self, cache_dir, caption_file):
         self.cache_dir = cache_dir
-        self.items = self._load(caption_file)
+        self.img_ids, self.captions = self._load(caption_file)
+        self.epoch = 0
 
     def _load(self, caption_file):
         with open(caption_file, encoding='utf-8') as f:
             lines = [ln.strip() for ln in f if ln.strip()]
 
-        items, imgs = [], set()
+        by_img, order = {}, []
         r = re.compile(r'#\d*')
         missing = malformed = 0
 
@@ -59,27 +63,40 @@ class FactualDataset(Dataset):
                 malformed += 1
                 continue
             img_id = strip_ext(parts[0])
-            if not os.path.exists(os.path.join(self.cache_dir, f"{img_id}.pt")):
-                missing += 1
-                continue
-            items.append((img_id, parts[1]))
-            imgs.add(img_id)
+            if img_id not in by_img:
+                if not os.path.exists(os.path.join(self.cache_dir, f"{img_id}.pt")):
+                    missing += 1
+                    by_img[img_id] = None
+                    continue
+                by_img[img_id] = []
+                order.append(img_id)
+            if by_img[img_id] is not None:
+                by_img[img_id].append(parts[1])
 
         if malformed:
             print(f"[WARN] {caption_file}: {malformed} malformed lines.")
         if missing:
-            print(f"[WARN] {caption_file}: {missing} lines without cached features.")
-        if not items:
+            print(f"[WARN] {caption_file}: {missing} images without cached features.")
+        if not order:
             raise RuntimeError(f"No usable samples in {caption_file}")
-        print(f"[INFO] {os.path.basename(caption_file)}: {len(items)} captions, "
-              f"{len(imgs)} images")
-        return items
+
+        caps = [by_img[i] for i in order]
+        total = sum(len(c) for c in caps)
+        print(f"[INFO] {os.path.basename(caption_file)}: {len(order)} images, "
+              f"{total} captions ({total/len(order):.1f} per image). "
+              f"One caption/image per epoch.")
+        return order, caps
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
     def __len__(self):
-        return len(self.items)
+        return len(self.img_ids)
 
     def __getitem__(self, ix):
-        img_id, caption = self.items[ix]
+        img_id = self.img_ids[ix]
+        caps = self.captions[ix]
+        caption = caps[self.epoch % len(caps)]
         feats = torch.load(os.path.join(self.cache_dir, f"{img_id}.pt"),
                            map_location='cpu')          # [50, 768] fp16
         return feats, caption
@@ -135,9 +152,3 @@ def style_loader(caption_file, bs, shuffle=True, workers=2):
                       batch_size=bs, shuffle=shuffle, num_workers=workers,
                       pin_memory=True, persistent_workers=workers > 0,
                       collate_fn=collate_style)
-
-
-def infinite(loader):
-    while True:
-        for batch in loader:
-            yield batch
