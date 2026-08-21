@@ -39,6 +39,10 @@ class StyleModulator(nn.Module):
     sitting on the image path, and the bound means the worst it can do is
     perturb content by a bounded fraction — it cannot overwrite it.
 
+    NOTE: the bound limits DAMAGE, it does not make the module image-grounded.
+    That depends on the ratio of image-pass to text-pass optimizer steps, which
+    train.py balances explicitly. See --max_style_steps.
+
     proj is zero-initialized, so at step 0 this is an exact no-op.
     """
     def __init__(self, d_model, alpha=0.5):
@@ -79,7 +83,11 @@ class StyleNetT5(nn.Module):
     fusion, and MSSRNet's per-position style application.
 
     Not StyleNet's W = U*S*V: a factored matrix inside a T5 decoder FFN sits
-    downstream of cross-attention and cannot transfer from text-only training.
+    downstream of cross-attention, so it is tuned on decoder states produced
+    while attending to TEXT memory and must then apply to decoder states
+    produced while attending to VISUAL memory. Injecting style into the
+    encoder memory instead applies the same delta at the same point in the
+    pipeline for both modalities, which is a far shorter transfer path.
     """
     def __init__(self, t5_ckpt="csebuetnlp/banglat5", clip_dim=768,
                  styles=("factual", "romantic"), alpha=0.5):
@@ -120,7 +128,11 @@ class StyleNetT5(nn.Module):
 
     def _style_at(self, target, lam, scale):
         """s = s_src + lam * (s_tgt - s_src), both rescaled to content
-        magnitude so lam operates on a comparable scale."""
+        magnitude so lam operates on a comparable scale.
+
+        When target == 'factual' this returns s_src and lam is ignored, which
+        is correct — factual IS the origin of the interpolation.
+        """
         def at_scale(v):
             return v / (v.norm() + 1e-6) * scale
 
@@ -146,14 +158,29 @@ class StyleNetT5(nn.Module):
         return loss, content
 
     def v2l_loss(self, img_content, text_ids, text_mask):
-        """L2-normalize both pooled vectors before the MSE. Unnormalized this
-        read 0.001 at every step and was effectively switched off."""
-        text_content, _ = self.encode_text(text_ids, text_mask)
+        """Pull the VISUAL representation toward the TEXT representation.
+
+        The text branch runs under no_grad and is the fixed anchor. Previously
+        both branches carried gradient through the SAME encoder and both were
+        L2-normalized, which makes representational collapse the global
+        optimum — the encoder can drive this MSE to zero by emitting one
+        constant direction for every input. Normalizing was the right fix for
+        the loss reading 0.001 and being effectively off; leaving the text side
+        trainable is what turned it into a collapse attractor.
+
+        Direction matters: text is the space the style vectors are calibrated
+        in, so the visual side must move toward it and never the reverse.
+
+        Watch for the tell: l_v2l plunging toward zero while caption loss
+        stalls means it is collapsing anyway.
+        """
+        with torch.no_grad():
+            text_content, _ = self.encode_text(text_ids, text_mask)
+            m = text_mask.unsqueeze(-1).to(text_content.dtype)
+            txt_pool = (text_content * m).sum(1) / m.sum(1).clamp(min=1e-6)
+            txt_pool = F.normalize(txt_pool, dim=-1)
         img_pool = F.normalize(img_content.mean(dim=1), dim=-1)
-        m = text_mask.unsqueeze(-1).to(text_content.dtype)
-        txt_pool = (text_content * m).sum(1) / m.sum(1).clamp(min=1e-6)
-        txt_pool = F.normalize(txt_pool, dim=-1)
-        return F.mse_loss(img_pool, txt_pool)
+        return F.mse_loss(img_pool, txt_pool.to(img_pool.dtype))
 
     def text_style_loss(self, corrupt_ids, corrupt_mask, labels, style, lam=1.0):
         """lam is sampled during training so the interpolation path is trained,
@@ -186,25 +213,62 @@ class StyleNetT5(nn.Module):
     # ---------- inference ----------
     @torch.no_grad()
     def generate(self, feats, target="factual", lam=1.0, num_beams=5,
-                 max_new_tokens=40, repetition_penalty=1.2,
-                 no_repeat_ngram_size=3, length_penalty=1.0):
+                 max_new_tokens=40, repetition_penalty=1.0,
+                 no_repeat_ngram_size=0, length_penalty=1.0):
+        """repetition_penalty and no_repeat_ngram_size default OFF.
+
+        On ~20-token Bangla captions a hard 3-gram ban plus a 1.2 logit penalty
+        fights legitimate repetition of function words and postpositions and
+        pushes beam search off natural phrasing. StyleNet used plain beam
+        search at width 5. Turn these back on only if you actually observe
+        degenerate loops in the output.
+        """
         content, mask = self.encode_image(feats)
         mem = self._fuse(content, mask, target, lam)
-        return self.t5.generate(
+        kwargs = dict(
             encoder_outputs=BaseModelOutput(last_hidden_state=mem),
             attention_mask=mask, num_beams=num_beams,
-            max_new_tokens=max_new_tokens,
-            repetition_penalty=repetition_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            length_penalty=length_penalty,
+            max_new_tokens=max_new_tokens, length_penalty=length_penalty,
             early_stopping=True, use_cache=True)
+        if repetition_penalty and repetition_penalty != 1.0:
+            kwargs["repetition_penalty"] = repetition_penalty
+        if no_repeat_ngram_size:
+            kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+        return self.t5.generate(**kwargs)
 
 
-def load_compatible(model, state_dict, verbose=True):
+def load_compatible(model, state_dict, verbose=True, min_frac=0.95):
+    """Report what was dropped and refuse to silently resume from a mostly
+    random model. The old version printed only a count, so an architecture
+    edit would restore a partial checkpoint and train on from a half
+    initialized state with no error anywhere."""
     own = model.state_dict()
-    ok = {k: v for k, v in state_dict.items()
-          if k in own and own[k].shape == v.shape}
+    ok, bad = {}, []
+    for k, v in state_dict.items():
+        if k in own and own[k].shape == v.shape:
+            ok[k] = v
+        else:
+            reason = "absent" if k not in own else f"{tuple(v.shape)}!={tuple(own[k].shape)}"
+            bad.append(f"{k} ({reason})")
+    missing = [k for k in own if k not in ok]
     model.load_state_dict(ok, strict=False)
+
+    frac = len(ok) / max(len(own), 1)
     if verbose:
-        print(f"[LOAD] restored {len(ok)}/{len(own)} tensors")
+        print(f"[LOAD] restored {len(ok)}/{len(own)} tensors ({frac:.1%})")
+        for k in bad[:10]:
+            print(f"[LOAD]   skipped: {k}")
+        if len(bad) > 10:
+            print(f"[LOAD]   ... and {len(bad)-10} more")
+        for k in missing[:10]:
+            print(f"[LOAD]   left at init: {k}")
+        if len(missing) > 10:
+            print(f"[LOAD]   ... and {len(missing)-10} more")
+    if frac < min_frac:
+        raise RuntimeError(
+            f"checkpoint restored only {frac:.1%} of the model "
+            f"(threshold {min_frac:.0%}). The architecture likely changed since "
+            f"this checkpoint was written. Delete it or pass min_frac=0 if you "
+            f"really intend to resume from a partially initialized model."
+        )
     return len(ok)
