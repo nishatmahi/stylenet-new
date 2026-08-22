@@ -1,5 +1,7 @@
 import os
 import random
+from collections import Counter
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import T5Tokenizer
@@ -8,36 +10,33 @@ try:
     from normalizer import normalize
 except ImportError:
     raise ImportError(
-        "BanglaT5 requires the csebuetnlp normalization pipeline it was "
-        "pretrained with. Install it:\n"
-        "  pip install git+https://github.com/csebuetnlp/normalizer"
-    )
+        "BanglaT5 needs the csebuetnlp normalization pipeline it was pretrained "
+        "with:\n  pip install git+https://github.com/csebuetnlp/normalizer")
 
 T5_CKPT = "csebuetnlp/banglat5"
 MAX_LEN = 48
 
-# 0.3, not 0.5. At 0.5 half of a ~10-word Bangla caption is gone and the decoder
-# is being asked to invent content words. A single global style vector cannot
-# supply missing CONTENT, so extra noise does not strengthen the style signal —
-# it teaches hallucination. If the decoder is ignoring the style vector,
-# diagnose with style_geometry(): cos(fac,style) near 1.0 means the vectors
-# collapsed onto each other and no amount of input noise helps.
-DROP_P = 0.3
+# Two rates, not one. Uniform dropout removed content words as often as style
+# words, so the model learned to invent content (which it cannot know) while the
+# style phrase survived and was copied straight off the input — the knobs got
+# almost no gradient. Masking the style words leaves the content intact and
+# removes the one thing the knobs are supposed to supply, so each example reads
+# as "here is the plain sentence, produce the styled one" — the exact job at
+# inference, derived from the unpaired style corpus alone.
+P_STYLE = 0.9
+P_CONTENT = 0.1
 
 tokenizer = T5Tokenizer.from_pretrained(T5_CKPT, use_fast=False)
 
 
 def strip_ext(img_id):
-    for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
-        if img_id.lower().endswith(ext.lower()):
-            return img_id[: -len(ext)]
+    for e in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+        if img_id.lower().endswith(e.lower()):
+            return img_id[:-len(e)]
     return img_id
 
 
 def encode(texts, max_len=MAX_LEN):
-    # The real normalization pipeline, not a single danda replace. Must be
-    # applied to captions, style corpora, AND the reference side of any metric
-    # you compute later, or your BLEU is measuring the wrong thing.
     texts = [normalize(t) for t in texts]
     enc = tokenizer(texts, max_length=max_len, truncation=True,
                     padding=True, return_tensors="pt")
@@ -51,77 +50,106 @@ def to_labels(input_ids):
 
 
 def _split_line(line):
-    """`1000092795.jpg#0<TAB>caption` -> ('1000092795', 'caption').
-
-    Split on the tab, not on a `#\\d*` regex. The regex also fired on a bare
-    '#' and on any '#' inside the caption itself, silently truncating it.
-    """
+    """`1000092795.jpg#0<TAB>caption` -> ('1000092795', 'caption')."""
     if '\t' in line:
         key, cap = line.split('\t', 1)
     elif '#' in line:
         key, cap = line.split('#', 1)
-        cap = cap.split(None, 1)[1] if len(cap.split(None, 1)) > 1 else ''
+        parts = cap.split(None, 1)
+        cap = parts[1] if len(parts) > 1 else ''
     else:
         return None
     return strip_ext(key.split('#')[0].strip()), cap.strip()
 
 
-class FactualDataset(Dataset):
-    """One row per (image, caption) pair. No epoch state, no rotation.
+def read_lines(path):
+    return [l.strip() for l in open(path, encoding='utf-8') if l.strip()]
 
-    The previous version returned one row per IMAGE and rotated which caption
-    was used via set_epoch(). Under persistent_workers=True the workers fork
-    once and keep their own copy of the dataset, so the parent's set_epoch()
-    never reached them — self.epoch stayed 0 forever and only caption #0 of
-    each image was ever trained on. Four fifths of the caption data was loaded,
-    counted in the INFO line, and discarded.
 
-    The caption is returned as text as well, because V2L encodes it on the
-    text side.
+# --------------------------------------------------------------------------
+def find_style_words(style_lines, factual_lines, ratio=5.0, min_count=20, name=""):
+    """Words far more frequent in the style corpus than in factual text.
+
+    Purely lexical — no hand-written list — so it still works after you
+    regenerate a corpus. The printout doubles as a corpus check: if only a
+    handful of words clear the bar, the style is a template, not a style.
     """
+    cf = Counter(w for l in factual_lines for w in l.split())
+    cs = Counter(w for l in style_lines for w in l.split())
+    Nf, Ns = max(sum(cf.values()), 1), max(sum(cs.values()), 1)
+
+    scored = []
+    for w, c in cs.items():
+        if c < min_count:
+            continue
+        r = (c / Ns) / (cf.get(w, 0) / Nf + 1e-9)
+        if r > ratio:
+            scored.append((r, c, w))
+    scored.sort(reverse=True)
+    words = {w for _, _, w in scored}
+
+    hit = sum(1 for l in style_lines if any(w in words for w in l.split()))
+    print(f"[STYLE] {name}: {len(words)} style words; present in "
+          f"{hit:,}/{len(style_lines):,} lines "
+          f"({100*hit/max(len(style_lines),1):.0f}%)")
+    if scored:
+        print(f"[STYLE] {name}: top -> " + "  ".join(w for _, _, w in scored[:12]))
+    if len(words) < 50:
+        print(f"[STYLE] {name}: WARNING only {len(words)} distinct style words — "
+              f"the knobs will learn a lookup table, not a style.")
+    if hit < 0.4 * len(style_lines):
+        print(f"[STYLE] {name}: WARNING style markers reach under 40% of lines; "
+              f"masking will have little to remove on the rest.")
+    return words
+
+
+# --------------------------------------------------------------------------
+class FactualDataset(Dataset):
+    """One row per (image, caption) pair. No epoch state, no rotation — the
+    old rotation was inert under persistent_workers and silently trained on
+    caption #0 of every image only."""
 
     def __init__(self, cache_dir, caption_file):
         self.cache_dir = cache_dir
         self.rows = self._load(caption_file)
 
     def _load(self, caption_file):
-        with open(caption_file, encoding='utf-8') as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-
         rows, seen, malformed = [], {}, 0
-        for line in lines:
+        for line in read_lines(caption_file):
             parsed = _split_line(line)
             if parsed is None or not parsed[1]:
                 malformed += 1
                 continue
-            img_id, caption = parsed
-            if img_id not in seen:
-                seen[img_id] = os.path.exists(
-                    os.path.join(self.cache_dir, f"{img_id}.pt"))
-            if seen[img_id]:
-                rows.append((img_id, caption))
+            img, cap = parsed
+            if img not in seen:
+                seen[img] = os.path.exists(
+                    os.path.join(self.cache_dir, f"{img}.pt"))
+            if seen[img]:
+                rows.append((img, cap))
 
-        missing = sum(1 for v in seen.values() if not v)
-        n_img = sum(1 for v in seen.values() if v)
+        miss = sum(1 for v in seen.values() if not v)
+        nimg = sum(1 for v in seen.values() if v)
         if malformed:
             print(f"[WARN] {caption_file}: {malformed} malformed lines.")
-        if missing:
-            print(f"[WARN] {caption_file}: {missing} images without cached features.")
+        if miss:
+            print(f"[WARN] {caption_file}: {miss} images without cached features.")
         if not rows:
             raise RuntimeError(f"No usable samples in {caption_file}")
-
-        print(f"[INFO] {os.path.basename(caption_file)}: {n_img} images, "
-              f"{len(rows)} captions ({len(rows)/max(n_img,1):.1f} per image).")
+        print(f"[INFO] {os.path.basename(caption_file)}: {nimg} images, "
+              f"{len(rows)} captions ({len(rows)/max(nimg,1):.1f} per image).")
         return rows
+
+    def captions(self):
+        return [c for _, c in self.rows]
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, ix):
-        img_id, caption = self.rows[ix]
-        feats = torch.load(os.path.join(self.cache_dir, f"{img_id}.pt"),
-                           map_location='cpu')          # [50, 768] fp16
-        return feats, caption
+        img, cap = self.rows[ix]
+        feats = torch.load(os.path.join(self.cache_dir, f"{img}.pt"),
+                           map_location='cpu')        # [50, 768] fp16
+        return feats, cap
 
 
 def collate_factual(batch):
@@ -131,16 +159,16 @@ def collate_factual(batch):
 
 
 class StyleTextDataset(Dataset):
-    """Monolingual stylized text. Returns (corrupted, clean): the encoder sees
-    a corrupted sentence and the decoder must restore the original, so it has
-    to rely on the style vector for what the noise removed."""
+    """Encoder sees the sentence with its STYLE words gone and its content
+    intact; the decoder must restore the full styled sentence."""
 
-    def __init__(self, caption_file, drop_p=DROP_P, seed=0):
-        with open(caption_file, encoding='utf-8') as f:
-            self.lines = [x.strip() for x in f if x.strip()]
+    def __init__(self, caption_file, style_words=None,
+                 p_style=P_STYLE, p_content=P_CONTENT, seed=0):
+        self.lines = read_lines(caption_file)
         if not self.lines:
             raise RuntimeError(f"{caption_file} is empty")
-        self.drop_p = drop_p
+        self.style_words = style_words or set()
+        self.p_style, self.p_content = p_style, p_content
         self.seed = seed
         print(f"[INFO] {os.path.basename(caption_file)}: {len(self.lines)} lines")
 
@@ -148,44 +176,33 @@ class StyleTextDataset(Dataset):
         return len(self.lines)
 
     def __getitem__(self, ix):
-        # Seed per item instead of holding one random.Random on the dataset.
-        # Every worker forks with an identical RNG state, so a shared generator
-        # produced duplicated corruption across workers and was not reproducible
-        # run to run. Keying on ix makes the corruption a deterministic function
-        # of the item, identical in every worker.
+        # Seeded per item. Every worker forks with the same RNG state, so a
+        # shared generator duplicates corruption across workers.
         rng = random.Random(self.seed * 1_000_003 + ix)
-        text = self.lines[ix]
-        words = text.split()
-        kept = [w for w in words if rng.random() > self.drop_p]
+        words = self.lines[ix].split()
+        kept = [w for w in words
+                if rng.random() > (self.p_style if w in self.style_words
+                                   else self.p_content)]
         if not kept:
-            kept = words[:1]
-        return " ".join(kept), text
+            kept = [w for w in words if w not in self.style_words][:3] or words[:1]
+        return " ".join(kept), self.lines[ix]
 
 
 def collate_style(batch):
-    corrupted, clean = zip(*batch)
-    c_ids, c_mask = encode(corrupted)
+    corrupt, clean = zip(*batch)
+    c_ids, c_mask = encode(corrupt)
     t_ids, _ = encode(clean)
     return c_ids, c_mask, to_labels(t_ids)
 
 
 class SubsetEpochSampler(torch.utils.data.Sampler):
-    """OPTIONAL. Off unless --captions_per_epoch > 0.
-
-    Draws `num_samples` rows per epoch from a fresh permutation, purely to make
-    epochs shorter. Every caption is still reachable because the permutation is
-    redrawn each epoch.
-
-    NOTE this set_epoch DOES work under persistent_workers, unlike the one that
-    used to live on the dataset. The sampler runs in the MAIN process and ships
-    indices to the workers; only the dataset object is copied into them.
-    """
+    """Optional, off unless --captions_per_epoch > 0. Shortens epochs only.
+    set_epoch works here because the sampler lives in the main process."""
 
     def __init__(self, n, num_samples=None, seed=0):
         self.n = n
         self.num_samples = min(num_samples or n, n)
-        self.seed = seed
-        self.epoch = 0
+        self.seed, self.epoch = seed, 0
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -200,21 +217,21 @@ class SubsetEpochSampler(torch.utils.data.Sampler):
 
 
 def factual_loader(cache_dir, caption_file, bs, shuffle=False, workers=4,
-                   captions_per_epoch=0):
+                   captions_per_epoch=0, return_dataset=False):
     ds = FactualDataset(cache_dir, caption_file)
     sampler = None
     if shuffle and captions_per_epoch and captions_per_epoch < len(ds):
         sampler = SubsetEpochSampler(len(ds), captions_per_epoch)
-        shuffle = False                       # mutually exclusive with sampler
+        shuffle = False
         print(f"[INFO] sampling {len(sampler)}/{len(ds)} captions per epoch")
-    return DataLoader(ds, batch_size=bs, shuffle=shuffle, sampler=sampler,
-                      num_workers=workers, pin_memory=True,
-                      persistent_workers=workers > 0,
-                      collate_fn=collate_factual)
+    dl = DataLoader(ds, batch_size=bs, shuffle=shuffle, sampler=sampler,
+                    num_workers=workers, pin_memory=True,
+                    persistent_workers=workers > 0, collate_fn=collate_factual)
+    return (dl, ds) if return_dataset else dl
 
 
-def style_loader(caption_file, bs, shuffle=True, workers=2):
-    return DataLoader(StyleTextDataset(caption_file),
-                      batch_size=bs, shuffle=shuffle, num_workers=workers,
-                      pin_memory=True, persistent_workers=workers > 0,
-                      collate_fn=collate_style)
+def style_loader(caption_file, bs, style_words=None, shuffle=True, workers=2):
+    return DataLoader(
+        StyleTextDataset(caption_file, style_words=style_words),
+        batch_size=bs, shuffle=shuffle, num_workers=workers, pin_memory=True,
+        persistent_workers=workers > 0, collate_fn=collate_style)
