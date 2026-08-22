@@ -6,7 +6,8 @@ from transformers.modeling_outputs import BaseModelOutput
 
 
 class VisualProjection(nn.Module):
-    """CLIP tokens -> T5 encoder input space, following FS-StyleCap's M_{V->L}."""
+    """CLIP tokens -> T5 encoder input space. The encoder handles the picture
+    and nothing else — it never sees style."""
     def __init__(self, clip_dim, d_model, n_layers=2, n_heads=8):
         super().__init__()
         self.inp = nn.Linear(clip_dim, d_model)
@@ -20,89 +21,88 @@ class VisualProjection(nn.Module):
         return self.ln(self.tr(self.inp(feats)))
 
 
-class StyleModulator(nn.Module):
-    """Per-position style application with a hard magnitude bound.
+class StyleContext:
+    """Shared holder for the style dial. lam=0 means the adapters are off and
+    the model is exactly the plain factual captioner."""
+    def __init__(self, lam=0.0):
+        self.lam = lam
 
-    MSSRNet (KDD 2023): a fixed-sized vector "applies the same style
-    information to all words forming coarse-grained control". TED
-    (Neurocomputing 2023) reports the consequence as "suboptimal preservation
-    of non-stylistic semantic content" — swimmers becoming a boat. Adding one
-    vector identically to every position has a single degree of freedom, so
-    style strength and content damage are the same knob.
 
-    A sigmoid gate computed per position and per dimension lets the model
-    learn WHERE style applies, separating those two.
+class StyleAdapter(nn.Module):
+    """The style knobs. One small bottleneck per decoder block.
 
-    The delta is then renormalized so its per-position norm never exceeds
-    alpha * ||content|| at that position. This is a structural guarantee, not
-    a monitored hope: the modulator trains partly on text-only data while
-    sitting on the image path, and the bound means the worst it can do is
-    perturb content by a bounded fraction — it cannot overwrite it.
-
-    NOTE: the bound limits DAMAGE, it does not make the module image-grounded.
-    That depends on the ratio of image-pass to text-pass optimizer steps, which
-    train.py balances explicitly. See --max_style_steps.
-
-    proj is zero-initialized, so at step 0 this is an exact no-op.
+    Up-projection is zero-initialised, so at step 0 the adapter output is
+    exactly zero: factual and romantic start as the same model and every
+    difference that appears later was learned.
     """
-    def __init__(self, d_model, alpha=0.5):
+    def __init__(self, d_model, bottleneck=64, dropout=0.1):
         super().__init__()
-        self.alpha = alpha
-        self.proj = nn.Linear(d_model, d_model, bias=False)
-        self.gate = nn.Linear(2 * d_model, d_model)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.gate.bias)
+        self.down = nn.Linear(d_model, bottleneck)
+        self.up = nn.Linear(bottleneck, d_model)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        nn.init.normal_(self.down.weight, std=1e-3)
+        nn.init.zeros_(self.down.bias)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
 
-    def _delta(self, content, s):
-        s_exp = s.unsqueeze(0).unsqueeze(0).expand_as(content)
-        g = torch.sigmoid(self.gate(torch.cat([content, s_exp], dim=-1)))
-        return g * self.proj(s_exp), g
+    def forward(self, x):
+        return self.dropout(self.up(self.act(self.down(x))))
 
-    def forward(self, content, s):
-        delta, _ = self._delta(content, s)
-        cn = content.norm(dim=-1, keepdim=True)
-        dn = delta.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        scale = torch.clamp(self.alpha * cn / dn, max=1.0)
-        return content + delta * scale
 
-    @torch.no_grad()
-    def report(self, content, s):
-        """Gate spread and the realized delta-to-content ratio.
-        gate std ~0 means it degenerated back to a global vector."""
-        delta, g = self._delta(content, s)
-        cn = content.norm(dim=-1, keepdim=True)
-        dn = delta.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        scale = torch.clamp(self.alpha * cn / dn, max=1.0)
-        ratio = ((delta * scale).norm(dim=-1) / cn.squeeze(-1).clamp(min=1e-6))
-        return g.mean().item(), g.std().item(), ratio.mean().item()
+class AdapterFF(nn.Module):
+    """Wraps a T5 decoder feed-forward block and adds the style delta.
+
+        h = ff(x) + lam * adapter(ff(x))
+
+    Residual, exactly like S_f + lam*S_r in your LSTM: the model's normal
+    writing behaviour is never switched off, style is only ever added on top.
+    lam multiplies the delta directly with nothing renormalising it, so the
+    dial actually controls intensity.
+    """
+    def __init__(self, orig_ff, d_model, bottleneck, ctx: StyleContext):
+        super().__init__()
+        self.orig = orig_ff
+        self.adapter = StyleAdapter(d_model, bottleneck)
+        self.ctx = ctx
+        self.last_ratio = 0.0          # diagnostic: ||delta|| / ||h||
+
+    def forward(self, hidden_states):
+        h = self.orig(hidden_states)
+        if self.ctx.lam == 0.0:
+            return h
+        d = self.adapter(h)
+        if not self.training:
+            self.last_ratio = (d.norm(dim=-1).mean()
+                               / h.norm(dim=-1).mean().clamp(min=1e-6)).item()
+        return h + self.ctx.lam * d
 
 
 class StyleNetT5(nn.Module):
-    """
-    StyleNet's alternating multi-task procedure, FS-StyleCap's shared-encoder
-    fusion, and MSSRNet's per-position style application.
+    """One style per run, matching how you trained the LSTM.
 
-    Not StyleNet's W = U*S*V: a factored matrix inside a T5 decoder FFN sits
-    downstream of cross-attention, so it is tuned on decoder states produced
-    while attending to TEXT memory and must then apply to decoder states
-    produced while attending to VISUAL memory. Injecting style into the
-    encoder memory instead applies the same delta at the same point in the
-    pipeline for both modalities, which is a far shorter transfer path.
+    Encoder: picture only.
+    Decoder: writing, with the style knobs inside it.
+    lam=0 -> plain factual captioner.  lam=1 -> trained style strength.
     """
     def __init__(self, t5_ckpt="csebuetnlp/banglat5", clip_dim=768,
-                 styles=("factual", "romantic"), alpha=0.5):
+                 style="romantic", bottleneck=64):
         super().__init__()
         self.t5 = T5ForConditionalGeneration.from_pretrained(t5_ckpt)
         self.d_model = self.t5.config.d_model
-        self.styles = list(styles)
+        self.style = style
+        self.ctx = StyleContext(0.0)
 
         self.projector = VisualProjection(clip_dim, self.d_model)
-        self.modulator = StyleModulator(self.d_model, alpha=alpha)
+        for block in self.t5.decoder.block:
+            block.layer[-1] = AdapterFF(block.layer[-1], self.d_model,
+                                        bottleneck, self.ctx)
 
-        self.style = nn.ParameterDict({
-            s: nn.Parameter(torch.randn(self.d_model) * 0.02)
-            for s in self.styles
-        })
+    def adapter_modules(self):
+        return [b.layer[-1] for b in self.t5.decoder.block]
+
+    def adapter_parameters(self):
+        return [p for m in self.adapter_modules() for p in m.adapter.parameters()]
 
     # ---------- encoders ----------
     def encode_image(self, feats):
@@ -113,162 +113,109 @@ class StyleNetT5(nn.Module):
         return out.last_hidden_state, mask
 
     def encode_text(self, ids, mask):
-        out = self.t5.encoder(input_ids=ids, attention_mask=mask)
-        return out.last_hidden_state, mask
+        return self.t5.encoder(input_ids=ids, attention_mask=mask).last_hidden_state, mask
 
-    # ---------- style vector ----------
-    @staticmethod
-    def _masked_scale(content, mask):
-        """Mean per-position norm over REAL positions only. Padded slots are
-        masked out of attention but still carry hidden states, so an unmasked
-        mean drifts with how much padding a batch contains."""
-        m = mask.unsqueeze(-1).to(content.dtype)
-        norms = content.norm(dim=-1, keepdim=True) * m
-        return (norms.sum() / m.sum().clamp(min=1e-6)).detach()
-
-    def _style_at(self, target, lam, scale):
-        """s = s_src + lam * (s_tgt - s_src), both rescaled to content
-        magnitude so lam operates on a comparable scale.
-
-        When target == 'factual' this returns s_src and lam is ignored, which
-        is correct — factual IS the origin of the interpolation.
-        """
-        def at_scale(v):
-            return v / (v.norm() + 1e-6) * scale
-
-        src = at_scale(self.style["factual"])
-        if target == "factual" or lam == 0.0:
-            return src
-        return src + lam * (at_scale(self.style[target]) - src)
-
-    def _fuse(self, content, mask, target, lam):
-        s = self._style_at(target, lam, self._masked_scale(content, mask))
-        return self.modulator(content, s)
-
-    def _decode(self, content, mask, labels, target, lam=1.0):
-        mem = self._fuse(content, mask, target, lam)
-        out = self.t5(encoder_outputs=BaseModelOutput(last_hidden_state=mem),
+    def _decode(self, content, mask, labels, lam):
+        self.ctx.lam = lam
+        out = self.t5(encoder_outputs=BaseModelOutput(last_hidden_state=content),
                       attention_mask=mask, labels=labels)
+        self.ctx.lam = 0.0
         return out.loss
 
-    # ---------- training losses ----------
+    # ---------- training ----------
     def caption_loss(self, feats, labels):
+        """Image -> factual caption. Knobs off."""
         content, mask = self.encode_image(feats)
-        loss = self._decode(content, mask, labels, "factual")
-        return loss, content
+        return self._decode(content, mask, labels, 0.0), content
 
     def v2l_loss(self, img_content, text_ids, text_mask):
-        """Pull the VISUAL representation toward the TEXT representation.
+        """Pull the visual representation toward the text representation so the
+        knobs, which are trained on text, still apply when the input is an image.
 
-        The text branch runs under no_grad and is the fixed anchor. Previously
-        both branches carried gradient through the SAME encoder and both were
-        L2-normalized, which makes representational collapse the global
-        optimum — the encoder can drive this MSE to zero by emitting one
-        constant direction for every input. Normalizing was the right fix for
-        the loss reading 0.001 and being effectively off; leaving the text side
-        trainable is what turned it into a collapse attractor.
+        Text branch is under no_grad and is the fixed anchor: with both branches
+        trainable through one encoder and both normalised, collapse to a single
+        constant direction is the global optimum.
 
-        Direction matters: text is the space the style vectors are calibrated
-        in, so the visual side must move toward it and never the reverse.
-
-        Watch for the tell: l_v2l plunging toward zero while caption loss
-        stalls means it is collapsing anyway.
+        Printed value is a mean over 768 dims of two unit vectors, so it looks
+        tiny by construction:  cos = 1 - 384*mse.
+        0.004 -> -0.54,  0.002 -> 0.23,  0.001 -> 0.62.
         """
         with torch.no_grad():
-            text_content, _ = self.encode_text(text_ids, text_mask)
-            m = text_mask.unsqueeze(-1).to(text_content.dtype)
-            txt_pool = (text_content * m).sum(1) / m.sum(1).clamp(min=1e-6)
-            txt_pool = F.normalize(txt_pool, dim=-1)
-        img_pool = F.normalize(img_content.mean(dim=1), dim=-1)
-        return F.mse_loss(img_pool, txt_pool.to(img_pool.dtype))
+            tc, _ = self.encode_text(text_ids, text_mask)
+            m = text_mask.unsqueeze(-1).to(tc.dtype)
+            tp = F.normalize((tc * m).sum(1) / m.sum(1).clamp(min=1e-6), dim=-1)
+        ip = F.normalize(img_content.mean(dim=1), dim=-1)
+        return F.mse_loss(ip, tp.to(ip.dtype))
 
-    def text_style_loss(self, corrupt_ids, corrupt_mask, labels, style, lam=1.0):
-        """lam is sampled during training so the interpolation path is trained,
-        not just its two endpoints."""
-        content, mask = self.encode_text(corrupt_ids, corrupt_mask)
-        return self._decode(content, mask, labels, style, lam=lam)
+    def text_style_loss(self, ids, mask, labels, lam=1.0):
+        """Rebuild a styled sentence whose style words were masked out of the
+        input. The knobs are the only place the missing words can come from."""
+        content, mask = self.encode_text(ids, mask)
+        return self._decode(content, mask, labels, lam)
 
     # ---------- diagnostics ----------
     @torch.no_grad()
-    def style_geometry(self):
-        """If cos(fac,style) ~ 1 the directions coincide, s_tgt - s_src is
-        near zero, and lam does nothing at any value."""
-        f = self.style["factual"]
-        f = f / (f.norm() + 1e-6)
-        out = {}
-        for s in self.styles:
-            if s == "factual":
-                continue
-            v = self.style[s] / (self.style[s].norm() + 1e-6)
-            out[f"cos(fac,{s})"] = torch.dot(f, v).item()
-            out[f"gap(fac,{s})"] = (v - f).norm().item()
-        return out
+    def adapter_report(self, feats, lam=1.0, max_new_tokens=8):
+        """||style delta|| / ||hidden|| averaged over decoder blocks.
 
-    @torch.no_grad()
-    def gate_report(self, feats, target="romantic", lam=1.0):
+        ~0.00  -> knobs are dead, nothing was learned. raise --lr_style.
+        0.05-0.4 -> healthy.
+        >1.0   -> style is swamping the content; lower lam or --lr_style.
+        """
+        was = self.training
+        self.eval()
+        self.ctx.lam = lam
         content, mask = self.encode_image(feats)
-        s = self._style_at(target, lam, self._masked_scale(content, mask))
-        return self.modulator.report(content, s)
+        self.t5.generate(
+            encoder_outputs=BaseModelOutput(last_hidden_state=content),
+            attention_mask=mask, max_new_tokens=max_new_tokens, num_beams=1)
+        self.ctx.lam = 0.0
+        r = [m.last_ratio for m in self.adapter_modules()]
+        if was:
+            self.train()
+        return sum(r) / max(len(r), 1)
 
     # ---------- inference ----------
     @torch.no_grad()
-    def generate(self, feats, target="factual", lam=1.0, num_beams=5,
-                 max_new_tokens=40, repetition_penalty=1.0,
-                 no_repeat_ngram_size=0, length_penalty=1.0):
-        """repetition_penalty and no_repeat_ngram_size default OFF.
-
-        On ~20-token Bangla captions a hard 3-gram ban plus a 1.2 logit penalty
-        fights legitimate repetition of function words and postpositions and
-        pushes beam search off natural phrasing. StyleNet used plain beam
-        search at width 5. Turn these back on only if you actually observe
-        degenerate loops in the output.
-        """
+    def generate(self, feats, lam=1.0, num_beams=5, max_new_tokens=40,
+                 repetition_penalty=1.0, no_repeat_ngram_size=0,
+                 length_penalty=1.0):
         content, mask = self.encode_image(feats)
-        mem = self._fuse(content, mask, target, lam)
-        kwargs = dict(
-            encoder_outputs=BaseModelOutput(last_hidden_state=mem),
-            attention_mask=mask, num_beams=num_beams,
-            max_new_tokens=max_new_tokens, length_penalty=length_penalty,
-            early_stopping=True, use_cache=True)
+        self.ctx.lam = lam
+        kw = dict(encoder_outputs=BaseModelOutput(last_hidden_state=content),
+                  attention_mask=mask, num_beams=num_beams,
+                  max_new_tokens=max_new_tokens, length_penalty=length_penalty,
+                  early_stopping=True, use_cache=True)
         if repetition_penalty and repetition_penalty != 1.0:
-            kwargs["repetition_penalty"] = repetition_penalty
+            kw["repetition_penalty"] = repetition_penalty
         if no_repeat_ngram_size:
-            kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
-        return self.t5.generate(**kwargs)
+            kw["no_repeat_ngram_size"] = no_repeat_ngram_size
+        ids = self.t5.generate(**kw)
+        self.ctx.lam = 0.0
+        return ids
 
 
 def load_compatible(model, state_dict, verbose=True, min_frac=0.95):
-    """Report what was dropped and refuse to silently resume from a mostly
-    random model. The old version printed only a count, so an architecture
-    edit would restore a partial checkpoint and train on from a half
-    initialized state with no error anywhere."""
     own = model.state_dict()
     ok, bad = {}, []
     for k, v in state_dict.items():
         if k in own and own[k].shape == v.shape:
             ok[k] = v
         else:
-            reason = "absent" if k not in own else f"{tuple(v.shape)}!={tuple(own[k].shape)}"
-            bad.append(f"{k} ({reason})")
+            why = "absent" if k not in own else f"{tuple(v.shape)}!={tuple(own[k].shape)}"
+            bad.append(f"{k} ({why})")
     missing = [k for k in own if k not in ok]
     model.load_state_dict(ok, strict=False)
-
     frac = len(ok) / max(len(own), 1)
     if verbose:
         print(f"[LOAD] restored {len(ok)}/{len(own)} tensors ({frac:.1%})")
-        for k in bad[:10]:
+        for k in bad[:8]:
             print(f"[LOAD]   skipped: {k}")
-        if len(bad) > 10:
-            print(f"[LOAD]   ... and {len(bad)-10} more")
-        for k in missing[:10]:
+        for k in missing[:8]:
             print(f"[LOAD]   left at init: {k}")
-        if len(missing) > 10:
-            print(f"[LOAD]   ... and {len(missing)-10} more")
     if frac < min_frac:
         raise RuntimeError(
-            f"checkpoint restored only {frac:.1%} of the model "
-            f"(threshold {min_frac:.0%}). The architecture likely changed since "
-            f"this checkpoint was written. Delete it or pass min_frac=0 if you "
-            f"really intend to resume from a partially initialized model."
-        )
+            f"checkpoint restored only {frac:.1%} (threshold {min_frac:.0%}). "
+            f"The architecture changed since it was written — delete it, or "
+            f"pass min_frac=0 to resume from a partly random model on purpose.")
     return len(ok)
