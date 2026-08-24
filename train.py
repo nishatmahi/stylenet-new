@@ -8,11 +8,17 @@ Two alternating tasks per epoch, following StyleNet Sec 3.3:
 
   CAP    image -> factual caption.  Knobs OFF (lam=0), so this task trains the
          plain captioner: backbone + visual projector. Adapters are untouched.
+         This is stage 1 of inference.
 
-  STY    styled text with its style words masked out -> full styled sentence.
-         Knobs ON. Backbone frozen, so ONLY the adapters learn. They are forced
-         to learn "what do I add to normal writing to make it romantic",
-         because the masked words are not on the input to copy.
+  STY    styled text with words randomly dropped -> full styled sentence.
+         Knobs ON. Backbone frozen, so ONLY the adapters learn. No style
+         lexicon exists anywhere: dropout is uniform over all words.
+         This is stage 2 of inference -- text in the encoder, knobs on.
+
+Inference is two passes (see sample.py):
+    image --(lam=0)--> factual caption --(lam)--> styled caption
+Both passes run in a configuration that occurs during training. The
+image-plus-knobs combination, which never occurs in training, is never used.
 
 --epochs only decides when the loop stops. The learning rate warms up and then
 stays flat, so a 3-epoch trial and a 30-epoch run see identical optimization
@@ -25,8 +31,8 @@ import argparse
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
-from data_loader import (factual_loader, style_loader, find_style_words,
-                         read_lines, tokenizer)
+from data_loader import (factual_loader, style_loader, read_lines,
+                         tokenizer, encode)
 from models import StyleNetT5, load_compatible
 
 
@@ -63,21 +69,18 @@ def run_caption_pass(model, loader, opt, sched, device, args, epoch, amp, scaler
     for p in model.adapter_parameters():
         p.requires_grad = False          # knobs are not trained on images
 
-    tot = {'cap': 0.0, 'v2l': 0.0}
+    tot = {'cap': 0.0}
     n = 0
     opt.zero_grad(set_to_none=True)
     params = [p for g in opt.param_groups for p in g['params']]
 
     for i, (feats, ids, mask, labels) in enumerate(loader):
         feats = feats.to(device, non_blocking=True)
-        ids = ids.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         with amp():
-            l_cap, img = model.caption_loss(feats, labels)
-            l_v2l = model.v2l_loss(img, ids, mask)
-            loss = l_cap + args.w_v2l * l_v2l
+            loss, _ = model.caption_loss(feats, labels)
+            l_cap = loss
         scaler.scale(loss / args.accum_steps).backward()
 
         if (i + 1) % args.accum_steps == 0:
@@ -89,11 +92,10 @@ def run_caption_pass(model, loader, opt, sched, device, args, epoch, amp, scaler
             opt.zero_grad(set_to_none=True)
 
         tot['cap'] += l_cap.item()
-        tot['v2l'] += l_v2l.item()
         n += 1
         if i % args.log_step == 0 or i == len(loader) - 1:
             print(f"Epoch [{epoch+1}] CAP [{i}/{len(loader)}] "
-                  f"cap {l_cap.item():.3f}  v2l {l_v2l.item():.3f}  "
+                  f"cap {l_cap.item():.3f}  "
                   f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
 
     opt.zero_grad(set_to_none=True)
@@ -158,17 +160,19 @@ def validate(model, fac_loader, sty_loader, device):
 
 @torch.no_grad()
 def show_samples(model, feats, style, lams):
+    """Two-stage, the same way sample.py runs it — otherwise these epoch
+    printouts would show the one configuration inference never uses."""
     model.eval()
     r = model.adapter_report(feats[:1], lam=1.0)
     print(f"    knob strength |delta|/|h| = {r:.4f}   "
           f"(~0 = knobs dead, raise --lr_style; 0.05-0.4 healthy)")
     for i in range(feats.size(0)):
         print(f"  --- sample {i+1} ---")
-        for lam in [0.0] + list(lams):
-            ids = model.generate(feats[i:i+1], lam=lam, num_beams=5)
-            txt = tokenizer.decode(ids[0], skip_special_tokens=True)
-            tag = "factual" if lam == 0.0 else f"{style} λ={lam}"
-            print(f"    [{tag}] {txt}")
+        fac, _ = model.caption_then_style(feats[i:i+1], 0.0, tokenizer, encode)
+        print(f"    [1 factual] {fac[0]}")
+        for lam in lams:
+            _, sty = model.caption_then_style(feats[i:i+1], lam, tokenizer, encode)
+            print(f"    [2 {style} λ={lam}] {sty[0]}")
     model.train()
 
 
@@ -204,12 +208,10 @@ def main(args):
 
     sty_train_path = os.path.join(sd, f'{args.style}_train.txt')
     sty_val_path = os.path.join(sd, f'{args.style}_val.txt')
-    style_words = find_style_words(read_lines(sty_train_path),
-                                   train_ds.captions(), name=args.style)
     train_sty = style_loader(sty_train_path, args.style_batch_size,
-                             style_words=style_words)
+                             dropout=args.dropout)
     val_sty = style_loader(sty_val_path, args.style_batch_size,
-                           style_words=style_words, shuffle=False)
+                           dropout=args.dropout, shuffle=False)
 
     cap_opt_steps = max(1, len(train_fac) // args.accum_steps)
     sty_steps = args.max_style_steps if args.max_style_steps > 0 else cap_opt_steps
@@ -254,8 +256,7 @@ def main(args):
                                device, args, epoch, amp, scaler)
         sty = run_style_pass(model, train_sty, opt_sty, sched_sty,
                              device, args, epoch, sty_steps, amp, scaler)
-        print(f"[EPOCH {epoch+1}] cap {cap['cap']:.4f}  v2l {cap['v2l']:.4f}  "
-              f"style {sty:.4f}")
+        print(f"[EPOCH {epoch+1}] cap {cap['cap']:.4f}  style {sty:.4f}")
 
         if peek is None:
             peek = next(iter(val_fac))[0][:3].to(device)
@@ -309,7 +310,11 @@ if __name__ == '__main__':
     p.add_argument('--lr', type=float, default=5e-5)
     p.add_argument('--lr_proj', type=float, default=1e-3)
     p.add_argument('--lr_style', type=float, default=1e-3)
-    p.add_argument('--w_v2l', type=float, default=1.0)
+    p.add_argument('--dropout', type=float, default=0.4,
+                   help='uniform word-dropout rate for the style pass. '
+                        'low = content kept but style can be copied; '
+                        'high = no copying but content must be invented. '
+                        'one number, tuned from val style loss.')
 
     p.add_argument('--lam_min', type=float, default=0.5)
     p.add_argument('--lam_max', type=float, default=2.0)
