@@ -1,17 +1,11 @@
 """
-sample.py — two-stage decoding.
+sample.py — one-pass decoding.
 
-    stage 1   image  --(lam=0)-->  factual caption
-    stage 2   that text --(lam)-->  styled caption
+    image -> encoder -> decoder with the knobs at lam
 
-Both stages run in a configuration the model was trained in: stage 1 is the
-CAP pass, stage 2 is the STY pass (text in the encoder, knobs on). The
-image-plus-knobs combination is never used, because it never occurs during
-training.
 
-    python sample.py                                   # 20 images
+    python sample.py
     python sample.py --n_images 1000 --out_json preds.json
-    python sample.py --one_step 0                      # drop the comparison
 """
 
 import os
@@ -21,7 +15,7 @@ import contextlib
 import torch
 
 from models import StyleNetT5, load_compatible
-from data_loader import tokenizer, encode, _split_line, normalize
+from data_loader import tokenizer, _split_line, normalize
 
 
 def get_args():
@@ -34,12 +28,9 @@ def get_args():
     p.add_argument('--batch_size', type=int, default=16)
     p.add_argument('--beam_size', type=int, default=5)
     p.add_argument('--max_new', type=int, default=48)
-    p.add_argument('--lams', default='0.5,1.0,1.5')
-    p.add_argument('--one_step', type=int, default=1,
-                   help='also decode image->styled in a single pass, for '
-                        'comparison. This is the untrained configuration; it '
-                        'is here as an ablation, not as the system.')
+    p.add_argument('--lams', default='0.5,1.0,1.5,2.0')
     p.add_argument('--amp', type=int, default=1)
+    p.add_argument('--force_bf16', type=int, default=1)
     return p.parse_args()
 
 
@@ -51,9 +42,9 @@ def test_images(path, limit):
     Stylized output is judged on relevance and style appropriateness, as in
     FS-StyleCap and MemCap.
 
-    References are normalized with the same pipeline the model trained
-    through — the model emits normalized Bangla, so scoring raw references
-    against it costs BLEU for a text-processing reason, not a model reason.
+    References are normalized with the pipeline the model trained through —
+    scoring raw references against normalized output costs BLEU for a text
+    processing reason, not a model reason.
     """
     order, refs, bad = [], {}, 0
     for line in open(path, encoding='utf-8'):
@@ -88,7 +79,8 @@ def main():
           f"style {style}")
 
     cuda = device.type == 'cuda'
-    if args.amp and cuda and torch.cuda.is_bf16_supported():
+    major = torch.cuda.get_device_capability()[0] if cuda else 0
+    if args.amp and cuda and (major >= 8 or args.force_bf16):
         amp = lambda: torch.autocast('cuda', dtype=torch.bfloat16)
     elif args.amp and cuda:
         amp = lambda: torch.autocast('cuda', dtype=torch.float16)
@@ -100,7 +92,7 @@ def main():
             if os.path.exists(os.path.join(args.cache_dir, f"{i}.pt"))]
     if len(keep) < len(ids_all):
         print(f"[WARN] {len(ids_all)-len(keep)} test images have no cached feature")
-    print(f"\ndecoding {len(keep)} held-out TEST images, two-stage\n")
+    print(f"\ndecoding {len(keep)} held-out TEST images\n")
 
     records = {i: {"image_id": i, "references": refs[i]} for i in keep}
 
@@ -111,41 +103,17 @@ def main():
                 torch.load(os.path.join(args.cache_dir, f"{i}.pt"),
                            map_location='cpu') for i in chunk]).to(device)
 
-            # ---- stage 1: image -> factual caption --------------------
-            with amp():
-                fac_ids = model.generate(feats, lam=0.0,
+            for lam in [0.0] + lams:
+                with amp():
+                    out = model.generate(feats, lam=lam,
                                          num_beams=args.beam_size,
                                          max_new_tokens=args.max_new,
                                          repetition_penalty=1.15,
                                          no_repeat_ngram_size=3)
-            factual = tokenizer.batch_decode(fac_ids, skip_special_tokens=True)
-            for img, t in zip(chunk, factual):
-                records[img]["factual"] = t
-
-            # ---- stage 2: that text -> styled caption ------------------
-            tids, tmask = encode(factual)
-            tids, tmask = tids.to(device), tmask.to(device)
-            for lam in lams:
-                with amp():
-                    out = model.generate_text(tids, tmask, lam=lam,
-                                              num_beams=args.beam_size,
-                                              max_new_tokens=args.max_new)
                 txts = tokenizer.batch_decode(out, skip_special_tokens=True)
+                key = "factual" if lam == 0.0 else f"{style}_lam{lam}"
                 for img, t in zip(chunk, txts):
-                    records[img][f"{style}_lam{lam}"] = t
-
-            # ---- ablation: single pass, image + knobs ------------------
-            if args.one_step:
-                for lam in lams:
-                    with amp():
-                        out = model.generate(feats, lam=lam,
-                                             num_beams=args.beam_size,
-                                             max_new_tokens=args.max_new,
-                                             repetition_penalty=1.15,
-                                             no_repeat_ngram_size=3)
-                    txts = tokenizer.batch_decode(out, skip_special_tokens=True)
-                    for img, t in zip(chunk, txts):
-                        records[img][f"onestep_lam{lam}"] = t
+                    records[img][key] = t
 
             print(f"  {min(s+args.batch_size, len(keep))}/{len(keep)}", flush=True)
 
@@ -155,18 +123,14 @@ def main():
 
     for rec in out[:5]:
         print(f"\n{rec['image_id']}.jpg")
-        print(f"  [ref]        {rec['references'][0]}")
-        print(f"  [1 factual]  {rec['factual']}")
+        print(f"  [ref]      {rec['references'][0]}")
+        print(f"  [factual]  {rec['factual']}")
         for lam in lams:
-            print(f"  [2 {style} λ={lam}]  {rec[f'{style}_lam{lam}']}")
-        if args.one_step:
-            for lam in lams:
-                print(f"      (one-step λ={lam})  {rec[f'onestep_lam{lam}']}")
+            print(f"  [{style} λ={lam}]  {rec[f'{style}_lam{lam}']}")
 
     print(f"\nwrote {args.out_json} ({len(out)} images)")
     print("BLEU/CIDEr go on 'factual' — the stylized fields have no paired "
-          "reference by construction, so they are judged on whether the "
-          "content of stage 1 survives into stage 2 and whether style appears.")
+          "reference by construction.")
 
 
 if __name__ == "__main__":
