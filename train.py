@@ -4,21 +4,7 @@ train.py — one style per run.
     python train.py --style romantic
     python train.py --style humorous --save_dir /kaggle/working/stylenet_hum
 
-Two alternating tasks per epoch, following StyleNet Sec 3.3:
-
-  CAP    image -> factual caption.  Knobs OFF (lam=0), so this task trains the
-         plain captioner: backbone + visual projector. Adapters are untouched.
-         This is stage 1 of inference.
-
-  STY    styled text with words randomly dropped -> full styled sentence.
-         Knobs ON. Backbone frozen, so ONLY the adapters learn. No style
-         lexicon exists anywhere: dropout is uniform over all words.
-         This is stage 2 of inference -- text in the encoder, knobs on.
-
-Inference is two passes (see sample.py):
-    image --(lam=0)--> factual caption --(lam)--> styled caption
-Both passes run in a configuration that occurs during training. The
-image-plus-knobs combination, which never occurs in training, is never used.
+.
 
 --epochs only decides when the loop stops. The learning rate warms up and then
 stays flat, so a 3-epoch trial and a 30-epoch run see identical optimization
@@ -31,8 +17,7 @@ import argparse
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
-from data_loader import (factual_loader, style_loader, read_lines,
-                         tokenizer, encode)
+from data_loader import factual_loader, style_loader, tokenizer
 from models import StyleNetT5, load_compatible
 
 
@@ -69,18 +54,21 @@ def run_caption_pass(model, loader, opt, sched, device, args, epoch, amp, scaler
     for p in model.adapter_parameters():
         p.requires_grad = False          # knobs are not trained on images
 
-    tot = {'cap': 0.0}
+    tot = {'cap': 0.0, 'v2l': 0.0}
     n = 0
     opt.zero_grad(set_to_none=True)
     params = [p for g in opt.param_groups for p in g['params']]
 
     for i, (feats, ids, mask, labels) in enumerate(loader):
         feats = feats.to(device, non_blocking=True)
+        ids = ids.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         with amp():
-            loss, _ = model.caption_loss(feats, labels)
-            l_cap = loss
+            l_cap, img_content = model.caption_loss(feats, labels)
+            l_v2l = model.v2l_loss(img_content, ids, mask)
+            loss = l_cap + args.w_v2l * l_v2l
         scaler.scale(loss / args.accum_steps).backward()
 
         if (i + 1) % args.accum_steps == 0:
@@ -92,10 +80,12 @@ def run_caption_pass(model, loader, opt, sched, device, args, epoch, amp, scaler
             opt.zero_grad(set_to_none=True)
 
         tot['cap'] += l_cap.item()
+        tot['v2l'] += l_v2l.item()
         n += 1
         if i % args.log_step == 0 or i == len(loader) - 1:
             print(f"Epoch [{epoch+1}] CAP [{i}/{len(loader)}] "
-                  f"cap {l_cap.item():.3f}  "
+                  f"cap {l_cap.item():.3f}  v2l {l_v2l.item():.3f}  "
+                  f"scale {scaler.get_scale():.0f}  "
                   f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
 
     opt.zero_grad(set_to_none=True)
@@ -104,6 +94,9 @@ def run_caption_pass(model, loader, opt, sched, device, args, epoch, amp, scaler
 
 def run_style_pass(model, loader, opt, sched, device, args, epoch,
                    max_steps, amp, scaler):
+    """Task 2. lam is FIXED at 1.0 here. Sampling it while demanding the same
+    target at every value trains the adapter to be lam-invariant, i.e. to
+    shrink. The dial belongs at inference."""
     model.train()
     for p in model.parameters():
         p.requires_grad = False
@@ -112,14 +105,12 @@ def run_style_pass(model, loader, opt, sched, device, args, epoch,
 
     params = model.adapter_parameters()
     tot, n = 0.0, 0
-    for i, (ids, mask, labels) in enumerate(loader):
+    for i, labels in enumerate(loader):
         if i >= max_steps:
             break
-        lam = float(torch.empty(1).uniform_(args.lam_min, args.lam_max).item())
         opt.zero_grad(set_to_none=True)
         with amp():
-            loss = model.text_style_loss(ids.to(device), mask.to(device),
-                                         labels.to(device), lam=lam)
+            loss = model.lm_style_loss(labels.to(device), lam=1.0)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -131,7 +122,7 @@ def run_style_pass(model, loader, opt, sched, device, args, epoch,
         n += 1
         if i % args.log_step == 0 or i == max_steps - 1:
             print(f"Epoch [{epoch+1}] STY [{i}/{max_steps}] "
-                  f"loss {loss.item():.3f}  lam {lam:.2f}", flush=True)
+                  f"loss {loss.item():.3f}", flush=True)
 
     for p in model.parameters():
         p.requires_grad = True
@@ -149,9 +140,8 @@ def validate(model, fac_loader, sty_loader, device):
     print(f"  val caption loss: {cap:.4f}")
 
     s, n = 0.0, 0
-    for ids, mask, labels in sty_loader:
-        s += model.text_style_loss(ids.to(device), mask.to(device),
-                                   labels.to(device), lam=1.0).item()
+    for labels in sty_loader:
+        s += model.lm_style_loss(labels.to(device), lam=1.0).item()
         n += 1
     print(f"  val style loss:   {s/max(n,1):.4f}")
     model.train()
@@ -160,19 +150,24 @@ def validate(model, fac_loader, sty_loader, device):
 
 @torch.no_grad()
 def show_samples(model, feats, style, lams):
-    """Two-stage, the same way sample.py runs it — otherwise these epoch
-    printouts would show the one configuration inference never uses."""
+    """One pass per lam, the same way sample.py runs it."""
     model.eval()
-    r = model.adapter_report(feats[:1], lam=1.0)
-    print(f"    knob strength |delta|/|h| = {r:.4f}   "
+    print(f"    knob strength |delta|/|h| = "
+          f"{model.adapter_report(feats[:1], lam=1.0):.4f}   "
           f"(~0 = knobs dead, raise --lr_style; 0.05-0.4 healthy)")
+
+    def gen(lam):
+        ids = model.generate(feats, lam=lam, num_beams=5, max_new_tokens=48,
+                             repetition_penalty=1.15, no_repeat_ngram_size=3)
+        return tokenizer.batch_decode(ids, skip_special_tokens=True)
+
+    fac = gen(0.0)
+    outs = {lam: gen(lam) for lam in lams}
     for i in range(feats.size(0)):
         print(f"  --- sample {i+1} ---")
-        fac, _ = model.caption_then_style(feats[i:i+1], 0.0, tokenizer, encode)
-        print(f"    [1 factual] {fac[0]}")
+        print(f"    [factual] {fac[i]}")
         for lam in lams:
-            _, sty = model.caption_then_style(feats[i:i+1], lam, tokenizer, encode)
-            print(f"    [2 {style} λ={lam}] {sty[0]}")
+            print(f"    [{style} λ={lam}] {outs[lam][i]}")
     model.train()
 
 
@@ -182,8 +177,15 @@ def main(args):
     print(f"device: {device}   style: {args.style}")
 
     cuda = device.type == 'cuda'
-    use_bf16 = args.amp and cuda and torch.cuda.is_bf16_supported()
-    use_fp16 = args.amp and cuda and not use_bf16      # T4 has no bf16
+    # torch.cuda.is_bf16_supported() returns True on Turing (T4, SM 7.5) where
+    # bf16 is emulated. Real bf16 starts at Ampere, SM 8.0. But the run that
+    # produced good factual captions used bf16 on a T4, and T5 is unstable in
+    # fp16, so --force_bf16 defaults to on. Set 0 to A/B it and watch `scale`.
+    major = torch.cuda.get_device_capability()[0] if cuda else 0
+    use_bf16 = args.amp and cuda and (major >= 8 or args.force_bf16)
+    use_fp16 = args.amp and cuda and not use_bf16
+    if cuda:
+        print(f"gpu: {torch.cuda.get_device_name(0)}  (SM {major}.x)")
     if use_bf16:
         amp = lambda: torch.autocast('cuda', dtype=torch.bfloat16)
     elif use_fp16:
@@ -198,20 +200,17 @@ def main(args):
                           "fp16+GradScaler" if use_fp16 else "off (fp32)"))
 
     sd = args.split_dir
-    train_fac, train_ds = factual_loader(
+    train_fac = factual_loader(
         args.cache_dir, os.path.join(sd, 'factual_train.txt'), args.batch_size,
-        shuffle=True, captions_per_epoch=args.captions_per_epoch,
-        return_dataset=True)
+        shuffle=True, captions_per_epoch=args.captions_per_epoch)
     val_fac = factual_loader(args.cache_dir,
                              os.path.join(sd, 'factual_val.txt'),
                              args.batch_size, shuffle=False)
 
-    sty_train_path = os.path.join(sd, f'{args.style}_train.txt')
-    sty_val_path = os.path.join(sd, f'{args.style}_val.txt')
-    train_sty = style_loader(sty_train_path, args.style_batch_size,
-                             dropout=args.dropout)
-    val_sty = style_loader(sty_val_path, args.style_batch_size,
-                           dropout=args.dropout, shuffle=False)
+    train_sty = style_loader(os.path.join(sd, f'{args.style}_train.txt'),
+                             args.style_batch_size)
+    val_sty = style_loader(os.path.join(sd, f'{args.style}_val.txt'),
+                           args.style_batch_size, shuffle=False)
 
     cap_opt_steps = max(1, len(train_fac) // args.accum_steps)
     sty_steps = args.max_style_steps if args.max_style_steps > 0 else cap_opt_steps
@@ -256,10 +255,22 @@ def main(args):
                                device, args, epoch, amp, scaler)
         sty = run_style_pass(model, train_sty, opt_sty, sched_sty,
                              device, args, epoch, sty_steps, amp, scaler)
-        print(f"[EPOCH {epoch+1}] cap {cap['cap']:.4f}  style {sty:.4f}")
+        print(f"[EPOCH {epoch+1}] cap {cap['cap']:.4f}  v2l {cap['v2l']:.4f}  "
+              f"style {sty:.4f}")
 
         if peek is None:
-            peek = next(iter(val_fac))[0][:3].to(device)
+            # FactualDataset stores ~4.8 consecutive rows per image, so
+            # [:3] off a batch is the SAME picture three times. Walk the
+            # rows and take three DISTINCT images.
+            seen, f3 = set(), []
+            for i, (img, _) in enumerate(val_fac.dataset.rows):
+                if img in seen:
+                    continue
+                seen.add(img)
+                f3.append(val_fac.dataset[i][0])
+                if len(f3) == 3:
+                    break
+            peek = torch.stack(f3).to(device)
         print(f"[EPOCH {epoch+1}] samples:")
         show_samples(model, peek, args.style, lams)
 
@@ -310,14 +321,8 @@ if __name__ == '__main__':
     p.add_argument('--lr', type=float, default=5e-5)
     p.add_argument('--lr_proj', type=float, default=1e-3)
     p.add_argument('--lr_style', type=float, default=1e-3)
-    p.add_argument('--dropout', type=float, default=0.4,
-                   help='uniform word-dropout rate for the style pass. '
-                        'low = content kept but style can be copied; '
-                        'high = no copying but content must be invented. '
-                        'one number, tuned from val style loss.')
+    p.add_argument('--w_v2l', type=float, default=1.0)
 
-    p.add_argument('--lam_min', type=float, default=0.5)
-    p.add_argument('--lam_max', type=float, default=2.0)
     p.add_argument('--max_style_steps', type=int, default=0)   # 0 = match cap
 
     p.add_argument('--warmup', type=int, default=200)
@@ -325,6 +330,7 @@ if __name__ == '__main__':
     p.add_argument('--patience', type=int, default=4)
     p.add_argument('--adam8bit', type=int, default=0)
     p.add_argument('--amp', type=int, default=1)
+    p.add_argument('--force_bf16', type=int, default=1)
     p.add_argument('--log_step', type=int, default=200)
     p.add_argument('--lams', default='1.0,1.5,2.0')
     main(p.parse_args())
