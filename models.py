@@ -124,32 +124,20 @@ class StyleNetT5(nn.Module):
 
     # ---------- training ----------
     def caption_loss(self, feats, labels):
-        """Image -> factual caption. Knobs off."""
+        """Image -> factual caption. Knobs off. This is stage 1 of inference."""
         content, mask = self.encode_image(feats)
         return self._decode(content, mask, labels, 0.0), content
 
-    def v2l_loss(self, img_content, text_ids, text_mask):
-        """Pull the visual representation toward the text representation so the
-        knobs, which are trained on text, still apply when the input is an image.
-
-        Text branch is under no_grad and is the fixed anchor: with both branches
-        trainable through one encoder and both normalised, collapse to a single
-        constant direction is the global optimum.
-
-        Printed value is a mean over 768 dims of two unit vectors, so it looks
-        tiny by construction:  cos = 1 - 384*mse.
-        0.004 -> -0.54,  0.002 -> 0.23,  0.001 -> 0.62.
-        """
-        with torch.no_grad():
-            tc, _ = self.encode_text(text_ids, text_mask)
-            m = text_mask.unsqueeze(-1).to(tc.dtype)
-            tp = F.normalize((tc * m).sum(1) / m.sum(1).clamp(min=1e-6), dim=-1)
-        ip = F.normalize(img_content.mean(dim=1), dim=-1)
-        return F.mse_loss(ip, tp.to(ip.dtype))
-
     def text_style_loss(self, ids, mask, labels, lam=1.0):
-        """Rebuild a styled sentence whose style words were masked out of the
-        input. The knobs are the only place the missing words can come from."""
+        """Rebuild a styled sentence from a randomly corrupted copy of itself.
+
+        The backbone is frozen during this pass, so every word the dropout
+        removed has to be supplied by the adapters. No word list decides what
+        gets removed — see data_loader.StyleTextDataset.
+
+        This is also exactly the configuration stage 2 of inference runs in:
+        text in the encoder, knobs on. Train and test match by construction.
+        """
         content, mask = self.encode_text(ids, mask)
         return self._decode(content, mask, labels, lam)
 
@@ -193,6 +181,52 @@ class StyleNetT5(nn.Module):
         ids = self.t5.generate(**kw)
         self.ctx.lam = 0.0
         return ids
+
+    @torch.no_grad()
+    def generate_text(self, ids, mask, lam=1.0, num_beams=5, max_new_tokens=48,
+                      repetition_penalty=1.15, no_repeat_ngram_size=3,
+                      length_penalty=1.0):
+        """Stage 2: a plain sentence in, a styled sentence out.
+
+        Same path the style pass trains on — text through the encoder, knobs
+        on — so this is not an extrapolation. `generate()` above is stage 1.
+        """
+        content, m = self.encode_text(ids, mask)
+        self.ctx.lam = lam
+        kw = dict(encoder_outputs=BaseModelOutput(last_hidden_state=content),
+                  attention_mask=m, num_beams=num_beams,
+                  max_new_tokens=max_new_tokens, length_penalty=length_penalty,
+                  early_stopping=True, use_cache=True)
+        if repetition_penalty and repetition_penalty != 1.0:
+            kw["repetition_penalty"] = repetition_penalty
+        if no_repeat_ngram_size:
+            kw["no_repeat_ngram_size"] = no_repeat_ngram_size
+        out = self.t5.generate(**kw)
+        self.ctx.lam = 0.0
+        return out
+
+    @torch.no_grad()
+    def caption_then_style(self, feats, lam, tok, encode_fn,
+                           num_beams=5, max_new_tokens=48):
+        """The full two-stage pass, as one call.
+
+            image --(lam=0)--> factual caption --(lam)--> styled caption
+
+        Neither stage uses the image-plus-knobs configuration, which is the
+        one combination that never occurs during training.
+        """
+        dev = next(self.parameters()).device
+        fac_ids = self.generate(feats, lam=0.0, num_beams=num_beams,
+                                max_new_tokens=max_new_tokens,
+                                repetition_penalty=1.15, no_repeat_ngram_size=3)
+        factual = tok.batch_decode(fac_ids, skip_special_tokens=True)
+        if lam == 0.0:
+            return factual, factual
+        ids, mask = encode_fn(factual)
+        sty_ids = self.generate_text(ids.to(dev), mask.to(dev), lam=lam,
+                                     num_beams=num_beams,
+                                     max_new_tokens=max_new_tokens)
+        return factual, tok.batch_decode(sty_ids, skip_special_tokens=True)
 
 
 def load_compatible(model, state_dict, verbose=True, min_frac=0.95):
