@@ -29,7 +29,7 @@ class StyleContext:
 
 
 class StyleAdapter(nn.Module):
-    """The style knobs. One small bottleneck per decoder block.
+    """The style knobs — StyleNet's S_r. One small bottleneck per decoder block.
 
     Up-projection is zero-initialised, so at step 0 the adapter output is
     exactly zero: factual and romantic start as the same model and every
@@ -55,10 +55,12 @@ class AdapterFF(nn.Module):
 
         h = ff(x) + lam * adapter(ff(x))
 
-    Residual, exactly like S_f + lam*S_r in your LSTM: the model's normal
-    writing behaviour is never switched off, style is only ever added on top.
-    lam multiplies the delta directly with nothing renormalising it, so the
-    dial actually controls intensity.
+    Residual, like S_f + lam*S_r: the model's normal writing behaviour is
+    never switched off, style is only ever added on top. lam multiplies the
+    delta directly with nothing renormalising it, so the dial controls
+    intensity. lam is fixed at 1.0 during training and swept only at
+    inference — sampling it during training teaches the adapter to be
+    lam-invariant, which is the opposite of what the dial is for.
     """
     def __init__(self, orig_ff, d_model, bottleneck, ctx: StyleContext):
         super().__init__()
@@ -79,11 +81,20 @@ class AdapterFF(nn.Module):
 
 
 class StyleNetT5(nn.Module):
-    """One style per run, matching how you trained the LSTM.
+    """StyleNet's two tasks, one style per run.
 
-    Encoder: picture only.
-    Decoder: writing, with the style knobs inside it.
-    lam=0 -> plain factual captioner.  lam=1 -> trained style strength.
+      Task 1 (CAP)  image -> factual caption, knobs off.
+                    Trains backbone + projector. This is the content path.
+
+      Task 2 (STY)  a language model over the style corpus, knobs on,
+                    backbone frozen. No encoder input at all, so the only
+                    weights that can shift the next-token distribution
+                    toward romantic/humorous Bangla are the adapters.
+
+    Inference is one pass: image -> encoder -> decoder with the knobs on.
+    Content arrives through cross-attention, register through the adapters.
+    Neither was ever trained on the other's data — which is exactly why no
+    paired factual/styled corpus is needed.
     """
     def __init__(self, t5_ckpt="csebuetnlp/banglat5", clip_dim=768,
                  style="romantic", bottleneck=64):
@@ -124,22 +135,47 @@ class StyleNetT5(nn.Module):
 
     # ---------- training ----------
     def caption_loss(self, feats, labels):
-        """Image -> factual caption. Knobs off. This is stage 1 of inference."""
+        """Task 1. Image -> factual caption. Knobs off."""
         content, mask = self.encode_image(feats)
         return self._decode(content, mask, labels, 0.0), content
 
-    def text_style_loss(self, ids, mask, labels, lam=1.0):
-        """Rebuild a styled sentence from a randomly corrupted copy of itself.
+    def v2l_loss(self, img_content, text_ids, text_mask):
+        """Pull the image representation toward its caption's representation.
 
-        The backbone is frozen during this pass, so every word the dropout
-        removed has to be supplied by the adapters. No word list decides what
-        gets removed — see data_loader.StyleTextDataset.
+        The text branch runs under no_grad and is a fixed anchor. If both
+        branches carried gradient through the same encoder, collapse to one
+        constant direction would be the global optimum.
 
-        This is also exactly the configuration stage 2 of inference runs in:
-        text in the encoder, knobs on. Train and test match by construction.
+        Without this the projector's only gradient comes back through the
+        decoder's cross-entropy, which the decoder can drive down by learning
+        a generic caption prior — fluent sentences that are not about the
+        picture in front of it.
         """
-        content, mask = self.encode_text(ids, mask)
-        return self._decode(content, mask, labels, lam)
+        with torch.no_grad():
+            text_content, _ = self.encode_text(text_ids, text_mask)
+            m = text_mask.unsqueeze(-1).to(text_content.dtype)
+            txt_pool = (text_content * m).sum(1) / m.sum(1).clamp(min=1e-6)
+            txt_pool = F.normalize(txt_pool, dim=-1)
+        img_pool = F.normalize(img_content.mean(dim=1), dim=-1)
+        return F.mse_loss(img_pool, txt_pool.to(img_pool.dtype))
+
+    def lm_style_loss(self, labels, lam=1.0):
+        """Task 2. A language model over the style corpus.
+
+        Cross-attention gets one all-zero memory slot. K and V of a zero
+        vector are zero, so the cross-attention output is exactly zero: the
+        decoder has nothing to read and must predict each token from its own
+        prefix alone. The backbone is frozen, so the only weights that can
+        move the distribution toward the style corpus are the adapters.
+
+        The length-1 slot matters — an all-padding memory softmaxes over
+        nothing and gives NaN on some Transformers versions.
+        """
+        b = labels.size(0)
+        mem = torch.zeros(b, 1, self.d_model, device=labels.device,
+                          dtype=self.t5.shared.weight.dtype)
+        mask = torch.ones(b, 1, dtype=torch.long, device=labels.device)
+        return self._decode(mem, mask, labels, lam)
 
     # ---------- diagnostics ----------
     @torch.no_grad()
@@ -168,6 +204,7 @@ class StyleNetT5(nn.Module):
     def generate(self, feats, lam=1.0, num_beams=5, max_new_tokens=40,
                  repetition_penalty=1.0, no_repeat_ngram_size=0,
                  length_penalty=1.0):
+        """One pass. lam=0 gives the factual caption, lam>0 the styled one."""
         content, mask = self.encode_image(feats)
         self.ctx.lam = lam
         kw = dict(encoder_outputs=BaseModelOutput(last_hidden_state=content),
@@ -181,52 +218,6 @@ class StyleNetT5(nn.Module):
         ids = self.t5.generate(**kw)
         self.ctx.lam = 0.0
         return ids
-
-    @torch.no_grad()
-    def generate_text(self, ids, mask, lam=1.0, num_beams=5, max_new_tokens=48,
-                      repetition_penalty=1.15, no_repeat_ngram_size=3,
-                      length_penalty=1.0):
-        """Stage 2: a plain sentence in, a styled sentence out.
-
-        Same path the style pass trains on — text through the encoder, knobs
-        on — so this is not an extrapolation. `generate()` above is stage 1.
-        """
-        content, m = self.encode_text(ids, mask)
-        self.ctx.lam = lam
-        kw = dict(encoder_outputs=BaseModelOutput(last_hidden_state=content),
-                  attention_mask=m, num_beams=num_beams,
-                  max_new_tokens=max_new_tokens, length_penalty=length_penalty,
-                  early_stopping=True, use_cache=True)
-        if repetition_penalty and repetition_penalty != 1.0:
-            kw["repetition_penalty"] = repetition_penalty
-        if no_repeat_ngram_size:
-            kw["no_repeat_ngram_size"] = no_repeat_ngram_size
-        out = self.t5.generate(**kw)
-        self.ctx.lam = 0.0
-        return out
-
-    @torch.no_grad()
-    def caption_then_style(self, feats, lam, tok, encode_fn,
-                           num_beams=5, max_new_tokens=48):
-        """The full two-stage pass, as one call.
-
-            image --(lam=0)--> factual caption --(lam)--> styled caption
-
-        Neither stage uses the image-plus-knobs configuration, which is the
-        one combination that never occurs during training.
-        """
-        dev = next(self.parameters()).device
-        fac_ids = self.generate(feats, lam=0.0, num_beams=num_beams,
-                                max_new_tokens=max_new_tokens,
-                                repetition_penalty=1.15, no_repeat_ngram_size=3)
-        factual = tok.batch_decode(fac_ids, skip_special_tokens=True)
-        if lam == 0.0:
-            return factual, factual
-        ids, mask = encode_fn(factual)
-        sty_ids = self.generate_text(ids.to(dev), mask.to(dev), lam=lam,
-                                     num_beams=num_beams,
-                                     max_new_tokens=max_new_tokens)
-        return factual, tok.batch_decode(sty_ids, skip_special_tokens=True)
 
 
 def load_compatible(model, state_dict, verbose=True, min_frac=0.95):
