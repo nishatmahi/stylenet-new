@@ -1,22 +1,10 @@
 """
-data_loader.py — one style per run, no style lexicon anywhere.
+data_loader.py — one style per run.
 
-The style pass corrupts its input with UNIFORM word dropout: every word is
-dropped with the same probability, whether it carries style or content. That
-is deliberate. The earlier design deleted words judged to be "style words",
-which required somebody to decide which Bangla words are romantic — a
-judgement that was measured to be wrong on 4.2% of the corpus and to leak
-style into the input on 9.4% of lines.
 
-Uniform dropout makes no such claim. Its one knob, `dropout`, trades content
-preservation against style leakage, and it is tuned from validation loss and
-sample output rather than from anyone's opinion about Bangla.
 """
 
 import os
-import random
-from collections import Counter
-
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import T5Tokenizer
@@ -30,12 +18,6 @@ except ImportError:
 
 T5_CKPT = "csebuetnlp/banglat5"
 MAX_LEN = 48
-
-# Every word dropped with this probability during the style pass.
-#   low  -> content survives, but style words survive too and can be copied
-#   high -> no copying, but the input is gutted and content must be invented
-# One number, tuned from val loss. Not a claim about which words are stylish.
-DROPOUT = 0.4
 
 tokenizer = T5Tokenizer.from_pretrained(T5_CKPT, use_fast=False)
 
@@ -79,7 +61,12 @@ def read_lines(path):
 
 # --------------------------------------------------------------------------
 class FactualDataset(Dataset):
-    """One row per (image, caption) pair. No epoch state, no rotation."""
+    """One row per (image, caption) pair. No epoch state, no rotation.
+
+    NOTE: rows for the same image are CONSECUTIVE, ~4.8 of them. Slicing
+    [:3] off a batch gives you one picture three times — see the peek block
+    in train.py.
+    """
 
     def __init__(self, cache_dir, caption_file):
         self.cache_dir = cache_dir
@@ -131,44 +118,31 @@ def collate_factual(batch):
 
 
 class StyleTextDataset(Dataset):
-    """Encoder sees the styled sentence with words randomly deleted; the
-    decoder must restore it in full.
+    """The style corpus, uncorrupted. One sentence per line.
 
-    No word list. Every word is treated identically. Whatever the adapters
-    end up learning about style, they learn because the decoder had to put
-    the missing words back — not because anything was labelled 'style'.
+    StyleNet Task 2 is a plain language model. The sentence appears only as
+    the decoder's target; the encoder gets nothing. There is therefore no
+    corruption scheme, no word list, and nothing for the decoder to copy.
     """
 
-    def __init__(self, caption_file, dropout=DROPOUT, seed=0, min_keep=2):
+    def __init__(self, caption_file):
         self.lines = read_lines(caption_file)
         if not self.lines:
             raise RuntimeError(f"{caption_file} is empty")
-        self.p = float(dropout)
-        self.seed = seed
-        self.min_keep = min_keep
-        print(f"[INFO] {os.path.basename(caption_file)}: {len(self.lines)} lines, "
-              f"uniform dropout p={self.p}")
+        print(f"[INFO] {os.path.basename(caption_file)}: "
+              f"{len(self.lines)} lines (language model)")
 
     def __len__(self):
         return len(self.lines)
 
     def __getitem__(self, ix):
-        # Seeded per item: workers fork with the same RNG state, so a shared
-        # generator would hand every worker identical corruptions.
-        rng = random.Random(self.seed * 1_000_003 + ix)
-        words = self.lines[ix].split()
-        kept = [w for w in words if rng.random() > self.p]
-        if len(kept) < self.min_keep:                  # never hand over nothing
-            kept = rng.sample(words, min(self.min_keep, len(words)))
-            kept.sort(key=words.index)
-        return " ".join(kept), self.lines[ix]
+        return self.lines[ix]
 
 
 def collate_style(batch):
-    corrupt, clean = zip(*batch)
-    c_ids, c_mask = encode(corrupt)
-    t_ids, _ = encode(clean)
-    return c_ids, c_mask, to_labels(t_ids)
+    """Labels only. There is no encoder side."""
+    ids, _ = encode(list(batch))
+    return to_labels(ids)
 
 
 class SubsetEpochSampler(torch.utils.data.Sampler):
@@ -205,8 +179,7 @@ def factual_loader(cache_dir, caption_file, bs, shuffle=False, workers=4,
     return (dl, ds) if return_dataset else dl
 
 
-def style_loader(caption_file, bs, dropout=DROPOUT, shuffle=True, workers=2):
-    return DataLoader(
-        StyleTextDataset(caption_file, dropout=dropout),
-        batch_size=bs, shuffle=shuffle, num_workers=workers, pin_memory=True,
-        persistent_workers=workers > 0, collate_fn=collate_style)
+def style_loader(caption_file, bs, shuffle=True, workers=2):
+    return DataLoader(StyleTextDataset(caption_file), batch_size=bs,
+                      shuffle=shuffle, num_workers=workers, pin_memory=True,
+                      persistent_workers=workers > 0, collate_fn=collate_style)
