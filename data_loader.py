@@ -1,3 +1,18 @@
+"""
+data_loader.py — one style per run, no style lexicon anywhere.
+
+The style pass corrupts its input with UNIFORM word dropout: every word is
+dropped with the same probability, whether it carries style or content. That
+is deliberate. The earlier design deleted words judged to be "style words",
+which required somebody to decide which Bangla words are romantic — a
+judgement that was measured to be wrong on 4.2% of the corpus and to leak
+style into the input on 9.4% of lines.
+
+Uniform dropout makes no such claim. Its one knob, `dropout`, trades content
+preservation against style leakage, and it is tuned from validation loss and
+sample output rather than from anyone's opinion about Bangla.
+"""
+
 import os
 import random
 from collections import Counter
@@ -16,15 +31,11 @@ except ImportError:
 T5_CKPT = "csebuetnlp/banglat5"
 MAX_LEN = 48
 
-# Two rates, not one. Uniform dropout removed content words as often as style
-# words, so the model learned to invent content (which it cannot know) while the
-# style phrase survived and was copied straight off the input — the knobs got
-# almost no gradient. Masking the style words leaves the content intact and
-# removes the one thing the knobs are supposed to supply, so each example reads
-# as "here is the plain sentence, produce the styled one" — the exact job at
-# inference, derived from the unpaired style corpus alone.
-P_STYLE = 0.9
-P_CONTENT = 0.1
+# Every word dropped with this probability during the style pass.
+#   low  -> content survives, but style words survive too and can be copied
+#   high -> no copying, but the input is gutted and content must be invented
+# One number, tuned from val loss. Not a claim about which words are stylish.
+DROPOUT = 0.4
 
 tokenizer = T5Tokenizer.from_pretrained(T5_CKPT, use_fast=False)
 
@@ -67,47 +78,8 @@ def read_lines(path):
 
 
 # --------------------------------------------------------------------------
-def find_style_words(style_lines, factual_lines, ratio=5.0, min_count=20, name=""):
-    """Words far more frequent in the style corpus than in factual text.
-
-    Purely lexical — no hand-written list — so it still works after you
-    regenerate a corpus. The printout doubles as a corpus check: if only a
-    handful of words clear the bar, the style is a template, not a style.
-    """
-    cf = Counter(w for l in factual_lines for w in l.split())
-    cs = Counter(w for l in style_lines for w in l.split())
-    Nf, Ns = max(sum(cf.values()), 1), max(sum(cs.values()), 1)
-
-    scored = []
-    for w, c in cs.items():
-        if c < min_count:
-            continue
-        r = (c / Ns) / (cf.get(w, 0) / Nf + 1e-9)
-        if r > ratio:
-            scored.append((r, c, w))
-    scored.sort(reverse=True)
-    words = {w for _, _, w in scored}
-
-    hit = sum(1 for l in style_lines if any(w in words for w in l.split()))
-    print(f"[STYLE] {name}: {len(words)} style words; present in "
-          f"{hit:,}/{len(style_lines):,} lines "
-          f"({100*hit/max(len(style_lines),1):.0f}%)")
-    if scored:
-        print(f"[STYLE] {name}: top -> " + "  ".join(w for _, _, w in scored[:12]))
-    if len(words) < 50:
-        print(f"[STYLE] {name}: WARNING only {len(words)} distinct style words — "
-              f"the knobs will learn a lookup table, not a style.")
-    if hit < 0.4 * len(style_lines):
-        print(f"[STYLE] {name}: WARNING style markers reach under 40% of lines; "
-              f"masking will have little to remove on the rest.")
-    return words
-
-
-# --------------------------------------------------------------------------
 class FactualDataset(Dataset):
-    """One row per (image, caption) pair. No epoch state, no rotation — the
-    old rotation was inert under persistent_workers and silently trained on
-    caption #0 of every image only."""
+    """One row per (image, caption) pair. No epoch state, no rotation."""
 
     def __init__(self, cache_dir, caption_file):
         self.cache_dir = cache_dir
@@ -159,32 +131,36 @@ def collate_factual(batch):
 
 
 class StyleTextDataset(Dataset):
-    """Encoder sees the sentence with its STYLE words gone and its content
-    intact; the decoder must restore the full styled sentence."""
+    """Encoder sees the styled sentence with words randomly deleted; the
+    decoder must restore it in full.
 
-    def __init__(self, caption_file, style_words=None,
-                 p_style=P_STYLE, p_content=P_CONTENT, seed=0):
+    No word list. Every word is treated identically. Whatever the adapters
+    end up learning about style, they learn because the decoder had to put
+    the missing words back — not because anything was labelled 'style'.
+    """
+
+    def __init__(self, caption_file, dropout=DROPOUT, seed=0, min_keep=2):
         self.lines = read_lines(caption_file)
         if not self.lines:
             raise RuntimeError(f"{caption_file} is empty")
-        self.style_words = style_words or set()
-        self.p_style, self.p_content = p_style, p_content
+        self.p = float(dropout)
         self.seed = seed
-        print(f"[INFO] {os.path.basename(caption_file)}: {len(self.lines)} lines")
+        self.min_keep = min_keep
+        print(f"[INFO] {os.path.basename(caption_file)}: {len(self.lines)} lines, "
+              f"uniform dropout p={self.p}")
 
     def __len__(self):
         return len(self.lines)
 
     def __getitem__(self, ix):
-        # Seeded per item. Every worker forks with the same RNG state, so a
-        # shared generator duplicates corruption across workers.
+        # Seeded per item: workers fork with the same RNG state, so a shared
+        # generator would hand every worker identical corruptions.
         rng = random.Random(self.seed * 1_000_003 + ix)
         words = self.lines[ix].split()
-        kept = [w for w in words
-                if rng.random() > (self.p_style if w in self.style_words
-                                   else self.p_content)]
-        if not kept:
-            kept = [w for w in words if w not in self.style_words][:3] or words[:1]
+        kept = [w for w in words if rng.random() > self.p]
+        if len(kept) < self.min_keep:                  # never hand over nothing
+            kept = rng.sample(words, min(self.min_keep, len(words)))
+            kept.sort(key=words.index)
         return " ".join(kept), self.lines[ix]
 
 
@@ -196,8 +172,7 @@ def collate_style(batch):
 
 
 class SubsetEpochSampler(torch.utils.data.Sampler):
-    """Optional, off unless --captions_per_epoch > 0. Shortens epochs only.
-    set_epoch works here because the sampler lives in the main process."""
+    """Optional, off unless --captions_per_epoch > 0. Shortens epochs only."""
 
     def __init__(self, n, num_samples=None, seed=0):
         self.n = n
@@ -230,8 +205,8 @@ def factual_loader(cache_dir, caption_file, bs, shuffle=False, workers=4,
     return (dl, ds) if return_dataset else dl
 
 
-def style_loader(caption_file, bs, style_words=None, shuffle=True, workers=2):
+def style_loader(caption_file, bs, dropout=DROPOUT, shuffle=True, workers=2):
     return DataLoader(
-        StyleTextDataset(caption_file, style_words=style_words),
+        StyleTextDataset(caption_file, dropout=dropout),
         batch_size=bs, shuffle=shuffle, num_workers=workers, pin_memory=True,
         persistent_workers=workers > 0, collate_fn=collate_style)
