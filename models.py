@@ -25,6 +25,62 @@ import torch.nn.functional as F
 from transformers import T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 
+
+def load_banglat5(t5_ckpt):
+    """Load BanglaT5 and verify it actually works before anything trains on it.
+
+    BanglaT5's config.json says tie_word_embeddings=True, but the checkpoint
+    ships a genuine SEPARATE output head. Measured on the real checkpoint:
+
+        shared.weight   std 22.04     <- large, meant to be used as an output
+                                         head only after T5 shrinks the hidden
+                                         state by d_model**-0.5 (1/27.7)
+        lm_head.weight  std  1.20     <- normal scale, expects it UNSCALED
+
+    Transformers 4.x honoured the flag: it tied lm_head to shared AND applied
+    the rescale. Self-consistent, and what the earlier working run used.
+    Transformers 5.x keeps the stored lm_head but STILL applies the rescale,
+    so the hidden state is shrunk 27.7x before a head that does not want it.
+    The logits come out flat, and on BanglaT5's own span-fill objective the
+    loss sits at ln(32100) = 10.4, i.e. chance. Training then blows up: cap
+    starts near 103 instead of 22 and validation diverges by epoch 2.
+
+    Forcing the tie is NOT the fix -- measured, that scores 49.87, five times
+    worse than leaving it alone. The stored head is the real one; the rescale
+    is what is wrong. Clearing the flag keeps the head and drops the rescale,
+    which is exactly what the v5 warning tells you to do.
+
+    Then it is checked rather than assumed. If the span-fill loss is still at
+    chance this raises immediately instead of training for two epochs.
+    """
+    model = T5ForConditionalGeneration.from_pretrained(t5_ckpt)
+    model.config.tie_word_embeddings = False
+
+    from transformers import T5Tokenizer
+    tok = T5Tokenizer.from_pretrained(t5_ckpt, use_fast=False)
+    enc = tok(["একটি ছোট ছেলে <extra_id_0> উপর বসে আছে।"], return_tensors="pt")
+    lab = tok(["<extra_id_0> একটি বড় পাথরের <extra_id_1>"],
+              return_tensors="pt").input_ids
+    model.eval()
+    with torch.no_grad():
+        loss = model(input_ids=enc.input_ids,
+                     attention_mask=enc.attention_mask,
+                     labels=lab).loss.item()
+    model.train()
+
+    n_m = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"[banglat5] {n_m:.1f}M params, span-fill loss {loss:.2f} "
+          f"(chance is 10.4; healthy is roughly 2-5)")
+
+    if loss > 6.0:
+        raise RuntimeError(
+            f"BanglaT5 loaded but is at chance on its own pretraining task "
+            f"(span-fill loss {loss:.2f}, chance = 10.4). The output head is "
+            f"not being applied correctly by transformers "
+            f"{__import__('transformers').__version__}. Do NOT train on this. "
+            f"Try:  pip install 'transformers==4.46.3'  and restart the kernel.")
+    return model
+
 STYLE_TOKENS = {
     "factual":  "<factual>",
     "romantic": "<romantic>",
@@ -84,7 +140,7 @@ class FactualCaptioner(nn.Module):
 
     def __init__(self, t5_ckpt="csebuetnlp/banglat5", clip_dim=768):
         super().__init__()
-        self.t5 = T5ForConditionalGeneration.from_pretrained(t5_ckpt)
+        self.t5 = load_banglat5(t5_ckpt)
         self.d_model = self.t5.config.d_model
         self.projector = VisualProjection(clip_dim, self.d_model)
 
@@ -160,7 +216,7 @@ class StyleModel(nn.Module):
     def __init__(self, t5_ckpt="csebuetnlp/banglat5", clip_dim=768,
                  prefix_len=10, vocab_size=None):
         super().__init__()
-        self.t5 = T5ForConditionalGeneration.from_pretrained(t5_ckpt)
+        self.t5 = load_banglat5(t5_ckpt)
         if vocab_size is not None:
             self.t5.resize_token_embeddings(vocab_size)
         self.d_model = self.t5.config.d_model
