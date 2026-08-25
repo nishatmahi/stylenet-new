@@ -1,13 +1,71 @@
+"""
+models.py — the two models of PPCap, in Bangla.
+
+They are trained separately, share no weights, and meet only in generate.py.
+
+  FactualCaptioner   image -> factual caption.   Off-the-shelf, frozen at
+                     inference. Sees images only, so it keeps your existing
+                     CLIP ViT-B/32 patch-token cache.
+
+  StyleModel         a small class-conditional captioner trained ONLY on the
+                     unpaired style corpus. Its prefix is
+                     [style embedding] ++ [CLIP embedding -> MLP], where the
+                     CLIP embedding is the TEXT tower's output at training
+                     time and the IMAGE tower's at inference (paper Fig. 3).
+                     This is what lets it train with no images at all.
+
+Both use BanglaT5, so they share a tokenizer. The paper had to zero out
+mismatched vocabulary between its GPT-2 discriminator and its factual model
+(Sec. 4.3); sharing a tokenizer removes that problem instead of patching it.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 
+STYLE_TOKENS = {
+    "factual":  "<factual>",
+    "romantic": "<romantic>",
+    "humorous": "<humorous>",
+}
 
+
+def add_style_tokens(tokenizer):
+    """Add the control codes as real single tokens.
+
+    The paper uses the literal strings ' romantic' / ' factual' and warns to
+    keep the leading space, because otherwise they tokenize inconsistently.
+    Dedicated tokens make that failure impossible.
+    """
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": list(STYLE_TOKENS.values())})
+    return {k: tokenizer.convert_tokens_to_ids(v) for k, v in STYLE_TOKENS.items()}
+
+
+class MLP(nn.Module):
+    """CLIP embedding -> prefix_len vectors in T5's embedding space.
+    Same shape of mapping ClipCap uses, one hidden layer, tanh."""
+
+    def __init__(self, in_dim, d_model, prefix_len):
+        super().__init__()
+        out = d_model * prefix_len
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, out // 2),
+            nn.Tanh(),
+            nn.Linear(out // 2, out),
+        )
+        self.d_model, self.prefix_len = d_model, prefix_len
+
+    def forward(self, x):
+        return self.net(x).view(-1, self.prefix_len, self.d_model)
+
+
+# ---------------------------------------------------------------- factual
 class VisualProjection(nn.Module):
-    """CLIP tokens -> T5 encoder input space. The encoder handles the picture
-    and nothing else — it never sees style."""
+    """CLIP patch tokens -> T5 encoder input space."""
+
     def __init__(self, clip_dim, d_model, n_layers=2, n_heads=8):
         super().__init__()
         self.inp = nn.Linear(clip_dim, d_model)
@@ -21,101 +79,15 @@ class VisualProjection(nn.Module):
         return self.ln(self.tr(self.inp(feats)))
 
 
-class StyleContext:
-    """Shared holder for the style dial. lam=0 means the adapters are off and
-    the model is exactly the plain factual captioner."""
-    def __init__(self, lam=0.0):
-        self.lam = lam
+class FactualCaptioner(nn.Module):
+    """Image -> factual caption. No style machinery anywhere in here."""
 
-
-class StyleAdapter(nn.Module):
-    """The style knobs — StyleNet's S_r. One small bottleneck per decoder block.
-
-    Up-projection is zero-initialised, so at step 0 the adapter output is
-    exactly zero: factual and romantic start as the same model and every
-    difference that appears later was learned.
-    """
-    def __init__(self, d_model, bottleneck=64, dropout=0.1):
-        super().__init__()
-        self.down = nn.Linear(d_model, bottleneck)
-        self.up = nn.Linear(bottleneck, d_model)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-        nn.init.normal_(self.down.weight, std=1e-3)
-        nn.init.zeros_(self.down.bias)
-        nn.init.zeros_(self.up.weight)
-        nn.init.zeros_(self.up.bias)
-
-    def forward(self, x):
-        return self.dropout(self.up(self.act(self.down(x))))
-
-
-class AdapterFF(nn.Module):
-    """Wraps a T5 decoder feed-forward block and adds the style delta.
-
-        h = ff(x) + lam * adapter(ff(x))
-
-    Residual, like S_f + lam*S_r: the model's normal writing behaviour is
-    never switched off, style is only ever added on top. lam multiplies the
-    delta directly with nothing renormalising it, so the dial controls
-    intensity. lam is fixed at 1.0 during training and swept only at
-    inference — sampling it during training teaches the adapter to be
-    lam-invariant, which is the opposite of what the dial is for.
-    """
-    def __init__(self, orig_ff, d_model, bottleneck, ctx: StyleContext):
-        super().__init__()
-        self.orig = orig_ff
-        self.adapter = StyleAdapter(d_model, bottleneck)
-        self.ctx = ctx
-        self.last_ratio = 0.0          # diagnostic: ||delta|| / ||h||
-
-    def forward(self, hidden_states):
-        h = self.orig(hidden_states)
-        if self.ctx.lam == 0.0:
-            return h
-        d = self.adapter(h)
-        if not self.training:
-            self.last_ratio = (d.norm(dim=-1).mean()
-                               / h.norm(dim=-1).mean().clamp(min=1e-6)).item()
-        return h + self.ctx.lam * d
-
-
-class StyleNetT5(nn.Module):
-    """StyleNet's two tasks, one style per run.
-
-      Task 1 (CAP)  image -> factual caption, knobs off.
-                    Trains backbone + projector. This is the content path.
-
-      Task 2 (STY)  a language model over the style corpus, knobs on,
-                    backbone frozen. No encoder input at all, so the only
-                    weights that can shift the next-token distribution
-                    toward romantic/humorous Bangla are the adapters.
-
-    Inference is one pass: image -> encoder -> decoder with the knobs on.
-    Content arrives through cross-attention, register through the adapters.
-    Neither was ever trained on the other's data — which is exactly why no
-    paired factual/styled corpus is needed.
-    """
-    def __init__(self, t5_ckpt="csebuetnlp/banglat5", clip_dim=768,
-                 style="romantic", bottleneck=64):
+    def __init__(self, t5_ckpt="csebuetnlp/banglat5", clip_dim=768):
         super().__init__()
         self.t5 = T5ForConditionalGeneration.from_pretrained(t5_ckpt)
         self.d_model = self.t5.config.d_model
-        self.style = style
-        self.ctx = StyleContext(0.0)
-
         self.projector = VisualProjection(clip_dim, self.d_model)
-        for block in self.t5.decoder.block:
-            block.layer[-1] = AdapterFF(block.layer[-1], self.d_model,
-                                        bottleneck, self.ctx)
 
-    def adapter_modules(self):
-        return [b.layer[-1] for b in self.t5.decoder.block]
-
-    def adapter_parameters(self):
-        return [p for m in self.adapter_modules() for p in m.adapter.parameters()]
-
-    # ---------- encoders ----------
     def encode_image(self, feats):
         embeds = self.projector(feats.to(self.projector.inp.weight.dtype))
         out = self.t5.encoder(inputs_embeds=embeds)
@@ -124,100 +96,144 @@ class StyleNetT5(nn.Module):
         return out.last_hidden_state, mask
 
     def encode_text(self, ids, mask):
-        return self.t5.encoder(input_ids=ids, attention_mask=mask).last_hidden_state, mask
+        return self.t5.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
 
-    def _decode(self, content, mask, labels, lam):
-        self.ctx.lam = lam
+    def caption_loss(self, feats, labels):
+        content, mask = self.encode_image(feats)
         out = self.t5(encoder_outputs=BaseModelOutput(last_hidden_state=content),
                       attention_mask=mask, labels=labels)
-        self.ctx.lam = 0.0
-        return out.loss
-
-    # ---------- training ----------
-    def caption_loss(self, feats, labels):
-        """Task 1. Image -> factual caption. Knobs off."""
-        content, mask = self.encode_image(feats)
-        return self._decode(content, mask, labels, 0.0), content
+        return out.loss, content
 
     def v2l_loss(self, img_content, text_ids, text_mask):
         """Pull the image representation toward its caption's representation.
 
-        The text branch runs under no_grad and is a fixed anchor. If both
-        branches carried gradient through the same encoder, collapse to one
-        constant direction would be the global optimum.
+        Text branch is no_grad — a fixed anchor. If both branches carried
+        gradient the encoder could drive this to zero by emitting one constant
+        direction for every input.
 
         Without this the projector's only gradient comes back through the
-        decoder's cross-entropy, which the decoder can drive down by learning
-        a generic caption prior — fluent sentences that are not about the
-        picture in front of it.
+        decoder's cross-entropy, which the decoder can minimise by learning a
+        generic caption prior: fluent Bangla about no particular picture.
         """
         with torch.no_grad():
-            text_content, _ = self.encode_text(text_ids, text_mask)
-            m = text_mask.unsqueeze(-1).to(text_content.dtype)
-            txt_pool = (text_content * m).sum(1) / m.sum(1).clamp(min=1e-6)
-            txt_pool = F.normalize(txt_pool, dim=-1)
-        img_pool = F.normalize(img_content.mean(dim=1), dim=-1)
-        return F.mse_loss(img_pool, txt_pool.to(img_pool.dtype))
+            t = self.encode_text(text_ids, text_mask)
+            m = text_mask.unsqueeze(-1).to(t.dtype)
+            txt = F.normalize((t * m).sum(1) / m.sum(1).clamp(min=1e-6), dim=-1)
+        img = F.normalize(img_content.mean(dim=1), dim=-1)
+        return F.mse_loss(img, txt.to(img.dtype))
 
-    def lm_style_loss(self, labels, lam=1.0):
-        """Task 2. A language model over the style corpus.
-
-        Cross-attention gets one all-zero memory slot. K and V of a zero
-        vector are zero, so the cross-attention output is exactly zero: the
-        decoder has nothing to read and must predict each token from its own
-        prefix alone. The backbone is frozen, so the only weights that can
-        move the distribution toward the style corpus are the adapters.
-
-        The length-1 slot matters — an all-padding memory softmaxes over
-        nothing and gives NaN on some Transformers versions.
-        """
-        b = labels.size(0)
-        mem = torch.zeros(b, 1, self.d_model, device=labels.device,
-                          dtype=self.t5.shared.weight.dtype)
-        mask = torch.ones(b, 1, dtype=torch.long, device=labels.device)
-        return self._decode(mem, mask, labels, lam)
-
-    # ---------- diagnostics ----------
     @torch.no_grad()
-    def adapter_report(self, feats, lam=1.0, max_new_tokens=8):
-        """||style delta|| / ||hidden|| averaged over decoder blocks.
-
-        ~0.00  -> knobs are dead, nothing was learned. raise --lr_style.
-        0.05-0.4 -> healthy.
-        >1.0   -> style is swamping the content; lower lam or --lr_style.
-        """
-        was = self.training
-        self.eval()
-        self.ctx.lam = lam
+    def generate(self, feats, num_beams=5, max_new_tokens=48,
+                 repetition_penalty=1.15, no_repeat_ngram_size=3):
         content, mask = self.encode_image(feats)
-        self.t5.generate(
+        return self.t5.generate(
             encoder_outputs=BaseModelOutput(last_hidden_state=content),
-            attention_mask=mask, max_new_tokens=max_new_tokens, num_beams=1)
-        self.ctx.lam = 0.0
-        r = [m.last_ratio for m in self.adapter_modules()]
-        if was:
-            self.train()
-        return sum(r) / max(len(r), 1)
+            attention_mask=mask, num_beams=num_beams,
+            max_new_tokens=max_new_tokens, early_stopping=True, use_cache=True,
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size)
 
-    # ---------- inference ----------
-    @torch.no_grad()
-    def generate(self, feats, lam=1.0, num_beams=5, max_new_tokens=40,
-                 repetition_penalty=1.0, no_repeat_ngram_size=0,
-                 length_penalty=1.0):
-        """One pass. lam=0 gives the factual caption, lam>0 the styled one."""
-        content, mask = self.encode_image(feats)
-        self.ctx.lam = lam
-        kw = dict(encoder_outputs=BaseModelOutput(last_hidden_state=content),
-                  attention_mask=mask, num_beams=num_beams,
-                  max_new_tokens=max_new_tokens, length_penalty=length_penalty,
-                  early_stopping=True, use_cache=True)
-        if repetition_penalty and repetition_penalty != 1.0:
-            kw["repetition_penalty"] = repetition_penalty
-        if no_repeat_ngram_size:
-            kw["no_repeat_ngram_size"] = no_repeat_ngram_size
-        ids = self.t5.generate(**kw)
-        self.ctx.lam = 0.0
-        return ids
+
+# ---------------------------------------------------------------- stylized
+def noise_injection(x, variance, normalize=True):
+    """Paper Sec. 3.3: CLIP text and image embeddings are close but not
+    interchangeable, so noise is injected during training to stop the model
+    keying on the exact text-side geometry. variance = 0.016 in the paper."""
+    if normalize:
+        x = x / x.norm(2, dim=-1, keepdim=True).clamp(min=1e-6)
+    if variance <= 0:
+        return x
+    return x + torch.randn_like(x) * variance
+
+
+class StyleModel(nn.Module):
+    """Class-conditional captioner trained on the unpaired style corpus.
+
+    encoder input = [ style token embedding ] ++ [ MLP(clip embedding) ]
+    decoder       = writes the caption
+
+    Feeding the prefix through the encoder is the T5 form of ClipCap's
+    "prepend to GPT-2" — the decoder cross-attends to style and content
+    together, which is the same conditioning the paper describes.
+    """
+
+    def __init__(self, t5_ckpt="csebuetnlp/banglat5", clip_dim=768,
+                 prefix_len=10, vocab_size=None):
+        super().__init__()
+        self.t5 = T5ForConditionalGeneration.from_pretrained(t5_ckpt)
+        if vocab_size is not None:
+            self.t5.resize_token_embeddings(vocab_size)
+        self.d_model = self.t5.config.d_model
+        self.prefix_len = prefix_len
+        self.clip_project = MLP(clip_dim, self.d_model, prefix_len)
+
+    def prefix_states(self, clip_emb, style_ids):
+        """[B, 1+prefix_len, d] encoder hidden states."""
+        clip_emb = clip_emb.to(self.clip_project.net[0].weight.dtype)
+        style = self.t5.shared(style_ids).unsqueeze(1)          # [B,1,d]
+        prefix = self.clip_project(clip_emb)                    # [B,k,d]
+        embeds = torch.cat([style, prefix], dim=1)
+        out = self.t5.encoder(inputs_embeds=embeds)
+        mask = torch.ones(out.last_hidden_state.shape[:2],
+                          dtype=torch.long, device=embeds.device)
+        return out.last_hidden_state, mask
+
+    def token_nll(self, clip_emb, style_ids, labels):
+        """Per-token negative log-likelihood, and the token count.
+
+        Returned unreduced so the caller can build both losses of Eq. 6-8:
+        the generative loss needs the length-normalised mean, and the
+        discriminative loss needs that same mean as a class logit.
+        """
+        h, mask = self.prefix_states(clip_emb, style_ids)
+        out = self.t5(encoder_outputs=BaseModelOutput(last_hidden_state=h),
+                      attention_mask=mask, labels=labels)
+        logits = out.logits                                     # [B,T,V]
+        nll = F.cross_entropy(
+            logits.view(-1, logits.size(-1)).float(),
+            labels.view(-1), ignore_index=-100, reduction='none'
+        ).view(labels.shape)                                    # [B,T]
+        n_tok = (labels != -100).sum(1).clamp(min=1)
+        return nll.sum(1), n_tok                                # [B], [B]
+
+    def step_logits(self, h, mask, decoder_input_ids, past=None):
+        """One decoding step. Returns (logits over vocab, new past)."""
+        out = self.t5(
+            encoder_outputs=BaseModelOutput(last_hidden_state=h),
+            attention_mask=mask,
+            decoder_input_ids=decoder_input_ids if past is None
+            else decoder_input_ids[:, -1:],
+            past_key_values=past, use_cache=True)
+        return out.logits[:, -1, :], out.past_key_values
+
+
+def ppcap_loss(model, clip_emb, true_ids, other_ids, labels, lam=0.8):
+    """Paper Eq. 6-8.
+
+        L_g = mean_i  -(1/T_i) log P(y_i | s_i, x_i)          generative
+        L_d = mean_i  -log P(s_i | x_i, y_i)                  discriminative
+        L   = lam * L_g + (1 - lam) * L_d
+
+    P(s|x,y) is a softmax over the two styles of the length-normalised
+    log-likelihood, which is what makes this a *discriminator*: the model
+    must make the sentence likely under its own style AND unlikely under the
+    contrasting one. Language modelling alone would only do the first, and
+    that is exactly the signal that was missing before.
+    """
+    nll_true, n = model.token_nll(clip_emb, true_ids, labels)
+    nll_other, _ = model.token_nll(clip_emb, other_ids, labels)
+
+    mean_true = nll_true / n
+    mean_other = nll_other / n
+
+    l_g = mean_true.mean()
+
+    class_logits = torch.stack([-mean_true, -mean_other], dim=1)   # [B,2]
+    target = torch.zeros(class_logits.size(0), dtype=torch.long,
+                         device=class_logits.device)               # index 0 = true
+    l_d = F.cross_entropy(class_logits, target)
+
+    return lam * l_g + (1.0 - lam) * l_d, l_g.detach(), l_d.detach()
 
 
 def load_compatible(model, state_dict, verbose=True, min_frac=0.95):
@@ -241,6 +257,5 @@ def load_compatible(model, state_dict, verbose=True, min_frac=0.95):
     if frac < min_frac:
         raise RuntimeError(
             f"checkpoint restored only {frac:.1%} (threshold {min_frac:.0%}). "
-            f"The architecture changed since it was written — delete it, or "
-            f"pass min_frac=0 to resume from a partly random model on purpose.")
+            f"The architecture changed since it was written.")
     return len(ok)
