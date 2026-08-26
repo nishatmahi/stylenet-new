@@ -1,31 +1,12 @@
 """
 extract_style_feats.py — NLLB-CLIP embeddings for the STYLE model only.
 
-PPCap trains the stylized model on text and runs it on images, using CLIP's
-shared embedding space as the bridge (paper Sec. 3.3, Fig. 3). OpenAI CLIP's
-text tower is English-only, so for Bangla we use NLLB-CLIP: an NLLB-200 text
-tower trained onto a FROZEN CLIP image tower, covering all 201 Flores-200
-languages. Bengali is one of the five low-resource languages the NLLB-CLIP
-paper reports numbers on.
-
 Your FACTUAL model is untouched by this file. It only ever sees images, so it
 keeps its existing CLIP ViT-B/32 patch-token cache. The two models share no
 weights, so they do not have to share a CLIP.
 
     pip install open_clip_torch
-
-    # style corpora -> text embeddings (training side)
-    python extract_style_feats.py --mode text \
-        --in_file  /kaggle/working/splits/romantic_train.txt \
-        --out      /kaggle/working/style_feats/romantic_train.pt
-
-    # images -> image embeddings (inference side)
-    python extract_style_feats.py --mode image \
-        --image_dir /kaggle/input/flickr30k/images \
-        --id_file   /kaggle/working/splits/factual_test.txt \
-        --out       /kaggle/working/style_feats/test_images.pt
 """
-
 import os
 import argparse
 
@@ -146,7 +127,6 @@ def main():
                     'model': MODEL}, args.out)
 
     print(f"\nwrote {args.out}   shape {tuple(emb.shape)}")
-    print("dim is read back automatically by the trainer — nothing to hardcode.")
 
 
 if __name__ == '__main__':
