@@ -13,7 +13,7 @@ Both use the SAME gpt2-bengali tokenizer, so guided decoding in generate.py is
 element-wise on logits. PPCap had to zero out mismatched vocabulary between its
 discriminator and factual model (Sec 4.3); sharing the decoder removes that.
 
-Three traps this file avoids, all found by running it:
+Four traps this file avoids, all found by running it:
   1. "openai/clip-vit-base-patch32" is the FULL CLIP (vision+text) and its
      CLIPConfig has no .hidden_size -> AttributeError in
      VisionEncoderDecoderModel.__init__. A vision-only config is required.
@@ -22,6 +22,7 @@ Three traps this file avoids, all found by running it:
   2. generate() reads model.generation_config, NOT model.config. Setting only
      m.config leaves eos/pad None and generate() dies with IndexError.
   3. num_attention_heads must divide hidden_size.
+  4. ppcap_loss must not materialise the logits twice -- see seq_logprob.
 """
 import torch, torch.nn as nn, torch.nn.functional as F
 from transformers import (AutoTokenizer, GPT2LMHeadModel,
@@ -49,9 +50,12 @@ def _vocab_needed(tok):
 
 # ------------------------------------------------------------------ factual
 def build_factual(tok, feat_dim, dec=DEC):
+    # 1 layer / 1 head: this encoder is a shape placeholder that is NEVER
+    # executed (we always pass encoder_outputs), and num_heads must divide
+    # hidden_size, which 12 does not for every feature dim.
     vcfg = CLIPVisionConfig(hidden_size=feat_dim, intermediate_size=feat_dim,
                             num_hidden_layers=1, num_attention_heads=1)
-    enc = CLIPVisionModel(vcfg)                       # placeholder, never run
+    enc = CLIPVisionModel(vcfg)
 
     d = GPT2LMHeadModel.from_pretrained(dec, add_cross_attention=True,
                                         is_decoder=True)
@@ -149,8 +153,13 @@ def ppcap_loss(model, clip_emb, style_ids, flip_ids, input_ids, attn_mask,
 
     def seq_logprob(sid):
         logits = model(clip_emb, sid, input_ids, attn_mask)[:, P - 1:-1, :]
-        lp = F.log_softmax(logits.float(), -1)
-        tok_lp = lp.gather(-1, input_ids.unsqueeze(-1)).squeeze(-1) * attn_mask
+        # cross_entropy fuses log_softmax + gather. The explicit
+        # F.log_softmax(...).gather(...) allocates a SECOND full [B,T,V]
+        # tensor -- 724 MiB at batch 64 -- and OOMs a T4.
+        tok_lp = -F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                  input_ids.reshape(-1),
+                                  reduction='none').view(input_ids.shape)
+        tok_lp = tok_lp * attn_mask
         return tok_lp.sum(1) / attn_mask.sum(1).clamp(min=1)
 
     lp_true, lp_flip = seq_logprob(style_ids), seq_logprob(flip_ids)
