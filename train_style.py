@@ -5,9 +5,11 @@ Trained ONLY on unpaired text: your style corpus plus the factual text corpus
 as its contrast class. Never sees an image. The CLIP TEXT embedding stands in
 for the image embedding, with noise to bridge the modality gap (paper Sec 3.3).
 
-    L = lam * L_g + (1 - lam) * L_d,  lam = 0.8, variance = 0.016, 20 epochs
+    L = lam * L_g + (1 - lam) * L_d,  lam = 0.8, variance = 0.016
 """
-import os, argparse, torch
+import os
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+import argparse, torch
 from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 from data import StyleData, add_style_tokens
@@ -21,8 +23,8 @@ def main(a):
     sid = add_style_tokens(tok)
     print("style control tokens:", sid)
 
-    tr_ds = StyleData(a.style_pt, a.factual_pt, a.style, tok, sid)
-    va_ds = StyleData(a.style_val_pt, a.factual_val_pt, a.style, tok, sid)
+    tr_ds = StyleData(a.style_pt, a.factual_pt, a.style, tok, sid, ratio=a.ratio)
+    va_ds = StyleData(a.style_val_pt, a.factual_val_pt, a.style, tok, sid, ratio=a.ratio)
     tr = DataLoader(tr_ds, batch_size=a.batch_size, shuffle=True, num_workers=2)
     va = DataLoader(va_ds, batch_size=a.batch_size, shuffle=False, num_workers=2)
 
@@ -43,8 +45,7 @@ def main(a):
             flip = torch.where(s_id == desired,
                                torch.full_like(s_id, undesired),
                                torch.full_like(s_id, desired))
-            loss, lg, ld = ppcap_loss(model, emb, s_id, flip, ids, m, ids,
-                                      is_sty.to(dev), lam=a.lam)
+            loss, lg, ld = ppcap_loss(model, emb, s_id, flip, ids, m, lam=a.lam)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sch.step(); opt.zero_grad()
@@ -60,8 +61,7 @@ def main(a):
                 flip = torch.where(s_id == desired,
                                    torch.full_like(s_id, undesired),
                                    torch.full_like(s_id, desired))
-                l, _, _ = ppcap_loss(model, emb, s_id, flip, ids, m, ids,
-                                     is_sty.to(dev), lam=a.lam)
+                l, _, _ = ppcap_loss(model, emb, s_id, flip, ids, m, lam=a.lam)
                 s += l.item(); n += 1
         val = s / max(n, 1)
         print(f"[EPOCH {ep+1}] val {val:.4f}")
@@ -83,6 +83,8 @@ def main(a):
                         'prefix_len': a.prefix_len, 'style': a.style},
                        os.path.join(a.save_dir, 'best_model.pth'))
             print(f"[EPOCH {ep+1}] saved  (best {val:.4f})")
+        else:
+            print(f"[EPOCH {ep+1}] val rose ({val:.4f} > {best:.4f}) -- not saved")
     print(f"done. best val {best:.4f}")
 
 
@@ -107,6 +109,7 @@ if __name__ == '__main__':
     p.add_argument('--warmup', type=int, default=500)
     p.add_argument('--epochs', type=int, default=6)          # paper: 20
     p.add_argument('--prefix_len', type=int, default=10)
+    p.add_argument('--ratio', type=float, default=1.0)       # factual : style
     p.add_argument('--lam', type=float, default=0.8)         # paper: 0.8
     p.add_argument('--variance', type=float, default=0.016)  # paper: 0.016
     p.add_argument('--normalize_prefix', type=int, default=1)
