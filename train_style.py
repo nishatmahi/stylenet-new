@@ -6,6 +6,12 @@ as its contrast class. Never sees an image. The CLIP TEXT embedding stands in
 for the image embedding, with noise to bridge the modality gap (paper Sec 3.3).
 
     L = lam * L_g + (1 - lam) * L_d,  lam = 0.8, variance = 0.016
+
+Memory: ppcap_loss runs TWO forwards per step (true code + flipped) and keeps
+both graphs. At batch 64 the lm_head output alone is 64 x 59 x 50259 x 4 =
+724 MiB per forward, which OOMs a T4 -- especially while the factual run is
+holding the same GPU. So the default is micro-batch 16 with 4-step gradient
+accumulation: same effective batch of 64, a quarter of the peak memory.
 """
 import os
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
@@ -32,8 +38,11 @@ def main(a):
     model = StyleModel(clip_dim, tok, prefix_len=a.prefix_len).to(dev)
     print(f"  style model {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
+    steps_per_ep = (len(tr) + a.accum - 1) // a.accum
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.01)
-    sch = get_linear_schedule_with_warmup(opt, a.warmup, a.epochs * len(tr))
+    sch = get_linear_schedule_with_warmup(opt, a.warmup, a.epochs * steps_per_ep)
+    print(f"  batch {a.batch_size} x accum {a.accum} = effective {a.batch_size*a.accum}"
+          f"   {steps_per_ep} optimiser steps/epoch")
     desired, undesired = sid[a.style], sid['factual']
 
     best = float('inf')
@@ -46,9 +55,10 @@ def main(a):
                                torch.full_like(s_id, undesired),
                                torch.full_like(s_id, desired))
             loss, lg, ld = ppcap_loss(model, emb, s_id, flip, ids, m, lam=a.lam)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); sch.step(); opt.zero_grad()
+            (loss / a.accum).backward()
+            if (i + 1) % a.accum == 0 or (i + 1) == len(tr):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step(); sch.step(); opt.zero_grad()
             if i % 100 == 0:
                 print(f"ep{ep+1} [{i}/{len(tr)}] loss {loss.item():.3f} "
                       f"gen {lg.item():.3f} disc {ld.item():.3f}", flush=True)
@@ -104,7 +114,8 @@ if __name__ == '__main__':
     p.add_argument('--style_val_pt', required=True)
     p.add_argument('--factual_val_pt', required=True)
     p.add_argument('--save_dir', default='/kaggle/working/p2_style_romantic')
-    p.add_argument('--batch_size', type=int, default=64)     # paper: 64
+    p.add_argument('--batch_size', type=int, default=16)     # micro-batch
+    p.add_argument('--accum', type=int, default=4)           # 16x4 = paper's 64
     p.add_argument('--lr', type=float, default=2e-5)
     p.add_argument('--warmup', type=int, default=500)
     p.add_argument('--epochs', type=int, default=6)          # paper: 20
