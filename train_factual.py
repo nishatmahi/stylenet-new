@@ -1,16 +1,5 @@
 """
-train_factual.py — the factual captioner. No style anything.
 
-This is PPCap's "off-the-shelf factual image captioning model". In the paper
-it is ClipCap, already trained, and never touched again. Here it is BanglaT5
-plus your CLIP projector, trained once and then frozen for the rest of the
-project.
-
-It matters more than it looks. Table 4 of the paper: the factual model scores
-CIDEr 86.0 and the full framework scores 68.1 — the factual model is the
-ceiling everything else works under. The generative style discriminator can
-only re-rank what this model proposes; it cannot add content this model never
-saw.
 
     python train_factual.py \
         --split_dir /kaggle/working/splits \
@@ -53,6 +42,40 @@ def amp_context(args, cuda):
     print("autocast: " + ("bf16" if use_bf16 else
                           "fp16+GradScaler" if use_fp16 else "off (fp32)"))
     return ctx, scaler
+
+
+def set_stage(model, stage, args):
+    """What trains, and when.
+
+    stage 1 — the DECODER is frozen. The decoder is the only part that can
+    memorise p(caption) and drive the loss down without looking at the image;
+    freezing it means the one remaining way to improve is for the projector
+    and encoder to deliver information the decoder can actually use. This is
+    LLaVA's stage 1 and ClipCap's frozen-LM variant, mapped onto an
+    encoder-decoder: the decoder is the language model here.
+
+    stage 2 — everything trains at a low LR. Identical to the configuration
+    that was run before, so nothing is lost by staging.
+
+    Nothing is deleted in either stage. The architecture is untouched.
+    """
+    if stage == 1:
+        for p in model.t5.decoder.parameters(): p.requires_grad = False
+        for p in model.t5.encoder.parameters(): p.requires_grad = True
+        for p in model.projector.parameters():  p.requires_grad = True
+        if hasattr(model.t5, 'lm_head'):
+            for p in model.t5.lm_head.parameters(): p.requires_grad = False
+        groups = [{'params': list(model.t5.encoder.parameters()), 'lr': args.lr},
+                  {'params': list(model.projector.parameters()),  'lr': args.lr_proj}]
+    else:
+        for p in model.parameters():            p.requires_grad = True
+        groups = [{'params': list(model.t5.parameters()),        'lr': args.lr_stage2},
+                  {'params': list(model.projector.parameters()), 'lr': args.lr_stage2 * 4}]
+    opt = torch.optim.AdamW(groups, weight_decay=0.01)
+    n = sum(p.numel() for g in groups for p in g['params']) / 1e6
+    print(f"[stage {stage}] training {n:.1f}M parameters "
+          f"({'decoder frozen' if stage == 1 else 'all trainable'})")
+    return opt
 
 
 def run_epoch(model, loader, opt, sched, device, args, epoch, amp, scaler):
@@ -135,14 +158,8 @@ def main(args):
     # the tokenizer is shared, so keep the embedding table the same size.
     model.t5.resize_token_embeddings(len(tokenizer))
 
-    proj = [p for n_, p in model.named_parameters() if n_.startswith('projector.')]
-    rest = [p for n_, p in model.named_parameters() if not n_.startswith('projector.')]
-    opt = torch.optim.AdamW([{'params': rest, 'lr': args.lr},
-                             {'params': proj, 'lr': args.lr_proj}],
-                            weight_decay=0.01)
+    opt = set_stage(model, 1, args)
     sched = LambdaLR(opt, lambda s: min(1.0, (s + 1) / max(1, args.warmup)))
-    print(f"  language model {sum(p.numel() for p in rest)/1e6:.1f}M")
-    print(f"  projector      {sum(p.numel() for p in proj)/1e6:.1f}M")
 
     start, best, patience = 0, float('inf'), 0
     ck_path = os.path.join(args.save_dir, 'checkpoint-latest.pth')
@@ -157,12 +174,18 @@ def main(args):
         except Exception as e:
             print(f"[WARN] optimizer state unusable ({e}); starting fresh")
         start, best, patience = ck['epoch'] + 1, ck['best'], ck['patience']
+        if start >= args.stage1_epochs:          # resuming into stage 2
+            opt = set_stage(model, 2, args)
+            sched = LambdaLR(opt, lambda s: min(1.0, (s + 1) / max(1, args.warmup)))
         print(f"[resume] epoch {start+1}, best {best:.4f}")
 
     peek = val_ds.distinct_images(3).to(device)
 
     for epoch in range(start, args.epochs):
         print(f"\n=== epoch {epoch+1}/{args.epochs} ===")
+        if epoch == args.stage1_epochs:
+            opt = set_stage(model, 2, args)
+            sched = LambdaLR(opt, lambda s: min(1.0, (s + 1) / max(1, args.warmup)))
         cap, v2l = run_epoch(model, train_dl, opt, sched, device, args,
                              epoch, amp, scaler)
         print(f"[EPOCH {epoch+1}] cap {cap:.4f}  v2l {v2l:.4f}")
@@ -206,7 +229,11 @@ if __name__ == '__main__':
     p.add_argument('--accum_steps', type=int, default=4)
     p.add_argument('--lr', type=float, default=5e-5)
     p.add_argument('--lr_proj', type=float, default=1e-3)
-    p.add_argument('--w_v2l', type=float, default=1.0)
+    # 1 - cos == 384 * F.mse_loss for unit vectors. The old default of 1.0
+    # made this term 0.07% of the gradient; 384 puts it on the standard scale.
+    p.add_argument('--w_v2l', type=float, default=384.0)
+    p.add_argument('--stage1_epochs', type=int, default=4)
+    p.add_argument('--lr_stage2', type=float, default=1e-5)
     p.add_argument('--warmup', type=int, default=200)
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--patience', type=int, default=4)
