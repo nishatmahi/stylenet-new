@@ -1,271 +1,180 @@
 """
-generate.py — the plug-and-play part. Paper Eq. 1, 2 and 5.
+generate.py — step 3. The two models meet, only here.
 
-The factual model proposes; the generative style discriminator re-ranks:
+    P(y_t | s, x, y_<t)  is proportional to  P(y_t | x, y_<t) * P(s | x, y_<t, y_t)^w
+                                             ^factual model    ^style discriminator
 
-    P(y_t | s, x, y_<t)  ∝  P(y_t | x, y_<t) · P(s | x, y_<t, y_t)^w        (2)
+The discriminator posterior is Eq. 5: the style model is run twice on the same
+image embedding, once with the desired control code and once with the
+undesired one, and the two are contrasted.
 
-and the discriminator's posterior comes from running the ONE stylized model
-under both control codes and normalising between them:
-
-    P(s | x, y_<t, y_t) = P(s)·P(y_<t, y_t | s, x)
-                          ────────────────────────────────                  (5)
-                          Σ_{s'∈{s,s̄}} P(s')·P(y_<t, y_t | s', x)
-
-Neither model is fine-tuned here. Nothing is merged. w=0 gives you the plain
-factual caption; raising w bends the output toward the style. On FlickrStyle10k
-the paper uses w=30 for romantic and w=39 for humorous — Bangla will need its
-own sweep, which is what --w accepts a list for.
-
-    python generate.py --style romantic --w 0,10,20,30,40 \
-        --factual_ckpt /kaggle/working/factual/best_model.pth \
-        --style_ckpt   /kaggle/working/style_romantic/best_model.pth \
-        --cache_dir    /kaggle/working/clip_feature_cache \
-        --style_img_pt /kaggle/working/style_feats/test_images.pt \
-        --test_file    /kaggle/working/splits/factual_test.txt
+Numerical details taken from the reference implementation, not the paper:
+  * the discriminator's probabilities are clamped before log
+  * the posterior is length-normalised by seq_len
+  * repetition_penalty / no_repeat_ngram, so w=0 matches the factual model
 """
-
-import os
-import json
-import argparse
-import contextlib
-
-import torch
-import torch.nn.functional as F
+import os, json, argparse, torch, torch.nn.functional as F
+from transformers import VisionEncoderDecoderModel, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
+from data import split_line, add_style_tokens
+from models import StyleModel, noise_injection
 
-from data import build_tokenizer, Encoder, split_line, normalize
-from models import FactualCaptioner, StyleModel, load_compatible
-
-# The discriminator's probabilities are clamped before being logged. A style
-# model trained on ~35k sentences is confidently wrong about rare tokens, and
-# without a floor one such token drives the guided score to -inf and the beam
-# dies. Same values PPCap uses.
 P_FLOOR, P_CEIL = 1e-3, 0.8
 
 
 def clamped_logprobs(logits):
-    p = torch.softmax(logits.float(), -1).clamp(min=P_FLOOR, max=P_CEIL)
-    return torch.log(p)
+    return torch.log(torch.softmax(logits.float(), -1).clamp(P_FLOOR, P_CEIL))
+
+
+def block_repeats(logits, ys, n, penalty):
+    if penalty and penalty != 1.0:
+        prev = torch.gather(logits, 1, ys)
+        logits = logits.scatter(1, ys, torch.where(prev < 0, prev * penalty,
+                                                   prev / penalty))
+    if n and ys.size(1) >= n:
+        for b in range(ys.size(0)):
+            seq = ys[b].tolist()
+            tail = tuple(seq[-(n - 1):])
+            for i in range(len(seq) - n + 1):
+                if tuple(seq[i:i + n - 1]) == tail:
+                    logits[b, seq[i + n - 1]] = float('-inf')
+    return logits
 
 
 @torch.no_grad()
-def guided_beam_search(factual, style, feats, clip_emb, sid_desired,
-                       sid_undesired, tok, w, num_beams=5, max_new_tokens=48,
-                       length_penalty=1.0, amp=contextlib.nullcontext):
-    """Beam search over the guided distribution of Eq. 2.
+def guided_beam(fac, sty, feats, clip_emb, sid_d, sid_u, tok, w,
+                num_beams=5, max_new=40, rep=1.15, nrng=3):
+    dev = feats.device
+    B, K = feats.size(0), num_beams
+    # the factual model's real output width. The style model's is 3 larger
+    # (the control tokens), so its logits are sliced to V before mixing.
+    V = fac.decoder.get_output_embeddings().weight.size(0)
+    bos = fac.config.decoder_start_token_id
+    eos = fac.config.eos_token_id
+    pad = fac.config.pad_token_id
 
-    No KV cache: the decoder prefix is re-run each step. That is slower than
-    the cached path but it is identical across Transformers versions, and the
-    sequences here are at most 48 tokens.
-    """
-    device = feats.device
-    B = feats.size(0)
-    K = num_beams
-    V = factual.t5.config.vocab_size
-    pad = tok.pad_token_id
-    eos = tok.eos_token_id
+    enc = BaseModelOutput(last_hidden_state=feats.repeat_interleave(K, 0))
+    ce = clip_emb.repeat_interleave(K, 0)
+    d_ids = torch.full((B * K,), sid_d, dtype=torch.long, device=dev)
+    u_ids = torch.full((B * K,), sid_u, dtype=torch.long, device=dev)
 
-    with amp():
-        f_h, f_mask = factual.encode_image(feats)
-        s_h, s_mask = style.prefix_states(
-            clip_emb, torch.full((B,), sid_desired, dtype=torch.long, device=device))
-        u_h, u_mask = style.prefix_states(
-            clip_emb, torch.full((B,), sid_undesired, dtype=torch.long, device=device))
-
-    def expand(h, m):
-        return (h.repeat_interleave(K, 0), m.repeat_interleave(K, 0))
-
-    f_h, f_mask = expand(f_h, f_mask)
-    s_h, s_mask = expand(s_h, s_mask)
-    u_h, u_mask = expand(u_h, u_mask)
-
-    # decoder starts from T5's decoder_start_token_id (the pad id)
-    ys = torch.full((B * K, 1), factual.t5.config.decoder_start_token_id,
-                    dtype=torch.long, device=device)
-    scores = torch.full((B, K), float('-inf'), device=device)
+    ys = torch.full((B * K, 1), bos, dtype=torch.long, device=dev)
+    scores = torch.full((B, K), float('-inf'), device=dev)
     scores[:, 0] = 0.0
-    scores = scores.view(-1)                       # [B*K]
-    ll_s = torch.zeros(B * K, device=device)       # running logP under s
-    ll_u = torch.zeros(B * K, device=device)       # running logP under s-bar
-    done = torch.zeros(B * K, dtype=torch.bool, device=device)
+    scores = scores.view(-1)
+    ll_d = torch.zeros(B * K, device=dev)
+    ll_u = torch.zeros(B * K, device=dev)
+    done = torch.zeros(B * K, dtype=torch.bool, device=dev)
 
-    def run(model, h, m, ys):
-        out = model.t5(encoder_outputs=BaseModelOutput(last_hidden_state=h),
-                       attention_mask=m, decoder_input_ids=ys)
-        return out.logits[:, -1, :]
-
-    for step in range(max_new_tokens):
+    for step in range(max_new):
         t = step + 1
-        with amp():
-            logp_f = F.log_softmax(run(factual, f_h, f_mask, ys).float(), -1)
-            logp_s = clamped_logprobs(run(style, s_h, s_mask, ys))
-            logp_u = clamped_logprobs(run(style, u_h, u_mask, ys))
-
+        lf = F.log_softmax(fac(encoder_outputs=enc, decoder_input_ids=ys
+                               ).logits[:, -1, :].float(), -1)
         if w != 0.0:
-            # Eq. 5, length-normalised exactly as the reference code does
-            a_s = (ll_s.unsqueeze(1) + logp_s) / t
-            a_u = (ll_u.unsqueeze(1) + logp_u) / t
-            logp_desired = F.log_softmax(torch.stack([a_s, a_u], -1), -1)[..., 0]
-            guided = F.log_softmax(logp_f + w * logp_desired, -1)
+            ld = clamped_logprobs(sty.step_logits(ce, d_ids, ys)[:, :V])
+            lu = clamped_logprobs(sty.step_logits(ce, u_ids, ys)[:, :V])
+            a_d = (ll_d.unsqueeze(1) + ld) / t
+            a_u = (ll_u.unsqueeze(1) + lu) / t
+            post = F.log_softmax(torch.stack([a_d, a_u], -1), -1)[..., 0]
+            g = F.log_softmax(lf + w * post, -1)
         else:
-            guided = logp_f                        # w=0 -> the factual model alone
+            g = lf
+        g = block_repeats(g, ys[:, 1:], nrng, rep) if ys.size(1) > 1 else g
 
-        # a finished beam may only extend with pad, at no cost
-        guided[done] = float('-inf')
-        guided[done, pad] = 0.0
-
-        cand = scores.unsqueeze(1) + guided                    # [B*K, V]
-        cand = cand.view(B, K * V)
-        top_scores, top_idx = cand.topk(K, dim=-1)             # [B,K]
-        beam_idx = top_idx // V                                # which beam
-        token_idx = top_idx % V                                # which token
-
-        flat_beam = (torch.arange(B, device=device).unsqueeze(1) * K
-                     + beam_idx).view(-1)                      # [B*K]
-        flat_token = token_idx.view(-1)
-
-        ys = torch.cat([ys[flat_beam], flat_token.unsqueeze(1)], dim=1)
-        scores = top_scores.view(-1)
-        done = done[flat_beam] | (flat_token == eos)
-
-        sel = flat_token.unsqueeze(1)
-        ll_s = ll_s[flat_beam] + logp_s[flat_beam].gather(1, sel).squeeze(1)
-        ll_u = ll_u[flat_beam] + logp_u[flat_beam].gather(1, sel).squeeze(1)
-
+        g[done] = float('-inf')
+        g[done, pad] = 0.0
+        cand = (scores.unsqueeze(1) + g).view(B, K * V)
+        top, idx = cand.topk(K, -1)
+        beam, tokn = idx // V, idx % V
+        flat = (torch.arange(B, device=dev).unsqueeze(1) * K + beam).view(-1)
+        ft = tokn.view(-1)
+        ys = torch.cat([ys[flat], ft.unsqueeze(1)], 1)
+        scores = top.view(-1)
+        done = done[flat] | (ft == eos)
+        if w != 0.0:
+            sel = ft.unsqueeze(1)
+            ll_d = ll_d[flat] + ld[flat].gather(1, sel).squeeze(1)
+            ll_u = ll_u[flat] + lu[flat].gather(1, sel).squeeze(1)
         if done.all():
             break
 
-    # length-normalise and take the best beam per image
-    lengths = (ys != pad).sum(1).clamp(min=1).float()
-    final = (scores / lengths.pow(length_penalty)).view(B, K)
-    best = final.argmax(-1)
-    picked = ys.view(B, K, -1)[torch.arange(B, device=device), best]
-    return tok.batch_decode(picked, skip_special_tokens=True)
+    lens = (ys != pad).sum(1).clamp(min=1).float()
+    best = (scores / lens).view(B, K).argmax(-1)
+    return tok.batch_decode(ys.view(B, K, -1)[torch.arange(B, device=dev), best],
+                            skip_special_tokens=True)
 
 
 def test_images(path, limit):
-    """Image ids with their factual references, normalised through the same
-    pipeline the model trained under."""
     order, refs = [], {}
-    for line in open(path, encoding='utf-8'):
-        parsed = split_line(line.strip())
-        if parsed is None or not parsed[1]:
+    for ln in open(path, encoding='utf-8'):
+        p = split_line(ln.strip())
+        if not p or not p[1]:
             continue
-        img, cap = parsed
+        img, cap = p
         if img not in refs:
-            if limit and len(order) >= limit:
+            if len(order) >= limit:
                 continue
-            order.append(img)
-            refs[img] = []
-        refs[img].append(normalize(cap))
+            order.append(img); refs[img] = []
+        refs[img].append(cap)
     return order, refs
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--style', required=True, choices=['romantic', 'humorous'])
-    p.add_argument('--factual_ckpt', required=True)
-    p.add_argument('--style_ckpt', required=True)
-    p.add_argument('--cache_dir', required=True,
-                   help='CLIP ViT-B/32 patch-token cache, for the factual model')
-    p.add_argument('--style_img_pt', required=True,
-                   help='NLLB-CLIP image embeddings, for the style model')
-    p.add_argument('--test_file', required=True)
-    p.add_argument('--out_json', default='/kaggle/working/ppcap_generations.json')
-    p.add_argument('--w', default='0,10,20,30,40')
-    p.add_argument('--n_images', type=int, default=0, help='0 = all')
-    p.add_argument('--batch_size', type=int, default=8)
-    p.add_argument('--beam_size', type=int, default=5)
-    p.add_argument('--max_new', type=int, default=48)
-    p.add_argument('--amp', type=int, default=1)
-    p.add_argument('--force_bf16', type=int, default=1)
-    args = p.parse_args()
+def main(a):
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    tok = AutoTokenizer.from_pretrained(a.factual_ckpt)
+    sid = add_style_tokens(tok)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ws = [float(x) for x in args.w.split(',')]
+    fac = VisionEncoderDecoderModel.from_pretrained(a.factual_ckpt).to(dev).eval()
+    ck = torch.load(a.style_ckpt, map_location=dev)
+    sty = StyleModel(ck['clip_dim'], tok, prefix_len=ck['prefix_len']).to(dev)
+    sty.load_state_dict(ck['model']); sty.eval()
+    style = ck['style']
+    print(f"[ckpt] factual {a.factual_ckpt}   style '{style}'")
+    print(f"desired <{style}>={sid[style]}   undesired <factual>={sid['factual']}")
 
-    cuda = device.type == 'cuda'
-    major = torch.cuda.get_device_capability()[0] if cuda else 0
-    if args.amp and cuda and (major >= 8 or args.force_bf16):
-        amp = lambda: torch.autocast('cuda', dtype=torch.bfloat16)
-    elif args.amp and cuda:
-        amp = lambda: torch.autocast('cuda', dtype=torch.float16)
-    else:
-        amp = contextlib.nullcontext
-
-    tokenizer, style_ids = build_tokenizer()
-
-    fck = torch.load(args.factual_ckpt, map_location=device)
-    factual = FactualCaptioner(fck.get('t5_ckpt', 'csebuetnlp/banglat5'),
-                               fck.get('clip_dim', 768)).to(device)
-    factual.t5.resize_token_embeddings(len(tokenizer))
-    load_compatible(factual, fck['model'])
-    factual.eval()
-
-    sck = torch.load(args.style_ckpt, map_location=device)
-    style = StyleModel(sck.get('t5_ckpt', 'csebuetnlp/banglat5'),
-                       sck['clip_dim'], sck.get('prefix_len', 10),
-                       vocab_size=len(tokenizer)).to(device)
-    load_compatible(style, sck['model'])
-    style.eval()
-    print(f"[ckpt] factual epoch {fck.get('epoch',-1)+1}, "
-          f"style '{sck.get('style')}' epoch {sck.get('epoch',-1)+1}")
-
-    sid_desired = style_ids[args.style]
-    sid_undesired = style_ids['factual']       # paper: factual is the undesired
-    print(f"desired <{args.style}>={sid_desired}   undesired <factual>={sid_undesired}")
-
-    ids_all, refs = test_images(args.test_file, args.n_images)
-    simg = torch.load(args.style_img_pt, map_location='cpu')
-    lut = {k: i for i, k in enumerate(simg['ids'])}
-
+    ws = [float(x) for x in a.w.split(',')]
+    ids_all, refs = test_images(a.test_file, a.n_images)
     keep = [i for i in ids_all
-            if i in lut and os.path.exists(os.path.join(args.cache_dir, f"{i}.pt"))]
-    dropped = len(ids_all) - len(keep)
-    if dropped:
-        print(f"[WARN] {dropped} test images lack a patch cache or an "
-              f"NLLB-CLIP embedding and were skipped")
+            if os.path.exists(os.path.join(a.cache_dir, f"{i}.pt"))]
+    img_emb = torch.load(a.style_img_pt, map_location='cpu')
+    lut = {k: v for k, v in zip(img_emb['ids'], img_emb['emb'].float())}
+    keep = [i for i in keep if i in lut]
     print(f"\ndecoding {len(keep)} images, w = {ws}\n")
 
-    records = {i: {"image_id": i, "references": refs[i]} for i in keep}
-
-    for s in range(0, len(keep), args.batch_size):
-        chunk = keep[s:s + args.batch_size]
-        feats = torch.stack([
-            torch.load(os.path.join(args.cache_dir, f"{i}.pt"),
-                       map_location='cpu') for i in chunk]).to(device)
-        clip_emb = torch.stack([simg['emb'][lut[i]] for i in chunk]).to(device)
-        clip_emb = clip_emb / clip_emb.norm(2, dim=-1, keepdim=True).clamp(min=1e-6)
-
+    rec = {i: {"image_id": i, "references": refs[i]} for i in keep}
+    for s in range(0, len(keep), a.batch_size):
+        ch = keep[s:s + a.batch_size]
+        feats = torch.stack([torch.load(os.path.join(a.cache_dir, f"{i}.pt"),
+                                        map_location='cpu').float() for i in ch]).to(dev)
+        ce = noise_injection(torch.stack([lut[i] for i in ch]).to(dev), 0.0, True)
         for w in ws:
-            txts = guided_beam_search(
-                factual, style, feats, clip_emb, sid_desired, sid_undesired,
-                tokenizer, w, num_beams=args.beam_size,
-                max_new_tokens=args.max_new, amp=amp)
-            key = "factual" if w == 0.0 else f"{args.style}_w{w:g}"
-            for img, t in zip(chunk, txts):
-                records[img][key] = t
+            out = guided_beam(fac, sty, feats, ce, sid[style], sid['factual'],
+                              tok, w, a.beams, a.max_new)
+            for i, t in zip(ch, out):
+                rec[i][f"w{w}"] = t
+        print(f"  {min(s+a.batch_size, len(keep))}/{len(keep)}", flush=True)
 
-        print(f"  {min(s+args.batch_size, len(keep))}/{len(keep)}", flush=True)
-
-    out = [records[i] for i in keep]
-    with open(args.out_json, 'w', encoding='utf-8') as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-
-    for rec in out[:5]:
-        print(f"\n{rec['image_id']}.jpg")
-        print(f"  [ref]      {rec['references'][0]}")
+    out = [rec[i] for i in keep]
+    json.dump(out, open(a.out_json, 'w', encoding='utf-8'),
+              ensure_ascii=False, indent=2)
+    for r in out[:5]:
+        print(f"\n{r['image_id']}.jpg\n  [ref]  {r['references'][0]}")
         for w in ws:
-            key = "factual" if w == 0.0 else f"{args.style}_w{w:g}"
-            print(f"  [w={w:<4g}]  {rec[key]}")
-
-    print(f"\nwrote {args.out_json} ({len(out)} images)")
-    print("Pick w from the sweep the way the paper does (Fig. 5): raise it "
-          "until style accuracy passes ~90%, then stop — CIDEr falls "
-          "monotonically as w rises, so the smallest w that reaches the style "
-          "is the right one.")
+            print(f"  [w={w:<5}] {r[f'w{w}']}")
+    print(f"\nwrote {a.out_json} ({len(out)} images)")
 
 
 if __name__ == '__main__':
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument('--factual_ckpt', default='/kaggle/working/p2_factual/best')
+    p.add_argument('--style_ckpt',   default='/kaggle/working/p2_style_romantic/best_model.pth')
+    p.add_argument('--cache_dir',    default='/kaggle/working/clip_feature_cache')
+    p.add_argument('--style_img_pt', default='/kaggle/working/style_feats/test_images.pt')
+    p.add_argument('--test_file',    default='/kaggle/working/splits/factual_test.txt')
+    p.add_argument('--out_json',     default='/kaggle/working/p2_generations.json')
+    p.add_argument('--n_images', type=int, default=50)
+    p.add_argument('--batch_size', type=int, default=8)
+    p.add_argument('--beams', type=int, default=5)
+    p.add_argument('--max_new', type=int, default=40)
+    p.add_argument('--w', default='0,1,2,3,5,8')
+    main(p.parse_args())
