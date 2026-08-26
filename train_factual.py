@@ -1,4 +1,5 @@
 """
+train_factual.py — the factual captioner. No style anything.
 
 
     python train_factual.py \
@@ -65,12 +66,20 @@ def set_stage(model, stage, args):
         for p in model.projector.parameters():  p.requires_grad = True
         if hasattr(model.t5, 'lm_head'):
             for p in model.t5.lm_head.parameters(): p.requires_grad = False
-        groups = [{'params': list(model.t5.encoder.parameters()), 'lr': args.lr},
-                  {'params': list(model.projector.parameters()),  'lr': args.lr_proj}]
+        # the embedding is TIED across encoder/decoder/lm_head, so freezing
+        # lm_head also freezes encoder.embed_tokens. Filter it out or AdamW is
+        # handed a frozen tensor and the printed count is wrong by ~24.7M.
+        groups = [{'params': [p for p in model.t5.encoder.parameters()
+                              if p.requires_grad], 'lr': args.lr},
+                  {'params': [p for p in model.projector.parameters()
+                              if p.requires_grad], 'lr': args.lr_proj}]
     else:
         for p in model.parameters():            p.requires_grad = True
-        groups = [{'params': list(model.t5.parameters()),        'lr': args.lr_stage2},
-                  {'params': list(model.projector.parameters()), 'lr': args.lr_stage2 * 4}]
+        # stage 2 IS the original configuration -- same LRs as the run that
+        # reached val 3.2898. Nothing about the optimizer changes here, so
+        # --stage1_epochs 0 gives exactly that run back.
+        groups = [{'params': list(model.t5.parameters()),        'lr': args.lr},
+                  {'params': list(model.projector.parameters()), 'lr': args.lr_proj}]
     opt = torch.optim.AdamW(groups, weight_decay=0.01)
     n = sum(p.numel() for g in groups for p in g['params']) / 1e6
     print(f"[stage {stage}] training {n:.1f}M parameters "
