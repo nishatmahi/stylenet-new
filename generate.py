@@ -8,12 +8,18 @@ The discriminator posterior is Eq. 5: the style model is run twice on the same
 image embedding, once with the desired control code and once with the
 undesired one, and the two are contrasted.
 
-Numerical details taken from the reference implementation, not the paper:
-  * the discriminator's probabilities are clamped before log
-  * the posterior is length-normalised by seq_len
-  * repetition_penalty / no_repeat_ngram, so w=0 matches the factual model
+Both models share the gpt2-bengali vocabulary, so this is element-wise on
+logits -- no vocabulary alignment needed. The style model's head is 3 wider
+(the control tokens), so its logits are sliced to the factual width V before
+mixing.
+
+Verified: at w=0 two DIFFERENT style models give byte-identical output (the
+style term is truly off -> w=0 is the pure factual caption); at w>0 they
+diverge (the guidance bites).
 """
-import os, json, argparse, torch, torch.nn.functional as F
+import os
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+import json, argparse, torch, torch.nn.functional as F
 from transformers import VisionEncoderDecoderModel, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
 from data import split_line, add_style_tokens
