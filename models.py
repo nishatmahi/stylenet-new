@@ -9,20 +9,7 @@ models.py — the two models of PPCap, both on gpt2-bengali.
                   [style token] ++ MLP(CLIP embedding), prepended to the
                   caption's token embeddings inside GPT-2.
 
-Both use the SAME gpt2-bengali tokenizer, so guided decoding in generate.py is
-element-wise on logits. PPCap had to zero out mismatched vocabulary between its
-discriminator and factual model (Sec 4.3); sharing the decoder removes that.
 
-Four traps this file avoids, all found by running it:
-  1. "openai/clip-vit-base-patch32" is the FULL CLIP (vision+text) and its
-     CLIPConfig has no .hidden_size -> AttributeError in
-     VisionEncoderDecoderModel.__init__. A vision-only config is required.
-     Since cached features are always passed as encoder_outputs the encoder is
-     never executed, so it is built from config -- no download, no wasted VRAM.
-  2. generate() reads model.generation_config, NOT model.config. Setting only
-     m.config leaves eos/pad None and generate() dies with IndexError.
-  3. num_attention_heads must divide hidden_size.
-  4. ppcap_loss must not materialise the logits twice -- see seq_logprob.
 """
 import torch, torch.nn as nn, torch.nn.functional as F
 from transformers import (AutoTokenizer, GPT2LMHeadModel,
