@@ -1,9 +1,6 @@
 """Verification harness for guided_beam_search. Not part of the pipeline.
 
-Checks the three things most likely to be wrong in a hand-written beam search
-with two auxiliary models: the beam/token index algebra, that w=0 reduces
-exactly to plain beam search over the factual model, and that a confident
-style model actually moves the output when w > 0.
+
 """
 import sys, types, math, itertools
 import torch
