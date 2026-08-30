@@ -1,9 +1,9 @@
 """
-data.py — datasets for both models.
+data.py — CaptionData (factual, unchanged) + StyleData (now text-only).
 
-  CaptionData   (image features, factual caption)                -> factual
-  StyleData     (CLIP text embedding, styled text, style token)  -> style
-
+StyleData reads plain text: the style corpus and the factual text corpus, each
+one caption per line. No image, no CLIP embedding. That is the whole point of a
+text-only discriminator, and it is why unpaired data is all it ever needs.
 """
 import os, torch
 from torch.utils.data import Dataset
@@ -21,7 +21,6 @@ def add_style_tokens(tok):
 
 
 def encode_with_eos(tok, text, max_len):
-    """ids, attention mask, labels -- with a real EOS the model can learn."""
     ids = tok(text, max_length=max_len - 1, truncation=True)["input_ids"]
     ids = ids + [tok.eos_token_id]
     attn = [1] * len(ids)
@@ -53,8 +52,22 @@ def read_lines(p):
     return [l.strip() for l in open(p, encoding='utf-8') if l.strip()]
 
 
+def read_style_lines(p):
+    """One caption per line. Tolerates an optional leading 'id<TAB>' by keeping
+    only the text after the first tab; plain lines are kept whole."""
+    out = []
+    for l in open(p, encoding='utf-8'):
+        l = l.rstrip('\n')
+        if '\t' in l:
+            l = l.split('\t', 1)[1]
+        l = l.strip()
+        if l:
+            out.append(l)
+    return out
+
+
 class CaptionData(Dataset):
-    """One row per (image, caption). Rows for an image are consecutive."""
+    """One row per (image, caption). UNCHANGED."""
 
     def __init__(self, cache_dir, path, tok, max_len=48):
         self.cache, self.tok, self.max_len = cache_dir, tok, max_len
@@ -74,7 +87,6 @@ class CaptionData(Dataset):
               f"{sum(seen.values())} images")
 
     def distinct_images(self, k):
-        """First k DISTINCT images -- features and ids, aligned."""
         seen, feats, ids = set(), [], []
         for img, _ in self.rows:
             if img in seen:
@@ -103,48 +115,34 @@ class CaptionData(Dataset):
 
 
 class StyleData(Dataset):
-    """Styled text + the factual text corpus, each tagged with its control code.
+    """Style corpus (label 1, its own code) + factual text corpus (label 0,
+    <factual>). Text only; no image ever loaded."""
 
-    The CLIP embedding is the TEXT tower's output at training time; at
-    inference the IMAGE tower's output goes in the same slot. Both come from
-    the same NLLB-CLIP model, which is what makes the substitution valid.
-    """
-
-    def __init__(self, style_pt, factual_pt, style, tok, sid, max_len=48,
+    def __init__(self, style_file, factual_file, style, tok, sid, max_len=48,
                  ratio=1.0, seed=0):
-        """ratio: how many factual lines to keep per style line. Your factual
-        text corpus is ~4.8x the style corpus; left unbalanced the generative
-        half of the loss is dominated by factual text and the control code
-        gets weak. PPCap trains on a balanced FlickrStyle10k. ratio=1.0
-        matches that -- and cuts the epoch to a fraction of the time."""
         self.tok, self.max_len = tok, max_len
         self.rows = []
-        d = torch.load(style_pt, map_location='cpu')
-        s_emb, s_lines = d['emb'].float(), d['lines']
-        assert len(s_emb) == len(s_lines), f"{style_pt}: {len(s_emb)} vs {len(s_lines)}"
-        for e, t in zip(s_emb, s_lines):
-            self.rows.append((e, t, sid[style], 1))
+        s_lines = read_style_lines(style_file)
+        for t in s_lines:
+            self.rows.append((t, sid[style], 1))
 
-        d = torch.load(factual_pt, map_location='cpu')
-        f_emb, f_lines = d['emb'].float(), d['lines']
-        assert len(f_emb) == len(f_lines), f"{factual_pt}: {len(f_emb)} vs {len(f_lines)}"
+        f_lines = read_style_lines(factual_file)
         keep = min(len(f_lines), int(round(len(s_lines) * ratio))) if ratio > 0 \
             else len(f_lines)
         idx = torch.randperm(len(f_lines),
                              generator=torch.Generator().manual_seed(seed))[:keep]
         for j in idx.tolist():
-            self.rows.append((f_emb[j], f_lines[j], sid['factual'], 0))
+            self.rows.append((f_lines[j], sid['factual'], 0))
         if keep < len(f_lines):
             print(f"[data] factual text subsampled {len(f_lines)} -> {keep} "
                   f"(ratio {ratio} : 1 vs {len(s_lines)} {style})")
-        print(f"[data] style set: {sum(r[3] for r in self.rows)} {style} + "
-              f"{sum(1-r[3] for r in self.rows)} factual = {len(self.rows)} rows, "
-              f"dim {self.rows[0][0].numel()}")
+        print(f"[data] style set: {sum(r[2] for r in self.rows)} {style} + "
+              f"{sum(1 - r[2] for r in self.rows)} factual = {len(self.rows)} rows")
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, i):
-        emb, text, sid, is_style = self.rows[i]
+        text, sid, is_style = self.rows[i]
         ids, attn, _ = encode_with_eos(self.tok, text, self.max_len)
-        return emb, ids, attn, torch.tensor(sid), torch.tensor(is_style)
+        return ids, attn, torch.tensor(sid), torch.tensor(is_style)
