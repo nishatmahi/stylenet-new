@@ -4,13 +4,6 @@ data.py — datasets for both models.
   CaptionData   (image features, factual caption)                -> factual
   StyleData     (CLIP text embedding, styled text, style token)  -> style
 
-The style side never sees an image during training. That is the whole point.
-
-EOS handling: gpt2-bengali has bos == eos == pad == token 0, and GPT-2's
-tokenizer never appends EOS (tokenization_gpt2.py:229). Masking labels by
-`lab == pad_token_id` would therefore erase the stop token too, and the model
-would never learn to finish a sentence. So EOS is appended explicitly and
-labels are masked from the ATTENTION MASK, not from the token id.
 """
 import os, torch
 from torch.utils.data import Dataset
