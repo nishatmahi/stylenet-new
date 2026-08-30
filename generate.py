@@ -1,21 +1,13 @@
 """
-generate.py — step 3. The two models meet, only here.
+generate.py — guided decoding with a TEXT-ONLY style discriminator.
 
-    P(y_t | s, x, y_<t)  is proportional to  P(y_t | x, y_<t) * P(s | x, y_<t, y_t)^w
-                                             ^factual model    ^style discriminator
+    P(y_t | s, x, y_<t)  ∝  P(y_t | x, y_<t) * P(s | y_<t, y_t)^w
+                            ^factual (image)   ^style discriminator (text only)
 
-The discriminator posterior is Eq. 5: the style model is run twice on the same
-image embedding, once with the desired control code and once with the
-undesired one, and the two are contrasted.
-
-Both models share the gpt2-bengali vocabulary, so this is element-wise on
-logits -- no vocabulary alignment needed. The style model's head is 3 wider
-(the control tokens), so its logits are sliced to the factual width V before
-mixing.
-
-Verified: at w=0 two DIFFERENT style models give byte-identical output (the
-style term is truly off -> w=0 is the pure factual caption); at w>0 they
-diverge (the guidance bites).
+The discriminator no longer takes any image. It is run twice on the running
+token sequence, once with the desired code and once with <factual>, and the two
+are contrasted (PPCap Eq. 5). The first generated token is factual-only so the
+caption anchors on the image before style is applied.
 """
 import os
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
@@ -23,7 +15,7 @@ import json, argparse, torch, torch.nn.functional as F
 from transformers import VisionEncoderDecoderModel, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
 from data import split_line, add_style_tokens
-from models import StyleModel, noise_injection
+from models import StyleModel
 
 P_FLOOR, P_CEIL = 1e-3, 0.8
 
@@ -48,19 +40,16 @@ def block_repeats(logits, ys, n, penalty):
 
 
 @torch.no_grad()
-def guided_beam(fac, sty, feats, clip_emb, sid_d, sid_u, tok, w,
+def guided_beam(fac, sty, feats, sid_d, sid_u, tok, w,
                 num_beams=5, max_new=40, rep=1.15, nrng=3):
     dev = feats.device
     B, K = feats.size(0), num_beams
-    # the factual model's real output width. The style model's is 3 larger
-    # (the control tokens), so its logits are sliced to V before mixing.
     V = fac.decoder.get_output_embeddings().weight.size(0)
     bos = fac.config.decoder_start_token_id
     eos = fac.config.eos_token_id
     pad = fac.config.pad_token_id
 
     enc = BaseModelOutput(last_hidden_state=feats.repeat_interleave(K, 0))
-    ce = clip_emb.repeat_interleave(K, 0)
     d_ids = torch.full((B * K,), sid_d, dtype=torch.long, device=dev)
     u_ids = torch.full((B * K,), sid_u, dtype=torch.long, device=dev)
 
@@ -76,9 +65,10 @@ def guided_beam(fac, sty, feats, clip_emb, sid_d, sid_u, tok, w,
         t = step + 1
         lf = F.log_softmax(fac(encoder_outputs=enc, decoder_input_ids=ys
                                ).logits[:, -1, :].float(), -1)
-        if w != 0.0:
-            ld = clamped_logprobs(sty.step_logits(ce, d_ids, ys)[:, :V])
-            lu = clamped_logprobs(sty.step_logits(ce, u_ids, ys)[:, :V])
+        styling = (w != 0.0) and (step > 0)   # first token: factual-only
+        if styling:
+            ld = clamped_logprobs(sty.step_logits(d_ids, ys)[:, :V])
+            lu = clamped_logprobs(sty.step_logits(u_ids, ys)[:, :V])
             a_d = (ll_d.unsqueeze(1) + ld) / t
             a_u = (ll_u.unsqueeze(1) + lu) / t
             post = F.log_softmax(torch.stack([a_d, a_u], -1), -1)[..., 0]
@@ -97,10 +87,13 @@ def guided_beam(fac, sty, feats, clip_emb, sid_d, sid_u, tok, w,
         ys = torch.cat([ys[flat], ft.unsqueeze(1)], 1)
         scores = top.view(-1)
         done = done[flat] | (ft == eos)
-        if w != 0.0:
+        if styling:
             sel = ft.unsqueeze(1)
             ll_d = ll_d[flat] + ld[flat].gather(1, sel).squeeze(1)
             ll_u = ll_u[flat] + lu[flat].gather(1, sel).squeeze(1)
+        else:
+            ll_d = ll_d[flat]
+            ll_u = ll_u[flat]
         if done.all():
             break
 
@@ -132,7 +125,7 @@ def main(a):
 
     fac = VisionEncoderDecoderModel.from_pretrained(a.factual_ckpt).to(dev).eval()
     ck = torch.load(a.style_ckpt, map_location=dev)
-    sty = StyleModel(ck['clip_dim'], tok, prefix_len=ck['prefix_len']).to(dev)
+    sty = StyleModel(tok).to(dev)
     sty.load_state_dict(ck['model']); sty.eval()
     style = ck['style']
     print(f"[ckpt] factual {a.factual_ckpt}   style '{style}'")
@@ -142,9 +135,6 @@ def main(a):
     ids_all, refs = test_images(a.test_file, a.n_images)
     keep = [i for i in ids_all
             if os.path.exists(os.path.join(a.cache_dir, f"{i}.pt"))]
-    img_emb = torch.load(a.style_img_pt, map_location='cpu')
-    lut = {k: v for k, v in zip(img_emb['ids'], img_emb['emb'].float())}
-    keep = [i for i in keep if i in lut]
     print(f"\ndecoding {len(keep)} images, w = {ws}\n")
 
     rec = {i: {"image_id": i, "references": refs[i]} for i in keep}
@@ -152,9 +142,8 @@ def main(a):
         ch = keep[s:s + a.batch_size]
         feats = torch.stack([torch.load(os.path.join(a.cache_dir, f"{i}.pt"),
                                         map_location='cpu').float() for i in ch]).to(dev)
-        ce = noise_injection(torch.stack([lut[i] for i in ch]).to(dev), 0.0, True)
         for w in ws:
-            out = guided_beam(fac, sty, feats, ce, sid[style], sid['factual'],
+            out = guided_beam(fac, sty, feats, sid[style], sid['factual'],
                               tok, w, a.beams, a.max_new)
             for i, t in zip(ch, out):
                 rec[i][f"w{w}"] = t
@@ -175,12 +164,11 @@ if __name__ == '__main__':
     p.add_argument('--factual_ckpt', default='/kaggle/working/p2_factual/best')
     p.add_argument('--style_ckpt',   default='/kaggle/working/p2_style_romantic/best_model.pth')
     p.add_argument('--cache_dir',    default='/kaggle/working/clip_feature_cache')
-    p.add_argument('--style_img_pt', default='/kaggle/working/style_feats/test_images.pt')
     p.add_argument('--test_file',    default='/kaggle/working/splits/factual_test.txt')
-    p.add_argument('--out_json',     default='/kaggle/working/p2_generations.json')
+    p.add_argument('--out_json',     default='/kaggle/working/ppcap_romantic.json')
     p.add_argument('--n_images', type=int, default=50)
     p.add_argument('--batch_size', type=int, default=8)
     p.add_argument('--beams', type=int, default=5)
     p.add_argument('--max_new', type=int, default=40)
-    p.add_argument('--w', default='0,1,2,3,5,8')
+    p.add_argument('--w', default='0,2,4,6,8,10')
     main(p.parse_args())
