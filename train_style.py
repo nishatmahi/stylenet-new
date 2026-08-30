@@ -1,17 +1,7 @@
 """
 train_style.py — step 2. The style discriminator.
 
-Trained ONLY on unpaired text: your style corpus plus the factual text corpus
-as its contrast class. Never sees an image. The CLIP TEXT embedding stands in
-for the image embedding, with noise to bridge the modality gap (paper Sec 3.3).
 
-    L = lam * L_g + (1 - lam) * L_d,  lam = 0.8, variance = 0.016
-
-Memory: ppcap_loss runs TWO forwards per step (true code + flipped) and keeps
-both graphs. At batch 64 the lm_head output alone is 64 x 59 x 50259 x 4 =
-724 MiB per forward, which OOMs a T4 -- especially while the factual run is
-holding the same GPU. So the default is micro-batch 16 with 4-step gradient
-accumulation: same effective batch of 64, a quarter of the peak memory.
 """
 import os
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
