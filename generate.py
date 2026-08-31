@@ -1,10 +1,11 @@
 """
-generate.py — factual model's OWN generate() + a GeDi style LogitsProcessor.
-Decoding, EOS, and min/max length are HuggingFace's; the text-only style
-discriminator enters only as a logits processor that adds w * log P(style | tokens).
+generate.py — factual model's own generate() + a memory-light GeDi LogitsProcessor.
+The processor computes only the NEXT-token style distribution (last position),
+so it never materialises full-sequence vocab logits.
 """
 import os
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 import json, argparse, torch, torch.nn.functional as F
 from transformers import (VisionEncoderDecoderModel, AutoTokenizer,
                           LogitsProcessor, LogitsProcessorList)
@@ -16,9 +17,8 @@ P_FLOOR, P_CEIL = 1e-3, 0.8
 
 
 class GeDiProcessor(LogitsProcessor):
-    """Adds w * log P(desired style | sequence so far, next token) to the factual
-    log-probs. Stateless, recomputed from the whole decoder sequence each step.
-    The first generated token is left to the factual model (skip_first)."""
+    """Adds w * log P(desired style | next token) to the factual log-probs.
+    Uses only the last-position next-token distribution, so it is cheap."""
 
     def __init__(self, sty, code_d, code_u, w, V, skip_first=True):
         self.sty, self.cd, self.cu, self.w, self.V = sty, code_d, code_u, w, V
@@ -35,20 +35,14 @@ class GeDiProcessor(LogitsProcessor):
 
         def branch(code_id):
             code = torch.full((B, 1), code_id, dtype=torch.long, device=dev)
-            seq = torch.cat([code, input_ids], dim=1)
-            logits = self.sty.gpt(input_ids=seq).logits[:, :, :self.V].float()
-            lp = torch.log(torch.softmax(logits, -1).clamp(P_FLOOR, P_CEIL))
-            prefix = lp[:, :L, :].gather(-1, input_ids.unsqueeze(-1)).squeeze(-1)
-            ll = prefix.sum(1)
-            nxt = lp[:, L, :]
-            return ll, nxt
+            seq = torch.cat([code, input_ids], dim=1)                     # [B, L+1]
+            h = self.sty.gpt.transformer(input_ids=seq).last_hidden_state[:, -1, :]  # [B, d]
+            logits = self.sty.gpt.lm_head(h)[:, :self.V].float()          # [B, V] only
+            return torch.log(torch.softmax(logits, -1).clamp(P_FLOOR, P_CEIL))
 
-        ll_d, ld = branch(self.cd)
-        ll_u, lu = branch(self.cu)
-        t = L + 1
-        a_d = (ll_d.unsqueeze(1) + ld) / t
-        a_u = (ll_u.unsqueeze(1) + lu) / t
-        post = F.log_softmax(torch.stack([a_d, a_u], -1), -1)[..., 0]
+        ld = branch(self.cd)
+        lu = branch(self.cu)
+        post = F.log_softmax(torch.stack([ld, lu], -1), -1)[..., 0]       # [B, V]
         out = scores.clone()
         out[:, :self.V] = out[:, :self.V] + self.w * post
         return out
@@ -108,6 +102,7 @@ def main(a):
             )
             for i, t in zip(ch, tok.batch_decode(gen, skip_special_tokens=True)):
                 rec[i][f"w{w}"] = t
+        torch.cuda.empty_cache()
         print(f"  {min(s+a.batch_size, len(keep))}/{len(keep)}", flush=True)
 
     out = [rec[i] for i in keep]
@@ -127,7 +122,7 @@ if __name__ == '__main__':
     p.add_argument('--test_file',    default='/kaggle/working/splits/factual_test.txt')
     p.add_argument('--out_json',     default='/kaggle/working/test_final.json')
     p.add_argument('--n_images', type=int, default=20)
-    p.add_argument('--batch_size', type=int, default=8)
+    p.add_argument('--batch_size', type=int, default=4)
     p.add_argument('--beams', type=int, default=4)
     p.add_argument('--min_new', type=int, default=8)
     p.add_argument('--max_new', type=int, default=40)
