@@ -1,131 +1,50 @@
-"""
-generate.py — factual model's own generate() + a memory-light GeDi LogitsProcessor.
-The processor computes only the NEXT-token style distribution (last position),
-so it never materialises full-sequence vocab logits.
-"""
-import os
-os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-import json, argparse, torch, torch.nn.functional as F
-from transformers import (VisionEncoderDecoderModel, AutoTokenizer,
-                          LogitsProcessor, LogitsProcessorList)
-from transformers.modeling_outputs import BaseModelOutput
-from data import split_line, add_style_tokens
-from models import StyleModel
-
-P_FLOOR, P_CEIL = 1e-3, 0.8
-
-
-class GeDiProcessor(LogitsProcessor):
-    """Adds w * log P(desired style | next token) to the factual log-probs.
-    Uses only the last-position next-token distribution, so it is cheap."""
-
-    def __init__(self, sty, code_d, code_u, w, V, skip_first=True):
-        self.sty, self.cd, self.cu, self.w, self.V = sty, code_d, code_u, w, V
-        self.skip_first = skip_first
-
-    @torch.no_grad()
-    def __call__(self, input_ids, scores):
-        if self.w == 0:
-            return scores
-        B, L = input_ids.shape
-        if self.skip_first and L <= 1:
-            return scores
-        dev = input_ids.device
-
-        def branch(code_id):
-            code = torch.full((B, 1), code_id, dtype=torch.long, device=dev)
-            seq = torch.cat([code, input_ids], dim=1)                     # [B, L+1]
-            h = self.sty.gpt.transformer(input_ids=seq).last_hidden_state[:, -1, :]  # [B, d]
-            logits = self.sty.gpt.lm_head(h)[:, :self.V].float()          # [B, V] only
-            return torch.log(torch.softmax(logits, -1).clamp(P_FLOOR, P_CEIL))
-
-        ld = branch(self.cd)
-        lu = branch(self.cu)
-        post = F.log_softmax(torch.stack([ld, lu], -1), -1)[..., 0]       # [B, V]
-        out = scores.clone()
-        out[:, :self.V] = out[:, :self.V] + self.w * post
-        return out
-
-
-def test_images(path, limit):
-    order, refs = [], {}
-    for ln in open(path, encoding='utf-8'):
-        p = split_line(ln.strip())
-        if not p or not p[1]:
-            continue
-        img, cap = p
-        if img not in refs:
-            if len(order) >= limit:
-                continue
-            order.append(img); refs[img] = []
-        refs[img].append(cap)
-    return order, refs
-
+import os, json, argparse, torch
+from stage1 import (StyleCaptioner, build_tokenizer, add_style_tokens,
+                    read_lines, split_line, unit)
 
 def main(a):
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    tok = AutoTokenizer.from_pretrained(a.factual_ckpt)
-    sid = add_style_tokens(tok)
-
-    fac = VisionEncoderDecoderModel.from_pretrained(a.factual_ckpt).to(dev).eval()
-    ck = torch.load(a.style_ckpt, map_location=dev)
-    sty = StyleModel(tok).to(dev)
-    sty.load_state_dict(ck['model']); sty.eval()
-    style = ck['style']
-    V = fac.decoder.get_output_embeddings().weight.size(0)
-    print(f"[ckpt] factual {a.factual_ckpt}   style '{style}'   V={V}")
-
-    ws = [float(x) for x in a.w.split(',')]
-    ids_all, refs = test_images(a.test_file, a.n_images)
-    keep = [i for i in ids_all
-            if os.path.exists(os.path.join(a.cache_dir, f"{i}.pt"))]
-    print(f"\ndecoding {len(keep)} images, w = {ws}\n")
-
-    rec = {i: {"image_id": i, "references": refs[i]} for i in keep}
-    for s in range(0, len(keep), a.batch_size):
-        ch = keep[s:s + a.batch_size]
-        feats = torch.stack([torch.load(os.path.join(a.cache_dir, f"{i}.pt"),
-                                        map_location='cpu').float() for i in ch]).to(dev)
-        enc = BaseModelOutput(last_hidden_state=feats)
-        for w in ws:
-            proc = LogitsProcessorList([GeDiProcessor(sty, sid[style], sid['factual'], w, V)])
-            gen = fac.generate(
-                encoder_outputs=enc,
-                num_beams=a.beams,
-                min_new_tokens=a.min_new,
-                max_new_tokens=a.max_new,
-                no_repeat_ngram_size=3,
-                early_stopping=True,
-                length_penalty=1.0,
-                logits_processor=proc,
-            )
-            for i, t in zip(ch, tok.batch_decode(gen, skip_special_tokens=True)):
-                rec[i][f"w{w}"] = t
-        torch.cuda.empty_cache()
-        print(f"  {min(s+a.batch_size, len(keep))}/{len(keep)}", flush=True)
-
-    out = [rec[i] for i in keep]
-    json.dump(out, open(a.out_json, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
-    for r in out[:6]:
-        print(f"\n{r['image_id']}.jpg\n  [ref]  {r['references'][0]}")
-        for w in ws:
-            print(f"  [w={w:<5}] {r[f'w{w}']}")
-    print(f"\nwrote {a.out_json} ({len(out)} images)")
-
+    tok = build_tokenizer(); sid = add_style_tokens(tok)
+    ck = torch.load(a.ckpt, map_location='cpu')
+    model = StyleCaptioner(ck['clip_dim'], tok, ck['prefix_len']).to(dev)
+    model.load_state_dict(ck['model']); model.eval()
+    offset = ck.get('offset', None)
+    timg = torch.load(a.test_img, map_location='cpu')
+    temb = {i: e.float() for i,e in zip(timg['ids'], timg['emb'])}
+    order, refs = [], {}
+    for ln in read_lines(a.test_cap):
+        p = split_line(ln)
+        if not p or not p[1]: continue
+        img, cap = p
+        if img in temb: refs.setdefault(img, []).append(cap)
+        if img in temb and img not in order: order.append(img)
+        if a.n_images and len(order) >= a.n_images: break
+    out = {}
+    for s in range(0, len(order), a.batch_size):
+        ch = order[s:s+a.batch_size]
+        e = unit(torch.stack([temb[i] for i in ch]))
+        if offset is not None and a.style != 'factual': e = unit(e - offset)
+        e = e.to(dev)
+        code = torch.full((e.size(0),), sid[a.style], device=dev)
+        outs = model.generate(e, code, max_new=a.max_new, eos_id=tok.eos_token_id)
+        for i, o in zip(ch, outs):
+            out[i] = {'image_id': i, 'references': refs[i],
+                      a.style: tok.decode(o, skip_special_tokens=True)}
+        print(' ', min(s+a.batch_size,len(order)),'/',len(order), flush=True)
+    json.dump(list(out.values()), open(a.out_json,'w',encoding='utf-8'),
+              ensure_ascii=False, indent=2)
+    for r in list(out.values())[:5]:
+        print('\n', r['image_id']); print('  ref ', r['references'][0]); print('  gen ', r[a.style])
+    print('wrote', a.out_json, len(out), 'images', flush=True)
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--factual_ckpt', default='/kaggle/working/p2_factual/best')
-    p.add_argument('--style_ckpt',   default='/kaggle/working/p2_style_romantic/best_model.pth')
-    p.add_argument('--cache_dir',    default='/kaggle/working/clip_feature_cache')
-    p.add_argument('--test_file',    default='/kaggle/working/splits/factual_test.txt')
-    p.add_argument('--out_json',     default='/kaggle/working/test_final.json')
-    p.add_argument('--n_images', type=int, default=20)
-    p.add_argument('--batch_size', type=int, default=4)
-    p.add_argument('--beams', type=int, default=4)
-    p.add_argument('--min_new', type=int, default=8)
-    p.add_argument('--max_new', type=int, default=40)
-    p.add_argument('--w', default='0,30,40')
-    args, _ = p.parse_known_args()
-    main(args)
+    p.add_argument('--ckpt', required=True)
+    p.add_argument('--style', default='romantic', choices=['factual','romantic','humorous'])
+    p.add_argument('--test_img', default='/kaggle/working/style_feats/test_images.pt')
+    p.add_argument('--test_cap', default='/kaggle/working/splits/factual_test.txt')
+    p.add_argument('--out_json', required=True)
+    p.add_argument('--n_images', type=int, default=100)
+    p.add_argument('--batch_size', type=int, default=8)
+    p.add_argument('--max_new', type=int, default=120)
+    a, _ = p.parse_known_args(); main(a)
