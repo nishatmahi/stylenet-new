@@ -1,8 +1,4 @@
-# evaluate.py  (v2 - the correct one)
-# Reference-free, no-API evaluation for one style.
-#   CLIPScore  -> does the caption match the image    (higher better)
-#   Style acc  -> does it sound like the target style (higher better, %)
-#   Perplexity -> is it fluent Bangla                 (LOWER better)
+# evaluate.py  (THE WORKING ONE - prints "=== evaluate.py v2 ===")
 import os, sys, json, argparse, torch
 import numpy as np
 
