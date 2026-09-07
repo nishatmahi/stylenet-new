@@ -1,11 +1,17 @@
-# evaluate.py  (THE WORKING ONE - prints "=== evaluate.py v2 ===")
-import os, sys, json, argparse, torch
+# evaluate.py  (v3 - BLEU-1, BLEU-3, CIDEr against aligned references + existing metrics)
+import os, sys, re, json, argparse, torch
 import numpy as np
 
 SPLITS = '/kaggle/working/splits'
 FEATS  = '/kaggle/working/style_feats'
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 ID_KEYS = {'image_id', 'image', 'id', 'img', 'file', 'filename', 'references', 'ref'}
+
+
+def strip_ext(n):
+    for e in ('.jpg', '.jpeg', '.png'):
+        if n.lower().endswith(e): return n[:-len(e)]
+    return n
 
 
 def load_preds(path, style=None):
@@ -31,6 +37,41 @@ def load_preds(path, style=None):
         if cap:
             pairs.append((iid, cap))
     return pairs
+
+
+def load_refs(style):
+    refs = {}
+    if style == 'factual':
+        r = re.compile(r'#\d*')
+        for line in open(f'{SPLITS}/factual_test.txt', encoding='utf-8'):
+            line = line.strip()
+            if not line: continue
+            parts = [x.strip() for x in r.split(line) if x.strip()]
+            if len(parts) < 2: continue
+            refs.setdefault(strip_ext(parts[0]), []).append(parts[1])
+    else:
+        for line in open(f'{SPLITS}/{style}_test_refs.txt', encoding='utf-8'):
+            line = line.rstrip('\n')
+            if '\t' not in line: continue
+            img, cap = line.split('\t', 1)
+            if cap.strip():
+                refs.setdefault(strip_ext(img.strip()), []).append(cap.strip())
+    return refs
+
+
+def bleu_cider(pairs, style):
+    from pycocoevalcap.bleu.bleu import Bleu
+    from pycocoevalcap.cider.cider import Cider
+    refs = load_refs(style)
+    gts, res = {}, {}
+    for iid, cap in pairs:
+        if iid in refs and refs[iid]:
+            gts[iid] = refs[iid]; res[iid] = [cap]
+    if not gts:
+        return None
+    b, _ = Bleu(4).compute_score(gts, res)
+    c, _ = Cider().compute_score(gts, res)
+    return b, c, len(gts)
 
 
 def clipscore(pairs):
@@ -90,7 +131,7 @@ def perplexity(pairs):
 
 
 if __name__ == '__main__':
-    print('=== evaluate.py v2 ===')
+    print('=== evaluate.py v3 ===')
     ap = argparse.ArgumentParser()
     ap.add_argument('--style', required=True)
     ap.add_argument('--pred',  required=True)
@@ -103,6 +144,14 @@ if __name__ == '__main__':
     if not pairs:
         print(f'0 captions found inside {a.pred}.')
         sys.exit(0)
+
+    bc = bleu_cider(pairs, a.style)
+    if bc:
+        b, c, nb = bc
+        print(f'BLEU-1 {b[0]*100:.1f}  BLEU-3 {b[2]*100:.1f}  CIDEr {c*100:.1f}   (over {nb} images)')
+    else:
+        print('BLEU/CIDEr: no matching references found')
+
     cs, n_cs = clipscore(pairs)
     print(f'CLIPScore   : {cs:.4f}   (higher better, over {n_cs} images)')
     if a.style != 'factual':
