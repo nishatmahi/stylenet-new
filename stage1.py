@@ -40,6 +40,26 @@ def encode_with_eos(tok, text, max_len):
 
 def unit(x): return x / x.norm(dim=-1, keepdim=True).clamp(min=1e-6)
 
+def reorder_past(past, idx):
+    # transformers has shipped three different KV-cache APIs; try them in order.
+    if past is None: return None
+    if isinstance(past, tuple):
+        return tuple(tuple(p.index_select(0, idx) for p in layer) for layer in past)
+    for fn in ('batch_select_indices', 'reorder_cache'):
+        if hasattr(past, fn):
+            getattr(past, fn)(idx); return past
+    from transformers.cache_utils import DynamicCache
+    legacy = tuple(tuple(p.index_select(0, idx) for p in layer) for layer in past.to_legacy_cache())
+    return DynamicCache.from_legacy_cache(legacy)
+
+def apply_rep(logits, seqs, rep):
+    if rep == 1.0: return
+    for i, s in enumerate(seqs):
+        if not s: continue
+        ix = torch.tensor(sorted(set(s)), device=logits.device)
+        v = logits[i, ix]
+        logits[i, ix] = torch.where(v > 0, v / rep, v * rep)
+
 class MLP(nn.Module):
     def __init__(self, in_dim, d_model, prefix_len):
         super().__init__(); out = d_model*prefix_len
@@ -70,9 +90,8 @@ class StyleCaptioner(nn.Module):
                             input_ids.masked_fill(attn_mask==0, -100)], 1)
         return self.gpt(inputs_embeds=e, attention_mask=full_mask, labels=labels).loss
     @torch.no_grad()
-    def generate(self, clip_emb, style_ids, max_new=120, eos_id=None, rep=1.2):
-        wte = self.gpt.transformer.wte; w = self.clip_project.net[0].weight
-        e = torch.cat([wte(style_ids).unsqueeze(1), self.clip_project(clip_emb.to(w.dtype))], dim=1)
+    def _greedy(self, e, max_new, eos_id, rep):
+        wte = self.gpt.transformer.wte
         B = e.size(0); dev = e.device
         ys = [[] for _ in range(B)]; done = torch.zeros(B, dtype=torch.bool, device=dev)
         past = None; inp = e
@@ -80,9 +99,7 @@ class StyleCaptioner(nn.Module):
             out = self.gpt(inputs_embeds=inp, past_key_values=past, use_cache=True)
             past = out.past_key_values
             logits = out.logits[:, -1, :].float()
-            for b in range(B):
-                for t in set(ys[b]):
-                    logits[b,t] = logits[b,t]/rep if logits[b,t]>0 else logits[b,t]*rep
+            apply_rep(logits, ys, rep)
             nxt = logits.argmax(-1)
             for b in range(B):
                 if not done[b]:
@@ -91,6 +108,42 @@ class StyleCaptioner(nn.Module):
             if done.all(): break
             inp = wte(nxt).unsqueeze(1)
         return ys
+
+    @torch.no_grad()
+    def generate(self, clip_emb, style_ids, max_new=120, eos_id=None, rep=1.2, beams=4, len_alpha=0.7):
+        wte = self.gpt.transformer.wte; w = self.clip_project.net[0].weight
+        e = torch.cat([wte(style_ids).unsqueeze(1), self.clip_project(clip_emb.to(w.dtype))], dim=1)
+        if beams <= 1: return self._greedy(e, max_new, eos_id, rep)
+        B, P, D = e.shape; dev = e.device; K = beams
+        e = e.unsqueeze(1).expand(B, K, P, D).reshape(B*K, P, D)
+        scores = torch.full((B, K), float('-inf'), device=dev); scores[:, 0] = 0.0
+        scores = scores.reshape(-1)
+        seqs = [[] for _ in range(B*K)]; fin = [[] for _ in range(B)]
+        rows = torch.arange(B, device=dev).unsqueeze(1)
+        past = None; inp = e
+        for _ in range(max_new):
+            out = self.gpt(inputs_embeds=inp, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            logits = out.logits[:, -1, :].float()
+            apply_rep(logits, seqs, rep)
+            lp = torch.log_softmax(logits, -1); V = lp.size(-1)
+            top_sc, top_ix = (scores.unsqueeze(1) + lp).view(B, K*V).topk(K, -1)
+            src = torch.div(top_ix, V, rounding_mode='floor')
+            tok = (top_ix % V).reshape(-1)
+            flat = (rows*K + src).reshape(-1)
+            past = reorder_past(past, flat)
+            seqs = [seqs[int(flat[i])] + [int(tok[i])] for i in range(B*K)]
+            scores = top_sc.reshape(-1).clone()
+            if eos_id is not None:
+                for i in range(B*K):
+                    if seqs[i][-1] == eos_id:
+                        fin[i // K].append((seqs[i], float(scores[i]) / len(seqs[i])**len_alpha))
+                        scores[i] = float('-inf')
+                if all(len(f) >= K for f in fin): break
+            inp = wte(tok).unsqueeze(1)
+        sv = scores.view(B, K)
+        return [max(fin[b], key=lambda x: x[1])[0] if fin[b] else seqs[b*K + int(sv[b].argmax())]
+                for b in range(B)]
 
 class FactualCapData(Dataset):
     def __init__(self, img_pt, cap_file, tok, sid, max_len=120):
