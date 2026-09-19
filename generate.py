@@ -10,6 +10,8 @@ def main(a):
     model = StyleCaptioner(ck['clip_dim'], tok, ck['prefix_len']).to(dev)
     model.load_state_dict(ck['model']); model.eval()
     offset = ck.get('offset', None)
+    W = torch.load(a.map, map_location='cpu')['W'].float() if a.map else None
+    print('bridge:', 'learned map' if W is not None else 'mean offset', flush=True)
     timg = torch.load(a.test_img, map_location='cpu')
     temb = {i: e.float() for i, e in zip(timg['ids'], timg['emb'])}
     order, refs = [], {}
@@ -24,10 +26,12 @@ def main(a):
     for s in range(0, len(order), a.batch_size):
         ch = order[s:s+a.batch_size]
         e = unit(torch.stack([temb[i] for i in ch]))
-        if offset is not None and a.style != 'factual': e = unit(e - offset)
+        if a.style != 'factual':
+            if W is not None: e = unit(e @ W)
+            elif offset is not None: e = unit(e - offset)
         e = e.to(dev)
         code = torch.full((e.size(0),), sid[a.style], device=dev)
-        outs = model.generate(e, code, max_new=a.max_new, eos_id=tok.eos_token_id)
+        outs = model.generate(e, code, max_new=a.max_new, eos_id=tok.eos_token_id, beams=a.beams)
         for i, o in zip(ch, outs):
             out[i] = {'image_id': i, 'references': refs[i],
                       a.style: tok.decode(o, skip_special_tokens=True)}
@@ -48,4 +52,6 @@ if __name__ == '__main__':
     p.add_argument('--n_images', type=int, default=100)
     p.add_argument('--batch_size', type=int, default=8)
     p.add_argument('--max_new', type=int, default=120)
+    p.add_argument('--beams', type=int, default=4)
+    p.add_argument('--map', default=None)
     a, _ = p.parse_known_args(); main(a)
