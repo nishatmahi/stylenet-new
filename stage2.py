@@ -27,15 +27,20 @@ class FactualImgData(Dataset):
         return unit(emb), torch.tensor(self.code), ids, attn
 
 class StyleTextData(Dataset):
-    def __init__(self, pt, tok, sid, style, noise=0.05, max_len=120):
+    def __init__(self, pt, tok, sid, style, noise=0.35, max_len=120):
         d = torch.load(pt, map_location='cpu')
         self.emb = d['emb'].float(); self.lines = d['lines']
-        self.tok, self.code, self.noise, self.max_len = tok, sid[style], noise, max_len
-        print('[data]', style, len(self.lines),'rows', flush=True)
+        self.tok, self.code, self.max_len = tok, sid[style], max_len
+        # noise is the perturbation norm RELATIVE to the unit embedding; per-dim std
+        # must be divided by sqrt(dim) or the perturbation swamps the signal and the
+        # decoder learns to ignore the prefix entirely.
+        self.std = noise / (self.emb.size(-1) ** 0.5)
+        print('[data]', style, len(self.lines),'rows  per-dim noise std', round(self.std, 5), flush=True)
     def __len__(self): return len(self.lines)
     def __getitem__(self, i):
         e = unit(self.emb[i])
-        if self.noise > 0: e = e + torch.randn_like(e)*self.noise
+        # renormalize: inference feeds unit-norm vectors, so training must too
+        if self.std > 0: e = unit(e + torch.randn_like(e)*self.std)
         ids, attn = encode_with_eos(self.tok, self.lines[i], self.max_len)
         return e, torch.tensor(self.code), ids, attn
 
@@ -65,6 +70,8 @@ def main(a):
     va_dl = DataLoader(ConcatDataset([facv, styv]), batch_size=a.batch_size, shuffle=False, num_workers=2)
     offset = (norm_mean(a.factual_img) - norm_mean(a.style_pt)).to(dev)
     print('modality offset norm', round(offset.norm().item(),4), flush=True)
+    W = torch.load(a.map, map_location='cpu')['W'].float().to(dev) if a.map else None
+    if W is not None: print('using learned img->txt map from', a.map, flush=True)
     timg = torch.load(a.test_img, map_location='cpu')
     temb = {i: e.float() for i,e in zip(timg['ids'], timg['emb'])}
     order, refs = [], {}
@@ -74,8 +81,8 @@ def main(a):
         img, cap = p
         if img in temb and img not in refs: refs[img] = cap; order.append(img)
         if len(order) >= 6: break
-    peek = unit(torch.stack([temb[i] for i in order]))
-    peek = unit(peek - offset.cpu()).to(dev)
+    peek = unit(torch.stack([temb[i] for i in order])).to(dev)
+    peek = unit(peek @ W) if W is not None else unit(peek - offset)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.01)
     sch = get_linear_schedule_with_warmup(opt, 200, a.epochs*len(dl))
     ckpt = os.path.join(a.save_dir, f'{a.style}.pth')
@@ -133,7 +140,8 @@ if __name__ == '__main__':
     p.add_argument('--batch_size', type=int, default=32)
     p.add_argument('--lr', type=float, default=3e-5)
     p.add_argument('--epochs', type=int, default=6)
-    p.add_argument('--noise', type=float, default=0.05)
+    p.add_argument('--noise', type=float, default=0.35)
+    p.add_argument('--map', default=None)
     p.add_argument('--max_len', type=int, default=120)
     p.add_argument('--max_new', type=int, default=120)
     p.add_argument('--fresh', action='store_true')
