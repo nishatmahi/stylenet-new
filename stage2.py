@@ -104,7 +104,10 @@ def main(a):
         print('[EPOCH', ep+1,'] train_loss', round(tr_loss,4),' val_loss', round(val,4), flush=True)
         model.eval()
         code = torch.full((peek.size(0),), sid[a.style], device=dev)
-        outs = model.generate(peek, code, max_new=a.max_new, eos_id=tok.eos_token_id)
+        if a.beams > 1:
+            outs = model.generate_beam(peek, code, max_new=a.max_new, eos_id=tok.eos_token_id, beams=a.beams)
+        else:
+            outs = model.generate(peek, code, max_new=a.max_new, eos_id=tok.eos_token_id)
         for iid, o in zip(order, outs):
             print(' ', iid, a.style,' ', tok.decode(o, skip_special_tokens=True))
         meta = {'model': model.state_dict(),'opt': opt.state_dict(),'sch': sch.state_dict(),
@@ -138,6 +141,7 @@ if __name__ == '__main__':
     p.add_argument('--max_len', type=int, default=120)
     p.add_argument('--max_new', type=int, default=120)
     p.add_argument('--offset_scale', type=float, default=1.0)
+    p.add_argument('--beams', type=int, default=1)
     p.add_argument('--fresh', action='store_true')
     a, _ = p.parse_known_args()
     if a.style_pt     is None: a.style_pt     = f'/kaggle/working/style_feats/{a.style}_train.pt'
