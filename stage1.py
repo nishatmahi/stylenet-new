@@ -91,6 +91,56 @@ class StyleCaptioner(nn.Module):
             if done.all(): break
             inp = wte(nxt).unsqueeze(1)
         return ys
+    @torch.no_grad()
+    def generate_beam(self, clip_emb, style_ids, max_new=120, eos_id=None, rep=1.2,
+                      beams=5, len_penalty=1.0):
+        # beam search, one image at a time (clear and safe; test set is small)
+        wte = self.gpt.transformer.wte; w = self.clip_project.net[0].weight
+        prefix = torch.cat([wte(style_ids).unsqueeze(1),
+                            self.clip_project(clip_emb.to(w.dtype))], dim=1)
+        B = prefix.size(0); dev = prefix.device
+        results = []
+        for b in range(B):
+            e = prefix[b:b+1]                       # (1, P, d)
+            out = self.gpt(inputs_embeds=e, use_cache=True)
+            past = out.past_key_values
+            logp = torch.log_softmax(out.logits[:, -1, :].float(), -1)
+            scores, nxt = logp.topk(beams, dim=-1)  # (1, beams)
+            seqs = [[int(t)] for t in nxt[0]]
+            scores = scores[0].tolist()
+            pasts = [past] * beams
+            done_seqs, done_scores = [], []
+            for _ in range(max_new - 1):
+                if not seqs: break
+                cand = []
+                for k in range(len(seqs)):
+                    inp = wte(torch.tensor([[seqs[k][-1]]], device=dev))
+                    o = self.gpt(inputs_embeds=inp, past_key_values=pasts[k], use_cache=True)
+                    pasts[k] = o.past_key_values
+                    lp = torch.log_softmax(o.logits[:, -1, :].float(), -1)[0]
+                    for t in set(seqs[k]):
+                        lp[t] = lp[t] - float(torch.log(torch.tensor(rep)))  # repetition penalty
+                    top_lp, top_id = lp.topk(beams)
+                    for j in range(beams):
+                        cand.append((scores[k] + float(top_lp[j]), k, int(top_id[j])))
+                cand.sort(key=lambda x: x[0], reverse=True)
+                new_seqs, new_scores, new_pasts = [], [], []
+                for sc, k, tk in cand:
+                    if len(new_seqs) == beams: break
+                    if eos_id is not None and tk == eos_id:
+                        seq = seqs[k] + [tk]
+                        done_seqs.append(seq)
+                        done_scores.append(sc / (len(seq) ** len_penalty))
+                    else:
+                        new_seqs.append(seqs[k] + [tk]); new_scores.append(sc)
+                        new_pasts.append(pasts[k])
+                seqs, scores, pasts = new_seqs, new_scores, new_pasts
+                if len(done_seqs) >= beams: break
+            for k in range(len(seqs)):
+                done_seqs.append(seqs[k]); done_scores.append(scores[k] / (len(seqs[k]) ** len_penalty))
+            best = done_seqs[int(torch.tensor(done_scores).argmax())] if done_seqs else []
+            results.append(best)
+        return results
 
 class FactualCapData(Dataset):
     def __init__(self, img_pt, cap_file, tok, sid, max_len=120):
@@ -160,7 +210,10 @@ def main(a):
         val = eval_loss(model, va, dev); tr_loss = tr_sum/max(tr_n,1)
         print('[EPOCH', ep+1,'] train_loss', round(tr_loss,4), ' val_loss', round(val,4), flush=True)
         code = torch.full((peek_emb.size(0),), sid['factual'], device=dev)
-        outs = model.generate(peek_emb, code, max_new=a.max_new, eos_id=tok.eos_token_id)
+        if a.beams > 1:
+            outs = model.generate_beam(peek_emb, code, max_new=a.max_new, eos_id=tok.eos_token_id, beams=a.beams)
+        else:
+            outs = model.generate(peek_emb, code, max_new=a.max_new, eos_id=tok.eos_token_id)
         for iid, o in zip(peek_ids, outs):
             print(' ', iid, 'gen ', tok.decode(o, skip_special_tokens=True))
             print('    gold', gold[iid])
@@ -188,5 +241,6 @@ if __name__ == '__main__':
     p.add_argument('--prefix_len', type=int, default=10)
     p.add_argument('--max_len', type=int, default=120)
     p.add_argument('--max_new', type=int, default=120)
+    p.add_argument('--beams', type=int, default=1)
     p.add_argument('--fresh', action='store_true')
     args, _ = p.parse_known_args(); main(args)
