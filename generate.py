@@ -10,7 +10,7 @@ def main(a):
     model = StyleCaptioner(ck['clip_dim'], tok, ck['prefix_len']).to(dev)
     model.load_state_dict(ck['model']); model.eval()
     offset = ck.get('offset', None)
-    print('offset_scale', a.offset_scale, flush=True)
+    print('offset_scale', a.offset_scale, ' beams', a.beams, flush=True)
     timg = torch.load(a.test_img, map_location='cpu')
     temb = {i: e.float() for i, e in zip(timg['ids'], timg['emb'])}
     order, refs = [], {}
@@ -28,7 +28,11 @@ def main(a):
         if offset is not None and a.style != 'factual': e = unit(e - a.offset_scale * offset)
         e = e.to(dev)
         code = torch.full((e.size(0),), sid[a.style], device=dev)
-        outs = model.generate(e, code, max_new=a.max_new, eos_id=tok.eos_token_id)
+        if a.beams > 1:
+            outs = model.generate_beam(e, code, max_new=a.max_new, eos_id=tok.eos_token_id,
+                                       beams=a.beams, len_penalty=a.len_penalty)
+        else:
+            outs = model.generate(e, code, max_new=a.max_new, eos_id=tok.eos_token_id)
         for i, o in zip(ch, outs):
             out[i] = {'image_id': i, 'references': refs[i],
                       a.style: tok.decode(o, skip_special_tokens=True)}
@@ -50,4 +54,6 @@ if __name__ == '__main__':
     p.add_argument('--batch_size', type=int, default=8)
     p.add_argument('--max_new', type=int, default=120)
     p.add_argument('--offset_scale', type=float, default=1.0)
+    p.add_argument('--beams', type=int, default=1)
+    p.add_argument('--len_penalty', type=float, default=1.0)
     a, _ = p.parse_known_args(); main(a)
